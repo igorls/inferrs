@@ -1,0 +1,57 @@
+[package]
+name = "inferrs"
+version = "0.1.0"
+edition = "2021"
+description = "A conservative-memory inference engine for LLMs"
+license = "Apache-2.0"
+
+[[bin]]
+name = "inferrs"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = ["candle-core/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+metal = ["candle-core/metal", "candle-nn/metal", "candle-transformers/metal"]
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP server
+axum = { version = "0.7", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# ML / Tensor
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+
+# Tokenizer
+tokenizers = { version = "0.21", features = [] }
+
+# HuggingFace model hub
+hf-hub = { version = "0.4", features = ["tokio"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+futures = "0.3"
+tokio-stream = "0.1"
+anyhow = "1"
+byteorder = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
