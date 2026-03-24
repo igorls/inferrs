@@ -17,7 +17,6 @@ Most LLM serving stacks force a trade-off between features and resource usage.
 | **Streaming (SSE)** | ✓ | ✓ | ✓ |
 | **Chunked prefill** | ✓ | ✓ | ✗ |
 | **KV cache management** | Block-based with free-list reuse | PagedAttention | Per-context allocation |
-| **Tensor library** | Candle (Rust) | PyTorch / custom CUDA | Custom C/C++ |
 | **Multi-GPU / distributed** | Single device | Multi-GPU, tensor parallel | Partial (model splitting) |
 | **Desktop friendly** | ✓ — lightweight | ✗ — claims most GPU memory | ✓ — lightweight |
 | **Binary footprint** | Single static binary | Python environment + deps | Single binary |
@@ -98,16 +97,6 @@ inferrs serve Qwen/Qwen3.5-0.8B --dtype f16 --port 8080
 ### Query
 
 ```bash
-# Chat completion
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen/Qwen3.5-0.8B",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "max_tokens": 128
-  }'
-
-# Streaming
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -169,7 +158,6 @@ All endpoints accept and return JSON following the
   tokens back via SSE.
 - **Engine** — Owns the model and runs the inference loop on a dedicated thread.
 - **Scheduler** — Continuous batching with chunked prefill and preemption.
-- **Transformer** — From-scratch implementation using Candle tensors.
 - **KV Cache** — Block-based, grow-on-demand allocation with free-list reuse.
 - **Sampler** — Temperature, top-k, top-p, and repetition penalty.
 
