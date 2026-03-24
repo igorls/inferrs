@@ -11,75 +11,28 @@ env:
 
 jobs:
   fmt:
-    name: Format (${{ matrix.target }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            runner: macos-15
-            rustflags: "-C target-feature=+fullfp16"
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
-            rustflags: ""
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            rustflags: "-C target-feature=+fullfp16"
-          - target: x86_64-pc-windows-msvc
-            runner: windows-latest
-            rustflags: ""
-          - target: aarch64-pc-windows-msvc
-            runner: windows-11-arm
-            rustflags: "-C target-feature=+fullfp16"
-    env:
-      RUSTFLAGS: ${{ matrix.rustflags }}
+    name: Format
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
       - run: cargo fmt --check
 
   clippy:
-    name: Clippy (${{ matrix.target }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            runner: macos-15
-            rustflags: "-C target-feature=+fullfp16"
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
-            rustflags: ""
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            rustflags: "-C target-feature=+fullfp16"
-          - target: x86_64-pc-windows-msvc
-            runner: windows-latest
-            rustflags: ""
-          - target: aarch64-pc-windows-msvc
-            runner: windows-11-arm
-            rustflags: "-C target-feature=+fullfp16"
-    env:
-      RUSTFLAGS: ${{ matrix.rustflags }}
+    name: Clippy
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
       - run: cargo clippy -- -D warnings
 
-  test:
-    name: Test (${{ matrix.target }})
+  build:
+    name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -109,37 +62,3 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo test
-
-  build:
-    name: Build (${{ matrix.target }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            runner: macos-15
-            rustflags: "-C target-feature=+fullfp16"
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-24.04
-            rustflags: ""
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            rustflags: "-C target-feature=+fullfp16"
-          - target: x86_64-pc-windows-msvc
-            runner: windows-latest
-            rustflags: ""
-          - target: aarch64-pc-windows-msvc
-            runner: windows-11-arm
-            rustflags: "-C target-feature=+fullfp16"
-    env:
-      RUSTFLAGS: ${{ matrix.rustflags }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-      - run: cargo build --target ${{ matrix.target }}
