@@ -36,15 +36,6 @@ as needed and should not free'd if it can be re-used:
 The result: minimal footprint to start and predictable steady-state performance
 after warm-up, all without tuning a pre-allocation knob.
 
-### Why not llama.cpp?
-
-llama.cpp is an excellent CPU inference tool. inferrs differs in:
-
-- **Continuous batching** — multiple requests are scheduled together, improving
-  throughput under concurrent load.
-- **Rust safety** — memory safety and data-race freedom guaranteed at compile
-  time.
-
 ## Features
 
 - **OpenAI-compatible API** — `/v1/completions`, `/v1/chat/completions`,
