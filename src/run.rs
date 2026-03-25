@@ -208,15 +208,13 @@ fn repl(
     sampling_params: SamplingParams,
     mut messages: Vec<ChatMessage>,
 ) -> Result<()> {
-    println!("Type /? for help, /bye to exit, \"\"\" for multiline input.");
-
     let mut multiline = MultilineState::None;
     let mut buf = String::new(); // current multi-line accumulation buffer
 
     loop {
         let prompt_str = match multiline {
-            MultilineState::None => ">>> ",
-            MultilineState::Prompt => "... ",
+            MultilineState::None => "> ",
+            MultilineState::Prompt => ". ",
         };
         print!("{}", prompt_str);
         io::stdout().flush()?;
