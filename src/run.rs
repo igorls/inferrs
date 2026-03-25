@@ -17,9 +17,12 @@ use std::sync::{
     Arc,
 };
 
+use candle_core::DType;
+
 use crate::config::RawConfig;
 use crate::engine::{Engine, StreamToken, SyncEngineRequest};
 use crate::hub;
+use crate::kv_cache::{BlockPool, PagedCacheConfig, PagedKvStore};
 use crate::sampler::SamplingParams;
 use crate::tokenizer::{ChatMessage, Role, Tokenizer};
 use crate::ServeArgs;
@@ -65,6 +68,13 @@ pub struct RunArgs {
     /// System prompt
     #[arg(long)]
     pub system: Option<String>,
+
+    /// Enable paged attention KV cache (vLLM-style block management).
+    /// Specify the fraction of GPU/CPU memory to reserve for KV blocks,
+    /// e.g. `--paged-attention 0.6` reserves 60% of available memory.
+    /// When unset (the default) the standard concat-based KV cache is used.
+    #[arg(long)]
+    pub paged_attention: Option<f64>,
 }
 
 impl RunArgs {
@@ -86,7 +96,7 @@ impl RunArgs {
             top_p: self.top_p,
             top_k: self.top_k,
             max_tokens: self.max_tokens,
-            paged_attention: None,
+            paged_attention: self.paged_attention,
         }
     }
 }
@@ -151,7 +161,39 @@ fn run_blocking(args: RunArgs) -> Result<()> {
     // Use std::sync::mpsc (not tokio) so that sends/recvs are plain blocking
     // calls with no Tokio runtime requirement.
     let (engine_tx, engine_rx) = stdmpsc::sync_channel::<SyncEngineRequest>(4);
-    let engine = Engine::new(model, engine_tokenizer, device, 1, 2048);
+    let mut engine = Engine::new(model, engine_tokenizer, device.clone(), 1, 2048);
+
+    // Wire up paged attention if requested (same logic as `serve` and `bench`).
+    if let Some(memory_fraction) = serve.paged_attention {
+        let bytes_per_element = match dtype {
+            DType::F32 => 4,
+            _ => 2,
+        };
+        let total_memory_bytes: usize = match &device {
+            candle_core::Device::Cuda(_) | candle_core::Device::Metal(_) => 8 * 1024 * 1024 * 1024,
+            _ => 4 * 1024 * 1024 * 1024,
+        };
+        let (num_kv_heads, head_dim, num_kv_layers) = raw_config.kv_cache_params(&arch);
+        let paged_cfg = PagedCacheConfig::from_memory_fraction(
+            total_memory_bytes,
+            memory_fraction,
+            serve.block_size,
+            num_kv_heads,
+            head_dim,
+            num_kv_layers,
+            bytes_per_element,
+        );
+        tracing::info!(
+            "Paged KV store: {} blocks × {} tokens/block",
+            paged_cfg.num_blocks,
+            paged_cfg.block_size,
+        );
+        let block_pool = BlockPool::new(paged_cfg.num_blocks, paged_cfg.block_size);
+        let kv_store = PagedKvStore::new(paged_cfg, dtype, &device)?;
+        engine = engine.with_paged_kv(block_pool, kv_store);
+    }
+
+    let engine = engine;
 
     std::thread::Builder::new()
         .name("engine".to_string())
