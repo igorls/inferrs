@@ -146,6 +146,7 @@ pub fn load_model(
     weight_paths: &[impl AsRef<Path>],
     dtype: DType,
     device: &Device,
+    turbo_quant_bits: Option<u8>,
 ) -> Result<Box<dyn CausalLM>> {
     tracing::info!("Loading model weights ({:?} architecture)...", arch);
 
@@ -156,7 +157,7 @@ pub fn load_model(
 
     match arch {
         ModelArchitecture::Qwen3 => {
-            let config = raw_config.to_qwen3_config(dtype, device.clone());
+            let config = raw_config.to_qwen3_config(dtype, device.clone(), turbo_quant_bits);
             tracing::info!(
                 "Qwen3 config: {} layers, {} heads, {} hidden, {} kv_heads, head_dim={}",
                 config.num_hidden_layers,

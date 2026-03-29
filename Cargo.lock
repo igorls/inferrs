@@ -1615,6 +1615,7 @@ dependencies = [
  "crossterm",
  "futures",
  "hf-hub",
+ "rayon",
  "serde",
  "serde_json",
  "tokenizers",

@@ -16,6 +16,7 @@ use candle_nn::{
 };
 
 use crate::kv_cache::{BlockTable, PagedKvStore};
+use crate::turbo_quant::{build_codec, TurboQuantConfig, TurboQuantKvCache};
 
 /// Paged-attention context passed to each layer.
 pub struct PagedCtx<'a> {
@@ -46,6 +47,8 @@ pub struct Qwen3Config {
     pub rope_theta: f64,
     pub dtype: DType,
     pub device: Device,
+    /// When `Some(bits)`, KV cache vectors are quantized using TurboQuant at the given bit-width.
+    pub turbo_quant_bits: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -164,11 +167,18 @@ struct Attention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    /// Standard (unquantized) concat KV cache.
     kv_cache: Option<(Tensor, Tensor)>,
+    /// TurboQuant compressed KV cache (used instead of `kv_cache` when enabled).
+    tq_cache: Option<TurboQuantKvCache>,
 }
 
 impl Attention {
-    fn new(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
+    fn new(
+        cfg: &Qwen3Config,
+        vb: VarBuilder,
+        codec: Option<std::sync::Arc<crate::turbo_quant::TurboQuantCodec>>,
+    ) -> Result<Self> {
         let q_out = cfg.num_attention_heads * cfg.head_dim;
         let kv_out = cfg.num_key_value_heads * cfg.head_dim;
 
@@ -178,6 +188,10 @@ impl Attention {
         let o_proj = linear_no_bias(q_out, cfg.hidden_size, vb.pp("o_proj"))?;
         let q_norm = rms_norm(cfg.head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
         let k_norm = rms_norm(cfg.head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
+
+        let tq_cache = codec.map(|c| {
+            TurboQuantKvCache::new(c, cfg.num_key_value_heads, cfg.dtype, cfg.device.clone())
+        });
 
         Ok(Self {
             q_proj,
@@ -190,6 +204,7 @@ impl Attention {
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
             kv_cache: None,
+            tq_cache,
         })
     }
 
@@ -228,16 +243,24 @@ impl Attention {
         let q = apply_rope(&q, &cos_slice, &sin_slice)?;
         let k = apply_rope(&k, &cos_slice, &sin_slice)?;
 
-        // Append to KV cache
-        let (k, v) = match &self.kv_cache {
-            None => (k, v),
-            Some((k_cache, v_cache)) => {
-                let k = Tensor::cat(&[k_cache, &k], 2)?;
-                let v = Tensor::cat(&[v_cache, &v], 2)?;
-                (k, v)
-            }
+        // Append to KV cache (TurboQuant-compressed or plain concat)
+        let (k, v) = if let Some(tq) = &mut self.tq_cache {
+            // TurboQuant path: quantize new tokens, then dequantize the full cache.
+            tq.append(&k, &v)?;
+            tq.dequantize()?
+        } else {
+            // Standard concat-based KV cache.
+            let (k, v) = match &self.kv_cache {
+                None => (k, v),
+                Some((k_cache, v_cache)) => {
+                    let k = Tensor::cat(&[k_cache, &k], 2)?;
+                    let v = Tensor::cat(&[v_cache, &v], 2)?;
+                    (k, v)
+                }
+            };
+            self.kv_cache = Some((k.clone(), v.clone()));
+            (k, v)
         };
-        self.kv_cache = Some((k.clone(), v.clone()));
 
         let kv_len = k.dim(2)?;
 
@@ -275,6 +298,9 @@ impl Attention {
 
     fn clear_kv_cache(&mut self) {
         self.kv_cache = None;
+        if let Some(tq) = &mut self.tq_cache {
+            tq.clear();
+        }
     }
 
     fn forward_paged(
@@ -418,9 +444,13 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(cfg: &Qwen3Config, vb: VarBuilder) -> Result<Self> {
+    fn new(
+        cfg: &Qwen3Config,
+        vb: VarBuilder,
+        codec: Option<std::sync::Arc<crate::turbo_quant::TurboQuantCodec>>,
+    ) -> Result<Self> {
         Ok(Self {
-            attn: Attention::new(cfg, vb.pp("self_attn"))?,
+            attn: Attention::new(cfg, vb.pp("self_attn"), codec)?,
             mlp: Mlp::new(cfg, vb.pp("mlp"))?,
             input_layernorm: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
             post_attention_layernorm: rms_norm(
@@ -489,11 +519,28 @@ impl Qwen3Model {
 
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, model_vb.pp("embed_tokens"))?;
 
+        // Build a shared TurboQuant codec if requested.
+        let tq_codec: Option<std::sync::Arc<crate::turbo_quant::TurboQuantCodec>> =
+            cfg.turbo_quant_bits.map(|bits| {
+                let tq_cfg = TurboQuantConfig {
+                    bits,
+                    head_dim: cfg.head_dim,
+                };
+                tracing::info!(
+                    "TurboQuant KV cache enabled: {} bits/coord ({}× compression vs bf16)",
+                    bits,
+                    16 / bits as u32
+                );
+                build_codec(&tq_cfg)
+            });
+
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             let layer_vb = model_vb.pp("layers").pp(i.to_string());
-            let layer =
-                DecoderLayer::new(cfg, layer_vb).with_context(|| format!("loading layer {}", i))?;
+            // Each layer gets its own TurboQuantKvCache but they all share the same codec
+            // (same rotation matrix / codebook) — this is the data-oblivious online design.
+            let layer = DecoderLayer::new(cfg, layer_vb, tq_codec.clone())
+                .with_context(|| format!("loading layer {}", i))?;
             layers.push(layer);
         }
 

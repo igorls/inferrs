@@ -216,6 +216,7 @@ impl RawConfig {
         &self,
         dtype: DType,
         device: Device,
+        turbo_quant_bits: Option<u8>,
     ) -> crate::models::qwen3::Qwen3Config {
         use crate::models::qwen3::Qwen3Config;
 
@@ -243,6 +244,7 @@ impl RawConfig {
             rope_theta,
             dtype,
             device,
+            turbo_quant_bits,
         }
     }
 
