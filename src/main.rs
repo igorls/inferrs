@@ -27,7 +27,7 @@ struct Cli {
 enum Commands {
     /// Serve a model from HuggingFace Hub
     Serve(ServeArgs),
-    /// Run a model interactively (like ollama run)
+    /// Run a model interactively
     Run(run::RunArgs),
     /// Benchmark inference throughput and latency
     Bench(bench::BenchArgs),

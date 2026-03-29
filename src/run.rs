@@ -1,4 +1,4 @@
-//! Interactive REPL for `inferrs run` — behaves like `ollama run` but in a
+//! Interactive REPL for `inferrs run` — runs a model in a
 //! single process (no HTTP server, no separate daemon).
 
 use anyhow::Result;
