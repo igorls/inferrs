@@ -245,21 +245,11 @@ impl Attention {
 
         // Append to KV cache (TurboQuant-compressed or plain concat)
         let (k, v) = if let Some(tq) = &mut self.tq_cache {
-            // TurboQuant path: store new tokens compressed, then build the full
-            // K/V for attention by concatenating the dequantized history with the
-            // original (unquantized) new tokens.  This avoids applying quantization
-            // error to the current forward pass's own attention computation.
-            if tq.is_empty() {
-                // No history yet — use the new tokens directly (no round-trip).
-                tq.append(&k, &v)?;
-                (k, v)
-            } else {
-                let (k_hist, v_hist) = tq.dequantize()?;
-                tq.append(&k, &v)?;
-                let k_full = Tensor::cat(&[&k_hist, &k], 2)?;
-                let v_full = Tensor::cat(&[&v_hist, &v], 2)?;
-                (k_full, v_full)
-            }
+            // TurboQuant path: append new tokens first, then dequantize the full
+            // sequence (history + current).  This avoids an extra Tensor::cat here;
+            // `dequantize()` internally cats only the delta onto the cached tensor.
+            tq.append(&k, &v)?;
+            tq.dequantize()?
         } else {
             // Standard concat-based KV cache.
             let (k, v) = match &self.kv_cache {
