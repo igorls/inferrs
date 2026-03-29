@@ -10,6 +10,7 @@ mod sampler;
 mod scheduler;
 mod server;
 mod tokenizer;
+mod turbo_quant;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -105,6 +106,12 @@ pub struct ServeArgs {
     /// When unset (the default) the standard concat-based KV cache is used.
     #[arg(long)]
     pub paged_attention: Option<f64>,
+
+    /// Enable TurboQuant KV cache compression.
+    /// Specify the bit-width (1–8) for quantizing key and value vectors, e.g. `--turbo-quant 4`.
+    /// Reduces KV cache memory by (dtype_bits / bits)×.  Works with the concat-KV path only.
+    #[arg(long)]
+    pub turbo_quant: Option<u8>,
 }
 
 impl ServeArgs {

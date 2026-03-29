@@ -71,6 +71,12 @@ pub struct RunArgs {
     /// When unset (the default) the standard concat-based KV cache is used.
     #[arg(long)]
     pub paged_attention: Option<f64>,
+
+    /// Enable TurboQuant KV cache compression.
+    /// Specify the bit-width (1–8) for quantizing key and value vectors, e.g. `--turbo-quant 4`.
+    /// Reduces KV cache memory by (dtype_bits / bits)×.
+    #[arg(long)]
+    pub turbo_quant: Option<u8>,
 }
 
 impl RunArgs {
@@ -93,6 +99,7 @@ impl RunArgs {
             top_k: self.top_k,
             max_tokens: self.max_tokens,
             paged_attention: self.paged_attention,
+            turbo_quant: self.turbo_quant,
         }
     }
 }
@@ -145,6 +152,7 @@ fn run_blocking(args: RunArgs) -> Result<()> {
         &model_files.weight_paths,
         dtype,
         &device,
+        args.turbo_quant,
     )?;
 
     // Engine tokenizer (separate instance — engine runs on its own thread)

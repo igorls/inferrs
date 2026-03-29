@@ -58,6 +58,7 @@ async-stream = "0.3"
 anyhow = "1"
 byteorder = "1"
 crossterm = "0.28"
+rayon = "1"
 
 [dev-dependencies]
 ureq = { version = "2", features = ["json"] }
