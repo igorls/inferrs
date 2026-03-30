@@ -1,7 +1,7 @@
 # inferrs
 
-A fast LLM inference engine. Ships as a single binary that downloads a model
-and exposes an OpenAI-compatible API.
+A TurboQuant LLM inference engine. Ships as a single binary that downloads a
+model and exposes an OpenAI-compatible API.
 
 ## Why inferrs?
 
