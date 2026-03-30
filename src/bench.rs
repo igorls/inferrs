@@ -87,7 +87,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
 
     // Build a synthetic prompt of the requested length.
     // Use the tokenizer's BOS token id if available, otherwise token id 1.
-    let bos_id = tokenizer.stop_token_ids.first().copied().unwrap_or(1);
+    let bos_id = tokenizer.bos_token_id().unwrap_or(1);
     let prompt_tokens: Vec<u32> = std::iter::repeat_n(bos_id, args.prompt_len).collect();
 
     // Clamp max_tokens to the model's effective KV-cache capacity so that

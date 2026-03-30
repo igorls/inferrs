@@ -124,11 +124,9 @@ const GROUP_SIZE: usize = 32;
 /// - `n_elems` — `seq_len * head_dim`
 fn quantize(x: &Tensor, bits: u8) -> Result<(Vec<u8>, Vec<f32>, usize)> {
     let (seq_len, head_dim) = x.dims2()?;
-    assert_eq!(
-        head_dim % GROUP_SIZE,
-        0,
-        "head_dim {head_dim} must be divisible by GROUP_SIZE {GROUP_SIZE}"
-    );
+    if head_dim % GROUP_SIZE != 0 {
+        anyhow::bail!("head_dim {head_dim} must be divisible by GROUP_SIZE {GROUP_SIZE}");
+    }
     let n_groups = head_dim / GROUP_SIZE;
     let n_levels = 1usize << bits;
     let levels = (n_levels - 1) as f32;
@@ -283,10 +281,9 @@ impl TurboQuantKvCache {
 
     /// Return dequantized `(k, v)` tensors of shape `[1, num_kv_heads, seq_len, head_dim]`.
     pub fn dequantize(&self) -> Result<(Tensor, Tensor)> {
-        assert!(
-            self.seq_len > 0,
-            "dequantize called on empty TurboQuantKvCache"
-        );
+        if self.seq_len == 0 {
+            anyhow::bail!("dequantize called on empty TurboQuantKvCache");
+        }
 
         let mut k_heads = Vec::with_capacity(self.num_kv_heads);
         let mut v_heads = Vec::with_capacity(self.num_kv_heads);
