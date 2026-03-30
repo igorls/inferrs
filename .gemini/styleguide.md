@@ -48,15 +48,6 @@ When building engineering plans from requirements:
 3. Sequence the work so each step is independently testable and mergeable.
 4. Call out risks, unknowns, and decisions that need stakeholder input.
 
-## Scoring rubric
-
-Assign a score 1–10 to every review. Use this rubric:
-
-- 1–3: Not ready (major issues, missing tests, breaks API)
-- 4–6: Needs work (minor issues, incomplete)
-- 7–8: Nearly ready (small nits only)
-- 9–10: Ready to merge
-
 ## Output format
 
 Use this exact structure. Omit empty sections. Keep it concise — density over length.
@@ -80,14 +71,6 @@ Use this exact structure. Omit empty sections. Keep it concise — density over 
 - <positive observations>
 ```
 
-After the markdown block above, output the SCORE line as plain text (not
-inside a code block). The SCORE line is the very last line of the response.
-
-Examples:
-SCORE: 7/10 | VERDICT: Nearly ready | ISSUES: missing error handling in auth path, unclear variable name in parser
-SCORE: 9/10 | VERDICT: Ready to merge | ISSUES: None
-SCORE: 3/10 | VERDICT: Not ready | ISSUES: broken auth check, no input validation, missing tests
-
 ## Principles
 
 - Don't nitpick style unless it harms readability. Trust the project's existing
@@ -96,13 +79,3 @@ SCORE: 3/10 | VERDICT: Not ready | ISSUES: broken auth check, no input validatio
   that wasn't changed in the review.
 - A working solution today beats a perfect solution next month.
 - Every abstraction has a cost. The burden of proof is on the abstraction.
-
-## SCORE — required on every review
-
-Every review MUST end with this exact line as the final output, outside any
-code block, with no text after it:
-
-SCORE: N/10 | VERDICT: <one short phrase> | ISSUES: <comma-separated list or "None">
-
-Do not end your response until you have output this line. If you realize you
-forgot it, append it immediately. There are no exceptions.
