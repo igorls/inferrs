@@ -152,6 +152,13 @@ impl Tokenizer {
         })
     }
 
+    /// Return the BOS token ID, if the tokenizer config declares one.
+    pub fn bos_token_id(&self) -> Option<u32> {
+        self.bos_token
+            .as_deref()
+            .and_then(|t| self.inner.token_to_id(t))
+    }
+
     /// Encode text to token IDs.
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
         let encoding = self
