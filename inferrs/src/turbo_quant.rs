@@ -245,12 +245,15 @@ fn dequantize_into(
 /// transfer for all prefill tokens — and `prefill_kv` is cleared.  This
 /// restores prefill throughput to the same level as the unquantized path.
 ///
-/// ## Incremental dequantize
+/// ## Incremental dequantize with pre-allocated buffer
 ///
-/// After a `dequantize()` call the resulting `[1, num_kv_heads, seq_len, head_dim]`
-/// tensors are kept on-device in `kv_cache`.  On the next decode step only the
-/// newly-appended token(s) are dequantized and concatenated onto the cached
-/// tensor, reducing dequantize work from O(seq_len) to O(new_tokens) per step.
+/// A fixed-size on-device buffer of shape `[1, num_kv_heads, max_seq_len, head_dim]`
+/// is pre-allocated on the first decode step.  On each subsequent decode step only
+/// the new delta token(s) are dequantized and written into the buffer via `slice_set`,
+/// eliminating the `Tensor::cat` allocation+copy that previously grew O(seq_len)
+/// per decode step.  The attention kernel receives a `narrow` view of the buffer
+/// covering the valid sequence length — a zero-copy operation.
+#[derive(Debug)]
 pub struct TurboQuantKvCache {
     bits: u8,
     orig_dtype: DType,
@@ -264,13 +267,17 @@ pub struct TurboQuantKvCache {
     v_scales: Vec<Vec<f32>>,
     /// Number of tokens cached so far (quantized tokens only).
     pub seq_len: usize,
-    /// Number of tokens already reflected in `kv_cache` (i.e. already uploaded).
-    /// When `cached_seq_len == seq_len` after an append, only the delta needs
-    /// to be dequantized on the next `dequantize()` call.
+    /// Number of tokens already written into `kv_buffer` (i.e. already uploaded
+    /// and set via `slice_set`).  When `cached_seq_len == seq_len` the buffer is
+    /// up-to-date and `dequantize()` returns a `narrow` view without any write.
     cached_seq_len: usize,
-    /// On-device KV tensors covering the first `cached_seq_len` tokens.
-    /// Shape: `[1, num_kv_heads, cached_seq_len, head_dim]`.
-    kv_cache: Option<(Tensor, Tensor)>,
+    /// Pre-allocated on-device KV buffer of shape `[1, num_kv_heads, max_seq_len, head_dim]`.
+    /// Tokens are written incrementally via `slice_set`; the attention kernel reads
+    /// a `narrow` view of length `seq_len`.  Allocated lazily on the first decode step
+    /// (after the prefill sequence length is known).
+    kv_buffer: Option<(Tensor, Tensor)>,
+    /// Maximum sequence length allocated in `kv_buffer`.  Zero until the buffer is created.
+    kv_buffer_cap: usize,
     /// Unquantized on-device KV tensors accumulated during prefill.
     /// Cleared (and flushed into the quantized store) on the first decode call.
     /// Shape when set: `[1, num_kv_heads, prefill_len, head_dim]`.
@@ -291,7 +298,8 @@ impl TurboQuantKvCache {
             v_scales: vec![Vec::new(); num_kv_heads],
             seq_len: 0,
             cached_seq_len: 0,
-            kv_cache: None,
+            kv_buffer: None,
+            kv_buffer_cap: 0,
             prefill_kv: None,
         }
     }
@@ -381,7 +389,10 @@ impl TurboQuantKvCache {
     /// During prefill the unquantized on-device tensors are returned directly
     /// (no CPU round-trip).  During decode the incremental dequantize strategy
     /// is used: only the delta tokens since the last call are decompressed and
-    /// concatenated onto the cached device tensor.
+    /// written into a pre-allocated on-device buffer via `slice_set` (O(delta)
+    /// work), then a zero-copy `narrow` view is returned.  This eliminates the
+    /// growing `Tensor::cat` allocation+copy that previously occurred on every
+    /// decode step.
     pub fn dequantize(&mut self) -> Result<(Tensor, Tensor)> {
         // Prefill path: return the unquantized tensors directly.
         if let Some((k, v)) = &self.prefill_kv {
@@ -395,12 +406,14 @@ impl TurboQuantKvCache {
         let delta = self.seq_len - self.cached_seq_len;
 
         if delta == 0 {
-            // Nothing new — return the cached tensors directly.
-            let (k, v) = self
-                .kv_cache
+            // Nothing new — return a narrow view of the existing buffer.
+            let (k_buf, v_buf) = self
+                .kv_buffer
                 .as_ref()
-                .expect("kv_cache must be set when cached_seq_len == seq_len");
-            return Ok((k.clone(), v.clone()));
+                .expect("kv_buffer must be set when cached_seq_len == seq_len");
+            let k = k_buf.narrow(2, 0, self.seq_len)?;
+            let v = v_buf.narrow(2, 0, self.seq_len)?;
+            return Ok((k, v));
         }
 
         // Dequantize only the delta (new) tokens.
@@ -410,7 +423,7 @@ impl TurboQuantKvCache {
         let bytes_per_token = (self.head_dim * self.bits as usize).div_ceil(8);
         let scales_per_token = self.head_dim / GROUP_SIZE;
 
-        // Build flat f32 buffers for all heads, then do a single device upload each.
+        // Build flat f32 buffers for all heads, then do a single device upload.
         let n_new_elems = self.num_kv_heads * delta * self.head_dim;
         let mut k_new_data = Vec::with_capacity(n_new_elems);
         let mut v_new_data = Vec::with_capacity(n_new_elems);
@@ -440,7 +453,7 @@ impl TurboQuantKvCache {
             );
         }
 
-        // Single device upload for all heads: [num_kv_heads, delta, head_dim] → unsqueeze → [1, ...]
+        // Single device upload: [num_kv_heads, delta, head_dim] → [1, num_kv_heads, delta, head_dim]
         let k_new = Tensor::from_vec(
             k_new_data,
             (self.num_kv_heads, delta, self.head_dim),
@@ -458,24 +471,54 @@ impl TurboQuantKvCache {
         .to_dtype(self.orig_dtype)?
         .unsqueeze(0)?;
 
-        // Concatenate with existing cache (if any) along the sequence dimension.
-        let (k, v) = match &self.kv_cache {
-            None => (k_new, v_new),
-            Some((k_prev, v_prev)) => {
-                let k = Tensor::cat(&[k_prev, &k_new], 2)?;
-                let v = Tensor::cat(&[v_prev, &v_new], 2)?;
-                (k, v)
+        // Ensure the pre-allocated buffer is large enough for the current sequence.
+        // The buffer is grown by doubling (amortised O(1)) to avoid frequent reallocations.
+        // On the first decode step this allocates a buffer sized to at least `seq_len` tokens.
+        let needed_cap = self.seq_len;
+        if self.kv_buffer_cap < needed_cap {
+            let new_cap = needed_cap.max(self.kv_buffer_cap * 2).max(256);
+            let k_buf = Tensor::zeros(
+                (1, self.num_kv_heads, new_cap, self.head_dim),
+                self.orig_dtype,
+                &self.device,
+            )?;
+            let v_buf = Tensor::zeros(
+                (1, self.num_kv_heads, new_cap, self.head_dim),
+                self.orig_dtype,
+                &self.device,
+            )?;
+            // Copy existing valid data into the new (larger) buffer.
+            if self.cached_seq_len > 0 {
+                if let Some((k_old, v_old)) = &self.kv_buffer {
+                    k_buf.slice_set(k_old, 2, 0)?;
+                    v_buf.slice_set(v_old, 2, 0)?;
+                }
             }
-        };
+            self.kv_buffer = Some((k_buf, v_buf));
+            self.kv_buffer_cap = new_cap;
+        }
 
-        // Update the cache.
+        // Write the new delta tokens into the buffer at position `cached_seq_len`.
+        // `slice_set` is an in-place write — no allocation, no copy of previous data.
+        let (k_buf, v_buf) = self.kv_buffer.as_mut().expect("kv_buffer allocated above");
+        k_buf.slice_set(&k_new, 2, self.cached_seq_len)?;
+        v_buf.slice_set(&v_new, 2, self.cached_seq_len)?;
+
+        // Update the cached sequence length.
         self.cached_seq_len = self.seq_len;
-        self.kv_cache = Some((k.clone(), v.clone()));
 
+        // Return a zero-copy narrow view of the valid portion of the buffer.
+        let k = k_buf.narrow(2, 0, self.seq_len)?;
+        let v = v_buf.narrow(2, 0, self.seq_len)?;
         Ok((k, v))
     }
 
     /// Clear all cached tokens (start of a new sequence).
+    ///
+    /// The pre-allocated `kv_buffer` is retained but the sequence pointers are
+    /// reset so the buffer is overwritten from position 0 on the next request.
+    /// This avoids re-allocating the Metal buffer on every new request when the
+    /// sequence length is similar across requests.
     pub fn clear(&mut self) {
         for h in 0..self.num_kv_heads {
             self.k_packed[h].clear();
@@ -485,7 +528,8 @@ impl TurboQuantKvCache {
         }
         self.seq_len = 0;
         self.cached_seq_len = 0;
-        self.kv_cache = None;
+        // Retain kv_buffer and kv_buffer_cap — the allocated Metal buffer is
+        // reused for the next sequence; only the write position is reset.
         self.prefill_kv = None;
     }
 }
