@@ -5,6 +5,14 @@ members = [
     "backends/inferrs-backend-rocm",
     "backends/inferrs-backend-vulkan",
 ]
+# Default members exclude the CUDA/ROCm backends, which require the CUDA/ROCm
+# toolchain (nvcc, nvidia-smi, hipcc) and only make sense on Linux with a GPU.
+# `cargo build` (no -p flag) will only build these. To build a GPU backend
+# explicitly: `cargo build -p inferrs-backend-cuda`
+default-members = [
+    "inferrs",
+    "backends/inferrs-backend-vulkan",
+]
 resolver = "2"
 
 [workspace.dependencies]
