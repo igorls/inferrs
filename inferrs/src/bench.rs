@@ -204,6 +204,38 @@ pub fn run(args: BenchArgs) -> Result<()> {
     let p50 = percentile(&sorted_e2e, 50.0);
     let p90 = percentile(&sorted_e2e, 90.0);
 
+    // ── KV cache memory estimate ─────────────────────────────────────────────
+    let kv_mem_str = {
+        let (num_kv_heads, head_dim, num_layers) = raw_config.kv_cache_params(&arch);
+        const GROUP_SIZE: usize = 32;
+        // bytes consumed per token across all layers (K + V combined)
+        let bytes_per_token: usize = if let Some(bits) = serve.turbo_quant {
+            // TurboQuant: nibble-packed indices + f32 per-group absmax scales
+            let index_bytes = if bits <= 4 {
+                // two indices packed per byte
+                head_dim.div_ceil(2)
+            } else {
+                // one index per byte
+                head_dim
+            };
+            let n_groups = head_dim.div_ceil(GROUP_SIZE);
+            let scale_bytes = n_groups * 4; // f32 per group
+                                            // K and V each have index_bytes + scale_bytes, times num_kv_heads, times num_layers
+            (index_bytes + scale_bytes) * 2 * num_kv_heads * num_layers
+        } else {
+            // Regular bf16/f16 or f32 cache
+            let bytes_per_element = dtype.size_in_bytes();
+            head_dim * 2 * num_kv_heads * num_layers * bytes_per_element
+        };
+        let effective_seq_len = if max_seq_len == usize::MAX {
+            args.prompt_len + max_tokens
+        } else {
+            max_seq_len
+        };
+        let total_bytes = bytes_per_token * effective_seq_len;
+        format_bytes(total_bytes)
+    };
+
     println!();
     println!(
         "── Results ({} runs) ──────────────────────────────────────────",
@@ -211,6 +243,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
     );
     println!("  Prompt tokens (avg)     : {mean_prompt_toks:.0}");
     println!("  Output tokens (avg)     : {mean_output_toks:.0}");
+    println!("  KV cache memory         : {kv_mem_str}");
     println!("  Prefill throughput      : {mean_prefill_tps:.1} tok/s");
     println!("  Decode  throughput      : {mean_decode_tps:.1} tok/s");
     println!("  Time to first token     : {mean_prefill_ms:.1} ms");
@@ -220,6 +253,18 @@ pub fn run(args: BenchArgs) -> Result<()> {
     println!("  End-to-end p90          : {p90:.1} ms");
 
     Ok(())
+}
+
+fn format_bytes(bytes: usize) -> String {
+    if bytes >= 1024 * 1024 * 1024 {
+        format!("{:.2} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
