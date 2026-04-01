@@ -113,31 +113,16 @@ pub struct TurboQuantConfig {
 
 const GROUP_SIZE: usize = 32;
 
-/// Quantize a 2D tensor `[seq_len, head_dim]` using per-group absmax.
+/// Quantize a flat CPU f32 slice `data` representing `[seq_len, head_dim]`
+/// using per-group absmax.  Used by `append` to avoid constructing per-head
+/// Tensor objects after a single batched device transfer.
 ///
-/// Each row is split into `head_dim / GROUP_SIZE` groups; each group gets its
-/// own absmax scale. `head_dim` must be divisible by `GROUP_SIZE`.
-///
-/// Returns `(packed, scales, n_elems)`:
-/// - `packed`  — nibble-packed indices, length = `ceil(n_elems / 2)` for bits≤4
-/// - `scales`  — flat absmax values, length = `seq_len * n_groups`
-/// - `n_elems` — `seq_len * head_dim`
-fn quantize(x: &Tensor, bits: u8) -> Result<(Vec<u8>, Vec<f32>, usize)> {
-    let (seq_len, head_dim) = x.dims2()?;
-    if head_dim % GROUP_SIZE != 0 {
-        anyhow::bail!("head_dim {head_dim} must be divisible by GROUP_SIZE {GROUP_SIZE}");
-    }
+/// Returns `(packed, scales)` identical to `quantize()` (minus the `n_elems`
+/// field, which the caller already knows).
+fn quantize_slice(data: &[f32], seq_len: usize, head_dim: usize, bits: u8) -> (Vec<u8>, Vec<f32>) {
     let n_groups = head_dim / GROUP_SIZE;
     let n_levels = 1usize << bits;
     let levels = (n_levels - 1) as f32;
-
-    // Pull to CPU f32 for group-wise processing.
-    let data: Vec<f32> = x
-        .to_dtype(DType::F32)?
-        .to_device(&Device::Cpu)?
-        .contiguous()?
-        .flatten_all()?
-        .to_vec1()?;
 
     let mut idx_u8 = Vec::with_capacity(seq_len * head_dim);
     let mut scales = Vec::with_capacity(seq_len * n_groups);
@@ -147,7 +132,6 @@ fn quantize(x: &Tensor, bits: u8) -> Result<(Vec<u8>, Vec<f32>, usize)> {
             let start = tok * head_dim + g * GROUP_SIZE;
             let group = &data[start..start + GROUP_SIZE];
 
-            // Per-group absmax
             let absmax = group
                 .iter()
                 .cloned()
@@ -155,7 +139,6 @@ fn quantize(x: &Tensor, bits: u8) -> Result<(Vec<u8>, Vec<f32>, usize)> {
                 .max(1e-8);
             scales.push(absmax);
 
-            // Quantize each element in the group
             for &v in group {
                 let v_norm = (v / absmax).clamp(-1.0, 1.0);
                 let idx = ((v_norm + 1.0) * (levels / 2.0)).round().clamp(0.0, levels) as u8;
@@ -164,23 +147,20 @@ fn quantize(x: &Tensor, bits: u8) -> Result<(Vec<u8>, Vec<f32>, usize)> {
         }
     }
 
-    let n_elems = seq_len * head_dim;
-    let packed = pack_indices(&idx_u8, bits);
-    Ok((packed, scales, n_elems))
+    (pack_indices(&idx_u8, bits), scales)
 }
 
-/// Dequantize packed indices back to a `[seq_len, head_dim]` tensor.
-///
-/// `scales` must have length `seq_len * (head_dim / GROUP_SIZE)`.
-fn dequantize_tensor(
+/// Dequantize packed indices and **append** the reconstructed f32 values into
+/// `out`.  Used by `TurboQuantKvCache::dequantize` to build a single flat
+/// buffer covering all heads before a single device upload.
+fn dequantize_into(
     packed: &[u8],
     scales: &[f32],
     seq_len: usize,
     head_dim: usize,
     bits: u8,
-    device: &Device,
-    target_dtype: DType,
-) -> Result<Tensor> {
+    out: &mut Vec<f32>,
+) {
     let n_elems = seq_len * head_dim;
     let n_groups = head_dim / GROUP_SIZE;
     let n_levels = 1usize << bits;
@@ -188,8 +168,6 @@ fn dequantize_tensor(
 
     let idx_u8 = unpack_indices(packed, bits, n_elems);
 
-    // Reconstruct on CPU — same group layout as quantize().
-    let mut data = Vec::with_capacity(n_elems);
     for tok in 0..seq_len {
         for g in 0..n_groups {
             let absmax = scales[tok * n_groups + g];
@@ -197,15 +175,10 @@ fn dequantize_tensor(
             for i in 0..GROUP_SIZE {
                 let idx = idx_u8[base + i] as f32;
                 let v_norm = idx * (2.0 / levels) - 1.0;
-                data.push(v_norm * absmax);
+                out.push(v_norm * absmax);
             }
         }
     }
-
-    Tensor::from_vec(data, (seq_len, head_dim), &Device::Cpu)?
-        .to_device(device)?
-        .to_dtype(target_dtype)
-        .map_err(Into::into)
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +189,13 @@ fn dequantize_tensor(
 ///
 /// Stores nibble-packed indices and per-vector absmax scales independently
 /// per head, so prefill and decode appends compose correctly.
+///
+/// ## Incremental dequantize
+///
+/// After a `dequantize()` call the resulting `[1, num_kv_heads, seq_len, head_dim]`
+/// tensors are kept on-device in `kv_cache`.  On the next decode step only the
+/// newly-appended token(s) are dequantized and concatenated onto the cached
+/// tensor, reducing dequantize work from O(seq_len) to O(new_tokens) per step.
 pub struct TurboQuantKvCache {
     bits: u8,
     orig_dtype: DType,
@@ -229,6 +209,13 @@ pub struct TurboQuantKvCache {
     v_scales: Vec<Vec<f32>>,
     /// Number of tokens cached so far.
     pub seq_len: usize,
+    /// Number of tokens already reflected in `kv_cache` (i.e. already uploaded).
+    /// When `cached_seq_len == seq_len` after an append, only the delta needs
+    /// to be dequantized on the next `dequantize()` call.
+    cached_seq_len: usize,
+    /// On-device KV tensors covering the first `cached_seq_len` tokens.
+    /// Shape: `[1, num_kv_heads, cached_seq_len, head_dim]`.
+    kv_cache: Option<(Tensor, Tensor)>,
 }
 
 impl TurboQuantKvCache {
@@ -244,6 +231,8 @@ impl TurboQuantKvCache {
             v_packed: vec![Vec::new(); num_kv_heads],
             v_scales: vec![Vec::new(); num_kv_heads],
             seq_len: 0,
+            cached_seq_len: 0,
+            kv_cache: None,
         }
     }
 
@@ -252,22 +241,37 @@ impl TurboQuantKvCache {
     /// `k` and `v`: shape `[1, num_kv_heads, new_seq_len, head_dim]`
     pub fn append(&mut self, k: &Tensor, v: &Tensor) -> Result<()> {
         let new_seq = k.dim(2)?;
+        let head_dim = self.head_dim;
 
+        if !head_dim.is_multiple_of(GROUP_SIZE) {
+            anyhow::bail!("head_dim {head_dim} must be divisible by GROUP_SIZE {GROUP_SIZE}");
+        }
+
+        // Single device→CPU transfer for all heads at once instead of one per head.
+        // k layout after squeeze(0)+contiguous: [num_kv_heads, new_seq, head_dim] (row-major).
+        let k_all: Vec<f32> = k
+            .squeeze(0)?
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .contiguous()?
+            .flatten_all()?
+            .to_vec1()?;
+        let v_all: Vec<f32> = v
+            .squeeze(0)?
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .contiguous()?
+            .flatten_all()?
+            .to_vec1()?;
+
+        // Quantize each head from its slice of the flat CPU buffer.
+        let stride = new_seq * head_dim; // elements per head in the flat buffer
         for h in 0..self.num_kv_heads {
-            // Extract head h as a contiguous [new_seq, head_dim] tensor.
-            // contiguous() is required on Metal: narrow() returns a strided
-            // view that reshape cannot reinterpret without materialising first.
-            let kh = k
-                .narrow(1, h, 1)?
-                .contiguous()?
-                .reshape((new_seq, self.head_dim))?;
-            let vh = v
-                .narrow(1, h, 1)?
-                .contiguous()?
-                .reshape((new_seq, self.head_dim))?;
+            let k_slice = &k_all[h * stride..(h + 1) * stride];
+            let v_slice = &v_all[h * stride..(h + 1) * stride];
 
-            let (kh_packed, kh_scales, _) = quantize(&kh, self.bits)?;
-            let (vh_packed, vh_scales, _) = quantize(&vh, self.bits)?;
+            let (kh_packed, kh_scales) = quantize_slice(k_slice, new_seq, head_dim, self.bits);
+            let (vh_packed, vh_scales) = quantize_slice(v_slice, new_seq, head_dim, self.bits);
 
             self.k_packed[h].extend_from_slice(&kh_packed);
             self.k_scales[h].extend_from_slice(&kh_scales);
@@ -280,40 +284,101 @@ impl TurboQuantKvCache {
     }
 
     /// Return dequantized `(k, v)` tensors of shape `[1, num_kv_heads, seq_len, head_dim]`.
-    pub fn dequantize(&self) -> Result<(Tensor, Tensor)> {
+    ///
+    /// Uses an incremental strategy: only tokens beyond `cached_seq_len` are
+    /// dequantized; the result is concatenated onto the cached on-device tensor
+    /// and the cache is updated.  This reduces dequantize work from
+    /// O(seq_len) to O(new_tokens) on every decode step after the first prefill.
+    pub fn dequantize(&mut self) -> Result<(Tensor, Tensor)> {
         if self.seq_len == 0 {
             anyhow::bail!("dequantize called on empty TurboQuantKvCache");
         }
 
-        let mut k_heads = Vec::with_capacity(self.num_kv_heads);
-        let mut v_heads = Vec::with_capacity(self.num_kv_heads);
+        let delta = self.seq_len - self.cached_seq_len;
 
-        for h in 0..self.num_kv_heads {
-            let kh = dequantize_tensor(
-                &self.k_packed[h],
-                &self.k_scales[h],
-                self.seq_len,
-                self.head_dim,
-                self.bits,
-                &self.device,
-                self.orig_dtype,
-            )?;
-            let vh = dequantize_tensor(
-                &self.v_packed[h],
-                &self.v_scales[h],
-                self.seq_len,
-                self.head_dim,
-                self.bits,
-                &self.device,
-                self.orig_dtype,
-            )?;
-            k_heads.push(kh);
-            v_heads.push(vh);
+        if delta == 0 {
+            // Nothing new — return the cached tensors directly.
+            let (k, v) = self
+                .kv_cache
+                .as_ref()
+                .expect("kv_cache must be set when cached_seq_len == seq_len");
+            return Ok((k.clone(), v.clone()));
         }
 
-        // Stack → [num_kv_heads, seq_len, head_dim], then unsqueeze → [1, ...]
-        let k = Tensor::stack(&k_heads, 0)?.unsqueeze(0)?;
-        let v = Tensor::stack(&v_heads, 0)?.unsqueeze(0)?;
+        // Dequantize only the delta (new) tokens.
+        //
+        // Packed storage layout per head: all seq_len tokens in order.
+        // For bits≤4, packed bytes per token = head_dim/2.
+        // For bits>4,  packed bytes per token = head_dim.
+        let bytes_per_token = if self.bits <= 4 {
+            self.head_dim / 2
+        } else {
+            self.head_dim
+        };
+        let scales_per_token = self.head_dim / GROUP_SIZE;
+
+        // Build flat f32 buffers for all heads, then do a single device upload each.
+        let n_new_elems = self.num_kv_heads * delta * self.head_dim;
+        let mut k_new_data = Vec::with_capacity(n_new_elems);
+        let mut v_new_data = Vec::with_capacity(n_new_elems);
+
+        for h in 0..self.num_kv_heads {
+            // Slice into the per-head packed storage to get only the delta tokens.
+            let k_packed_delta = &self.k_packed[h][self.cached_seq_len * bytes_per_token..];
+            let k_scales_delta = &self.k_scales[h][self.cached_seq_len * scales_per_token..];
+            let v_packed_delta = &self.v_packed[h][self.cached_seq_len * bytes_per_token..];
+            let v_scales_delta = &self.v_scales[h][self.cached_seq_len * scales_per_token..];
+
+            dequantize_into(
+                k_packed_delta,
+                k_scales_delta,
+                delta,
+                self.head_dim,
+                self.bits,
+                &mut k_new_data,
+            );
+            dequantize_into(
+                v_packed_delta,
+                v_scales_delta,
+                delta,
+                self.head_dim,
+                self.bits,
+                &mut v_new_data,
+            );
+        }
+
+        // Single device upload for all heads: [num_kv_heads, delta, head_dim] → unsqueeze → [1, ...]
+        let k_new = Tensor::from_vec(
+            k_new_data,
+            (self.num_kv_heads, delta, self.head_dim),
+            &Device::Cpu,
+        )?
+        .to_device(&self.device)?
+        .to_dtype(self.orig_dtype)?
+        .unsqueeze(0)?;
+        let v_new = Tensor::from_vec(
+            v_new_data,
+            (self.num_kv_heads, delta, self.head_dim),
+            &Device::Cpu,
+        )?
+        .to_device(&self.device)?
+        .to_dtype(self.orig_dtype)?
+        .unsqueeze(0)?;
+
+        // Concatenate with existing cache (if any) along the sequence dimension.
+        let (k, v) = match &self.kv_cache {
+            None => (k_new, v_new),
+            Some((k_prev, v_prev)) => {
+                let k = Tensor::cat(&[k_prev, &k_new], 2)?;
+                let v = Tensor::cat(&[v_prev, &v_new], 2)?;
+                (k, v)
+            }
+        };
+
+        // Update the cache.
+        self.cached_seq_len = self.seq_len;
+        self.kv_cache = Some((k.clone(), v.clone()));
+
         Ok((k, v))
     }
 
@@ -326,6 +391,8 @@ impl TurboQuantKvCache {
             self.v_scales[h].clear();
         }
         self.seq_len = 0;
+        self.cached_seq_len = 0;
+        self.kv_cache = None;
     }
 }
 
