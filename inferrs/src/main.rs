@@ -17,7 +17,7 @@ use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "inferrs", about = "A fast LLM inference engine")]
+#[command(name = "inferrs", about = "A TurboQuant inference engine")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
