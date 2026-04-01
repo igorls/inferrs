@@ -32,12 +32,6 @@ brew tap ericcurtin/inferrs
 brew install inferrs
 ```
 
-### Build from source
-
-```bash
-cargo build
-```
-
 ### Run
 
 ```bash
