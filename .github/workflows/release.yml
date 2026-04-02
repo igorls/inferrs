@@ -38,7 +38,7 @@ jobs:
           name: inferrs-aarch64-apple-darwin
           path: inferrs-aarch64-apple-darwin.tar.gz
 
-  # ── Linux x86_64: CPU-only binary + all backend plugins ───────────────────
+  # ── Linux x86_64: main binary (with CUDA support) + all backend plugins ─────
   build-linux-x86:
     name: Build (x86_64-unknown-linux-gnu)
     runs-on: ubuntu-24.04
@@ -53,12 +53,12 @@ jobs:
         with:
           key: release-x86_64-linux
 
-      # ── Main binary (CPU-only, no GPU features) ──────────────────────────
-      - name: Build main binary
-        run: cargo build --release --target x86_64-unknown-linux-gnu -p inferrs
-
-      # ── CUDA backend plugin ──────────────────────────────────────────────
+      # ── CUDA backend plugin + main binary ───────────────────────────────
       # Install the CUDA toolkit headers/stubs (no GPU required to compile).
+      # The main binary and CUDA backend must be built in the same cargo
+      # invocation so that Cargo's feature unification propagates the `cuda`
+      # feature to candle-core inside the main binary — without it,
+      # Device::new_cuda() panics at runtime even when the plugin probe succeeds.
       - name: Install CUDA toolkit
         run: |
           wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
@@ -72,10 +72,10 @@ jobs:
           # so bindgen_cuda skips the nvidia-smi probe and nvcc validation.
           echo "CUDA_COMPUTE_CAP=80" >> "$GITHUB_ENV"
 
-      - name: Build CUDA backend plugin
+      - name: Build main binary + CUDA backend plugin
         run: |
           cargo build --release --target x86_64-unknown-linux-gnu \
-            -p inferrs-backend-cuda
+            -p inferrs -p inferrs-backend-cuda
 
       # ── ROCm backend plugin ──────────────────────────────────────────────
       - name: Install ROCm toolkit
