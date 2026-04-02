@@ -253,29 +253,14 @@ jobs:
             def install
               bin.install "inferrs"
 
-              # Install GPU backend plugins alongside the binary.
-              # The inferrs binary probes these at runtime via dlopen — only the
-              # plugins that match the host hardware are actually used.
-              # Missing plugins are silently skipped (CPU fallback applies).
+              # Install GPU backend plugins alongside the binary so the
+              # inferrs binary can find them via dlopen at runtime.
               %w[
                 libinferrs_backend_cuda.so
                 libinferrs_backend_rocm.so
                 libinferrs_backend_vulkan.so
               ].each do |plugin|
-                (lib / "inferrs").install plugin if File.exist?(plugin)
-              end
-            end
-
-            def post_install
-              # Create a symlink so the binary can find sibling plugins in the
-              # same directory (the binary searches its own dir first).
-              # On Linux, also link into the standard search path.
-              return unless OS.linux?
-
-              plugin_dir = lib / "inferrs"
-              bin_dir    = bin.realpath
-              plugin_dir.children.select { |f| f.extname == ".so" }.each do |so|
-                (bin_dir / so.basename).make_symlink(so) unless (bin_dir / so.basename).exist?
+                bin.install plugin if File.exist?(plugin)
               end
             end
 
