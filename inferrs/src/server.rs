@@ -202,8 +202,16 @@ pub async fn run(args: ServeArgs) -> Result<()> {
     let device = args.resolve_device()?;
     let dtype = args.resolve_dtype()?;
 
-    // Download model
-    let model_files = crate::hub::download_model(&args.model, &args.revision)?;
+    // Parse --quantize format string if provided.
+    let quant_dtype = args
+        .quantize
+        .as_deref()
+        .map(crate::quantize::parse_format)
+        .transpose()?;
+
+    // Download model (and quantize/cache as GGUF if requested).
+    let model_files =
+        crate::hub::download_and_maybe_quantize(&args.model, &args.revision, quant_dtype)?;
 
     // Load config
     let raw_config = RawConfig::from_file(&model_files.config_path)?;
@@ -223,6 +231,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         &raw_config,
         &arch,
         &model_files.weight_paths,
+        model_files.gguf_path.as_deref(),
         dtype,
         &device,
         args.turbo_quant,

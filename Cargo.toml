@@ -23,3 +23,10 @@ anyhow = "1"
 
 [profile.release]
 lto = true
+
+# Patch candle crates with local forks that add:
+#   - SDPA vector kernel instantiations for head_dim=512 (Gemma4 global attention)
+#   - supported_head_dim check updated to include 512
+[patch.crates-io]
+candle-metal-kernels = { path = "candle-metal-kernels" }
+candle-nn = { path = "candle-nn" }

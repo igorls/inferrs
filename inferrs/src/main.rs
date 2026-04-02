@@ -5,6 +5,7 @@ mod engine;
 mod hub;
 mod kv_cache;
 mod models;
+mod quantize;
 mod rm;
 mod run;
 mod sampler;
@@ -114,6 +115,19 @@ pub struct ServeArgs {
     /// 4-bit gives ~3.5× but may produce poor output on models with large QK-norm values.
     #[arg(long, num_args(0..=1), default_missing_value("8"), require_equals(true))]
     pub turbo_quant: Option<u8>,
+
+    /// Quantize model weights and cache the result on disk as a GGUF file.
+    /// On first use the weights are quantized and saved next to the HuggingFace cache;
+    /// subsequent runs reuse the cached GGUF, so the slow conversion only happens once.
+    ///
+    /// Accepted formats (case-insensitive): Q4_0, Q4_1, Q5_0, Q5_1, Q8_0,
+    /// Q2K, Q3K, Q4K (Q4_K_M), Q5K, Q6K.
+    ///
+    /// When used as a plain flag (`--quantize`) the default Q4_K_M (= Q4K) is used.
+    /// Embedding and output (lm_head) tensors are kept at F16 for accuracy.
+    #[arg(long, num_args(0..=1), default_missing_value("Q4K"), require_equals(true),
+          value_name = "FORMAT")]
+    pub quantize: Option<String>,
 }
 
 impl ServeArgs {
