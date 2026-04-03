@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::StatusCode,
     response::{
         sse::{Event, Sse},
@@ -19,9 +19,11 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tower_http::cors::CorsLayer;
 
-use crate::engine::{load_engine, EngineRequest, GenerationResult, OutputBuffer, StreamToken};
+use crate::engine::{
+    load_engine, AudioEmbedContext, EngineRequest, GenerationResult, OutputBuffer, StreamToken,
+};
 use crate::sampler::SamplingParams;
-use crate::tokenizer::{ChatMessage, Role, Tokenizer};
+use crate::tokenizer::{apply_gemma4_with_audio, AudioInput, ChatMessage, Role, Tokenizer};
 use crate::ServeArgs;
 
 // ---------------------------------------------------------------------------
@@ -442,6 +444,7 @@ fn anthropic_messages_to_chat(
         chat_messages.push(ChatMessage {
             role: Role::System,
             content: sys.to_string(),
+            audio: None,
         });
     }
     for msg in messages {
@@ -452,6 +455,7 @@ fn anthropic_messages_to_chat(
         chat_messages.push(ChatMessage {
             role,
             content: msg.content.clone(),
+            audio: None,
         });
     }
     chat_messages
@@ -470,6 +474,20 @@ struct AppState {
     output_buf: OutputBuffer,
     /// Maps request_id → per-client SSE channel.
     stream_registry: StreamRegistry,
+    /// Token ID for `<|audio|>` soft tokens, present when model supports audio.
+    audio_token_id: Option<u32>,
+}
+
+fn audio_error(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: ErrorDetail {
+                message: message.into(),
+                r#type: "invalid_request_error".to_string(),
+            },
+        }),
+    )
 }
 
 // ─── Server startup ─────────────────────────────────────────────────────────
@@ -494,6 +512,10 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         ..SamplingParams::default()
     };
 
+    // Extract values from ctx before it is moved into the engine thread.
+    let max_seq_len = ctx.max_seq_len;
+    let audio_token_id = ctx.raw_config.audio_token_id;
+
     // Create the shared output buffer and per-request stream registry.
     let output_buf = OutputBuffer::new();
     let stream_registry: StreamRegistry = Arc::new(Mutex::new(HashMap::new()));
@@ -514,9 +536,10 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         engine_tx,
         tokenizer,
         default_params,
-        max_seq_len: ctx.max_seq_len,
+        max_seq_len,
         output_buf,
         stream_registry,
+        audio_token_id,
     });
 
     // Build router
@@ -526,6 +549,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/models", get(list_models))
         .route("/health", get(health))
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024)) // 64 MiB for audio payloads
         .layer(CorsLayer::permissive())
         .with_state(state);
 
@@ -548,20 +572,97 @@ async fn chat_completions(
     let created = unix_now();
     let model_id = req.model.clone().unwrap_or_else(|| state.model_id.clone());
 
-    // Apply chat template and tokenize
-    let prompt_tokens = match state
-        .tokenizer
-        .apply_chat_template_and_encode(&req.messages)
-    {
-        Ok(tokens) => tokens,
-        Err(e) => return Err(tokenization_error(e)),
+    // ── Audio preprocessing ──────────────────────────────────────────────────
+    // If any message has an audio attachment:
+    //   1. Decode audio bytes → PCM samples
+    //   2. Compute log-mel spectrogram → Tensor [1, T, 128]
+    //   3. Determine N = T / 4 (audio soft tokens after 4× subsampling)
+    //   4. Tokenize the prompt with N audio soft-token placeholders
+    //   5. Build AudioEmbedContext carrying the mel tensor (encoding happens on
+    //      the engine thread which owns the model weights)
+    let has_audio = req.messages.iter().any(|m| m.audio.is_some());
+
+    let (prompt_tokens, audio_ctx) = if has_audio {
+        let audio_token_id = state.audio_token_id.ok_or_else(|| {
+            audio_error("This model does not support audio input (no audio_token_id in config)")
+        })?;
+
+        // Collect audio inputs in message order.
+        let audio_inputs: Vec<&AudioInput> = req
+            .messages
+            .iter()
+            .filter_map(|m| m.audio.as_ref())
+            .collect();
+
+        if audio_inputs.len() > 1 {
+            return Err(audio_error(
+                "Only one audio input per request is currently supported",
+            ));
+        }
+        let audio_in = audio_inputs[0];
+
+        let raw_bytes =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &audio_in.data)
+                .map_err(|e| audio_error(format!("Base64 decode failed: {e}")))?;
+
+        let samples = crate::audio::decode_audio(&raw_bytes, &audio_in.format)
+            .map_err(|e| audio_error(format!("Audio decode failed: {e}")))?;
+
+        let (mel_data, n_mel_frames) = crate::audio::compute_log_mel(&samples)
+            .map_err(|e| audio_error(format!("Mel spectrogram failed: {e}")))?;
+
+        // Number of audio soft tokens after two stride-2 conv layers (kernel=3, padding=1).
+        // Each pass: out = floor((in - 1) / 2) + 1  (= ceil(in / 2)).
+        // Cap to AudioEncoder::MAX_MEL_FRAMES to match encoder truncation.
+        let effective_mel_frames =
+            n_mel_frames.min(crate::models::audio_encoder::AudioEncoder::MAX_MEL_FRAMES);
+        let after_pass1 = (effective_mel_frames.saturating_sub(1)) / 2 + 1;
+        let n_audio_tokens = (after_pass1.saturating_sub(1)) / 2 + 1;
+
+        // Tokenize with audio soft-token placeholders.
+        let prompt = apply_gemma4_with_audio(&req.messages, &[n_audio_tokens]);
+        let tokens = state
+            .tokenizer
+            .encode(&prompt, false)
+            .map_err(tokenization_error)?;
+
+        // Build mel tensor on CPU (engine thread moves it to device).
+        let mel_tensor = candle_core::Tensor::from_vec(
+            mel_data,
+            (1, n_mel_frames, crate::audio::N_MEL),
+            &candle_core::Device::Cpu,
+        )
+        .map_err(|e| server_error(format!("Mel tensor creation failed: {e}")))?
+        .to_dtype(candle_core::DType::F32)
+        .map_err(|e| server_error(format!("Mel dtype conversion failed: {e}")))?;
+
+        let audio_ctx = AudioEmbedContext {
+            mel: mel_tensor,
+            audio_token_id,
+        };
+
+        (tokens, Some(audio_ctx))
+    } else {
+        let tokens = match state
+            .tokenizer
+            .apply_chat_template_and_encode(&req.messages)
+        {
+            Ok(t) => t,
+            Err(e) => return Err(tokenization_error(e)),
+        };
+        (tokens, None)
     };
 
     tracing::info!(
-        "Request {}: {} messages, {} prompt tokens",
+        "Request {}: {} messages, {} prompt tokens{}",
         request_id,
         req.messages.len(),
-        prompt_tokens.len()
+        prompt_tokens.len(),
+        if audio_ctx.is_some() {
+            " (with audio)"
+        } else {
+            ""
+        }
     );
 
     check_prompt_length(prompt_tokens.len(), state.max_seq_len)?;
@@ -595,6 +696,7 @@ async fn chat_completions(
         let engine_req = EngineRequest::GenerateStream {
             request_id: request_id.clone(),
             prompt_tokens: prompt_tokens.clone(),
+            audio: audio_ctx,
             sampling_params: params,
             output_buf: state.output_buf.clone(),
         };
@@ -613,6 +715,7 @@ async fn chat_completions(
         let engine_req = EngineRequest::Generate {
             request_id: request_id.clone(),
             prompt_tokens: prompt_tokens.clone(),
+            audio: audio_ctx,
             sampling_params: params,
             response_tx,
         };
@@ -813,6 +916,7 @@ async fn completions(
         let engine_req = EngineRequest::GenerateStream {
             request_id: request_id.clone(),
             prompt_tokens,
+            audio: None,
             sampling_params: params,
             output_buf: state.output_buf.clone(),
         };
@@ -831,6 +935,7 @@ async fn completions(
         let engine_req = EngineRequest::Generate {
             request_id: request_id.clone(),
             prompt_tokens,
+            audio: None,
             sampling_params: params,
             response_tx,
         };
@@ -971,6 +1076,7 @@ async fn anthropic_messages(
         let engine_req = EngineRequest::GenerateStream {
             request_id: request_id.clone(),
             prompt_tokens: prompt_tokens.clone(),
+            audio: None,
             sampling_params: params,
             output_buf: state.output_buf.clone(),
         };
@@ -992,6 +1098,7 @@ async fn anthropic_messages(
         let engine_req = EngineRequest::Generate {
             request_id: request_id.clone(),
             prompt_tokens: prompt_tokens.clone(),
+            audio: None,
             sampling_params: params,
             response_tx,
         };

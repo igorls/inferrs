@@ -65,6 +65,58 @@ pub struct TextConfig {
     pub attention_k_eq_v: Option<bool>,
 }
 
+/// Audio encoder configuration from `audio_config` in `config.json`.
+#[derive(Debug, Deserialize, Clone)]
+pub struct AudioConfig {
+    pub hidden_size: usize,
+    pub num_hidden_layers: usize,
+    pub num_attention_heads: usize,
+    pub output_proj_dims: usize,
+    #[serde(default = "default_rms_norm_eps")]
+    pub rms_norm_eps: f64,
+    pub subsampling_conv_channels: Vec<usize>,
+    #[serde(default = "default_conv_kernel_size")]
+    pub conv_kernel_size: usize,
+    pub attention_chunk_size: usize,
+    pub attention_context_left: usize,
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub attention_context_right: usize,
+    #[serde(default = "default_logit_cap")]
+    pub attention_logit_cap: f64,
+    #[serde(default = "default_invalid_logit")]
+    pub attention_invalid_logits_value: f64,
+    #[serde(default = "default_residual_weight")]
+    pub residual_weight: f64,
+    #[serde(default = "default_gradient_clipping")]
+    pub gradient_clipping: f64,
+    #[allow(dead_code)]
+    #[serde(default = "default_hidden_act")]
+    pub hidden_act: String,
+}
+
+fn default_rms_norm_eps() -> f64 {
+    1e-6
+}
+fn default_conv_kernel_size() -> usize {
+    5
+}
+fn default_logit_cap() -> f64 {
+    50.0
+}
+fn default_invalid_logit() -> f64 {
+    -1e9
+}
+fn default_residual_weight() -> f64 {
+    0.5
+}
+fn default_gradient_clipping() -> f64 {
+    1e10
+}
+fn default_hidden_act() -> String {
+    "silu".to_string()
+}
+
 /// Raw config.json from HuggingFace.
 #[derive(Debug, Deserialize)]
 pub struct RawConfig {
@@ -106,6 +158,10 @@ pub struct RawConfig {
 
     // Qwen3.5/Gemma4-specific (nested text_config)
     pub text_config: Option<TextConfig>,
+
+    // Gemma4 multimodal
+    pub audio_config: Option<AudioConfig>,
+    pub audio_token_id: Option<u32>,
 }
 
 /// Default epsilon for RMS normalization layers across all model families.
@@ -624,6 +680,8 @@ mod tests {
             sliding_window_pattern: None,
             layer_types: None,
             text_config: None,
+            audio_config: None,
+            audio_token_id: None,
         }
     }
 

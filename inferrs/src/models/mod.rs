@@ -4,6 +4,7 @@
 //! with a unified trait for the engine to use.
 
 pub mod attention_utils;
+pub mod audio_encoder;
 pub mod gemma4;
 pub mod qwen3;
 pub mod qwen3_5;
@@ -40,6 +41,28 @@ pub trait CausalLM: Send {
 
     /// Clear all KV caches (for starting a new sequence).
     fn clear_kv_cache(&mut self);
+
+    // ── Audio ────────────────────────────────────────────────────────────────
+
+    /// Returns `true` if this model has an audio encoder.
+    #[allow(dead_code)]
+    fn has_audio_tower(&self) -> bool {
+        false
+    }
+
+    /// Encode a log-mel spectrogram (f32, shape `[1, T, 128]`) to LM-space
+    /// embeddings of shape `[T/4, lm_hidden_size]`.
+    ///
+    /// Returns an error for models without an audio encoder.
+    fn encode_audio(&mut self, _mel: &Tensor) -> Result<Tensor> {
+        anyhow::bail!("this model does not have an audio encoder")
+    }
+
+    /// Store audio embeddings to be injected during the next `forward()` call.
+    ///
+    /// `embeds`:    `[N, lm_hidden_size]` — output of `encode_audio`
+    /// `positions`: indices in the upcoming `input_ids` that hold audio soft tokens
+    fn set_pending_audio(&mut self, _embeds: Tensor, _positions: Vec<usize>) {}
 }
 
 /// Implement `CausalLM` for a simple newtype wrapper whose `inner` field
@@ -97,18 +120,43 @@ impl CausalLM for Qwen3ModelWrapper {
     }
 }
 
-/// A Gemma4 model wrapper.
+/// A Gemma4 model wrapper (with optional audio encoder).
 struct Gemma4ModelWrapper {
     inner: gemma4::Gemma4Model,
+    audio_encoder: Option<crate::models::audio_encoder::AudioEncoder>,
+    /// Pending audio: embeddings + positions of audio soft tokens in input_ids.
+    pending_audio: Option<(Tensor, Vec<usize>)>,
 }
 
 impl CausalLM for Gemma4ModelWrapper {
     fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
-        Ok(self.inner.forward(input_ids, seqlen_offset)?)
+        if let Some((audio_embeds, positions)) = self.pending_audio.take() {
+            Ok(self
+                .inner
+                .forward_with_audio(input_ids, seqlen_offset, audio_embeds, positions)?)
+        } else {
+            Ok(self.inner.forward(input_ids, seqlen_offset)?)
+        }
     }
 
     fn clear_kv_cache(&mut self) {
         self.inner.clear_kv_cache();
+    }
+
+    fn has_audio_tower(&self) -> bool {
+        self.audio_encoder.is_some()
+    }
+
+    fn encode_audio(&mut self, mel: &Tensor) -> Result<Tensor> {
+        let enc = self
+            .audio_encoder
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Gemma4 model was loaded without an audio tower"))?;
+        enc.encode(mel)
+    }
+
+    fn set_pending_audio(&mut self, embeds: Tensor, positions: Vec<usize>) {
+        self.pending_audio = Some((embeds, positions));
     }
 }
 
@@ -390,8 +438,34 @@ pub fn load_model(
                 config.hidden_size,
                 config.num_key_value_heads,
             );
+            let inner = gemma4::Gemma4Model::new(&config, vb.clone(), gemma4_qvb.as_ref())?;
+
+            // Load audio encoder if audio_config is present in the model config.
+            let audio_encoder = if let Some(audio_cfg) = &raw_config.audio_config {
+                tracing::info!(
+                    "Gemma4 audio encoder: {} layers, hidden={}, output_dims={}",
+                    audio_cfg.num_hidden_layers,
+                    audio_cfg.hidden_size,
+                    audio_cfg.output_proj_dims,
+                );
+                let enc = audio_encoder::AudioEncoder::load(
+                    vb.pp("model"),
+                    audio_cfg,
+                    config.hidden_size,
+                    device,
+                    dtype,
+                )
+                .context("Failed to load Gemma4 audio encoder")?;
+                tracing::info!("Audio encoder loaded successfully");
+                Some(enc)
+            } else {
+                None
+            };
+
             Box::new(Gemma4ModelWrapper {
-                inner: gemma4::Gemma4Model::new(&config, vb, gemma4_qvb.as_ref())?,
+                inner,
+                audio_encoder,
+                pending_audio: None,
             })
         }
     };

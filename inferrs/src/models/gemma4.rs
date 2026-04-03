@@ -1965,14 +1965,102 @@ impl Gemma4Model {
         mask_1.expand((b_size, 1, tgt_len, kv_len))
     }
 
+    /// Forward pass with pre-computed audio embeddings.
+    ///
+    /// `audio_embeds`:   `[N, hidden_size]` — output of the audio encoder in LM space
+    /// `audio_positions`: positions in `input_ids` that are `<|audio|>` soft tokens
+    ///
+    /// Audio embeddings are in the unscaled token embedding space; they are
+    /// inserted before the `sqrt(hidden_size)` scale is applied, exactly as in
+    /// the reference `Gemma4ForConditionalGeneration.forward`.
+    pub fn forward_with_audio(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        audio_embeds: Tensor,
+        audio_positions: Vec<usize>,
+    ) -> Result<Tensor> {
+        let (b_size, seq_len) = input_ids.dims2()?;
+
+        // Replace audio soft token IDs with 0 (pad) to avoid OOB embedding lookup.
+        let safe_ids = {
+            let ids_data = input_ids.to_vec2::<u32>()?;
+            let mut safe: Vec<u32> = ids_data.into_iter().flatten().collect();
+            for &pos in &audio_positions {
+                if pos < safe.len() {
+                    safe[pos] = 0;
+                }
+            }
+            Tensor::from_vec(safe, (b_size, seq_len), input_ids.device())?
+        };
+
+        // Embed tokens and scale by sqrt(hidden_size) — same as in forward().
+        // This matches the reference Gemma4TextScaledWordEmbedding which bakes
+        // the scale into the embedding lookup.
+        let xs = self.embed_tokens.forward(&safe_ids)?;
+        let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
+
+        // Inject audio embeddings into the already-scaled embedding tensor.
+        // Audio features from embedding_projection are trained to live in the
+        // scaled embedding space (the reference injects them after embed_tokens,
+        // which includes the sqrt scale).
+        //
+        // Save text-only xs (PAD at audio positions) for PLI computation.
+        // The reference uses llm_inputs_embeds (PAD at audio) for per_layer_model_projection,
+        // not the audio-injected embeddings.  Cloning before injection preserves that.
+        let xs_for_pli = xs.clone();
+        let audio_embeds = audio_embeds.to_device(xs.device())?.to_dtype(xs.dtype())?;
+        let h = self.hidden_size;
+        tracing::info!(
+            "forward_with_audio: injecting {} audio embeddings at {} positions",
+            audio_embeds.dim(0).unwrap_or(0),
+            audio_positions.len()
+        );
+        for (audio_idx, &pos) in audio_positions.iter().enumerate() {
+            if audio_idx >= audio_embeds.dim(0)? {
+                break;
+            }
+            let emb = audio_embeds.narrow(0, audio_idx, 1)?.unsqueeze(0)?; // [1, 1, H]
+            xs = xs.slice_assign(&[0..b_size, pos..pos + 1, 0..h], &emb)?;
+        }
+
+        self.forward_transformer(
+            b_size,
+            seq_len,
+            seqlen_offset,
+            &safe_ids,
+            Some(&xs_for_pli),
+            xs,
+        )
+    }
+
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let (b_size, seq_len) = input_ids.dims2()?;
 
         // Main token embeddings (scaled by sqrt(hidden_size) via embed_tokens convention)
         // Note: the Gemma embedding is raw; we scale here as in Gemma3.
         let xs = self.embed_tokens.forward(input_ids)?;
-        let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
+        let xs = (xs * (self.hidden_size as f64).sqrt())?;
 
+        self.forward_transformer(b_size, seq_len, seqlen_offset, input_ids, None, xs)
+    }
+
+    /// Shared transformer body — runs PLI, attention layers, and lm_head.
+    ///
+    /// `ids_for_pli`: the token IDs used for PLI embedding lookup.  For the
+    /// audio path this is the safe (audio positions zeroed) IDs tensor.
+    fn forward_transformer(
+        &mut self,
+        b_size: usize,
+        seq_len: usize,
+        seqlen_offset: usize,
+        ids_for_pli: &Tensor,
+        // Text-only embeddings for PLI projection (PAD at audio positions).
+        // When Some, used for per_layer_model_projection instead of xs.
+        // Matches reference behavior: PLI uses llm_inputs_embeds (PAD at audio).
+        xs_for_pli: Option<&Tensor>,
+        mut xs: Tensor,
+    ) -> Result<Tensor> {
         // Per-layer inputs (PLI) — only for efficient variants.
         //
         // `pli_all` has shape [b, seq_len, num_hidden_layers, pli_dim].
@@ -1987,7 +2075,7 @@ impl Gemma4Model {
         let pli_per_layer: Vec<Option<Tensor>> = if let Some(model_pli) = &self.pli {
             // Embedding lookup on CPU, then transfer result to GPU.
             // The full table is CPU-resident to avoid exhausting VRAM.
-            let ids_cpu = input_ids.to_device(&Device::Cpu)?;
+            let ids_cpu = ids_for_pli.to_device(&Device::Cpu)?;
             let embed_dim = model_pli.embed_tokens_per_layer_cpu.dim(1)?;
             let mut out_dims = ids_cpu.dims().to_vec();
             out_dims.push(embed_dim);
@@ -1998,7 +2086,11 @@ impl Gemma4Model {
                 .reshape(out_dims)?;
             let pli_embed = pli_embed_cpu.to_device(&model_pli.gpu_device)?;
             let pli_embed = (pli_embed * model_pli.embed_combined_scale)?;
-            let pli_proj = xs.apply(&model_pli.per_layer_model_projection)?;
+            // For the audio path, per_layer_model_projection must use text-only embeddings
+            // (PAD at audio positions), matching the reference Gemma4Model.forward() which
+            // computes per_layer_inputs from llm_inputs_embeds (not the audio-injected ones).
+            let proj_input = xs_for_pli.unwrap_or(&xs);
+            let pli_proj = proj_input.apply(&model_pli.per_layer_model_projection)?;
             let pli_proj =
                 pli_proj.reshape((b_size, seq_len, self.num_hidden_layers, model_pli.pli_dim))?;
             let pli_proj = model_pli.per_layer_projection_norm.forward(&pli_proj)?;

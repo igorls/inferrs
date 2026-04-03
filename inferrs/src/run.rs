@@ -170,6 +170,7 @@ fn run_blocking(args: RunArgs) -> Result<()> {
     if let Some(sys) = &args.system {
         messages.push(ChatMessage {
             role: Role::System,
+            audio: None,
             content: sys.clone(),
         });
     }
@@ -178,6 +179,7 @@ fn run_blocking(args: RunArgs) -> Result<()> {
     if let Some(prompt) = args.prompt {
         messages.push(ChatMessage {
             role: Role::User,
+            audio: None,
             content: prompt,
         });
         let prompt_tokens = tokenizer.apply_chat_template_and_encode(&messages)?;
@@ -288,6 +290,7 @@ fn repl(
         messages.push(ChatMessage {
             role: Role::User,
             content: user_content,
+            audio: None,
         });
 
         // Encode the full conversation with the chat template
@@ -316,6 +319,7 @@ fn repl(
         // Append assistant turn to history
         messages.push(ChatMessage {
             role: Role::Assistant,
+            audio: None,
             content: assistant_text,
         });
     }
@@ -350,6 +354,7 @@ fn handle_command(cmd: &str, messages: &mut Vec<ChatMessage>, params: &SamplingP
                         ChatMessage {
                             role: Role::System,
                             content: parts[2].to_string(),
+                            audio: None,
                         },
                     );
                     println!("System prompt set.");

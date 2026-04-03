@@ -18,8 +18,73 @@ pub struct ModelFiles {
     pub gguf_path: Option<PathBuf>,
 }
 
+/// Load model files from a local directory (no network required).
+pub fn load_local_model(path: &std::path::Path) -> Result<ModelFiles> {
+    tracing::info!("Loading model from local path: {}", path.display());
+
+    let config_path = path.join("config.json");
+    anyhow::ensure!(
+        config_path.exists(),
+        "config.json not found in {}",
+        path.display()
+    );
+
+    let tokenizer_path = path.join("tokenizer.json");
+    anyhow::ensure!(
+        tokenizer_path.exists(),
+        "tokenizer.json not found in {}",
+        path.display()
+    );
+
+    let tokenizer_config_path = {
+        let p = path.join("tokenizer_config.json");
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
+    };
+
+    // Prefer model.safetensors, then scan for shards
+    let weight_paths = if path.join("model.safetensors").exists() {
+        vec![path.join("model.safetensors")]
+    } else {
+        let mut shards: Vec<PathBuf> = std::fs::read_dir(path)
+            .with_context(|| format!("Cannot read {}", path.display()))?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().map(|e| e == "safetensors").unwrap_or(false))
+            .collect();
+        shards.sort();
+        anyhow::ensure!(
+            !shards.is_empty(),
+            "No safetensors files found in {}",
+            path.display()
+        );
+        shards
+    };
+
+    Ok(ModelFiles {
+        config_path,
+        tokenizer_path,
+        tokenizer_config_path,
+        weight_paths,
+        gguf_path: None,
+    })
+}
+
 /// Download model files from HuggingFace Hub.
 pub fn download_model(model_id: &str, revision: &str) -> Result<ModelFiles> {
+    // If the model_id looks like a local path, load directly without network.
+    let as_path = std::path::Path::new(model_id);
+    if as_path.is_absolute()
+        || model_id.starts_with("./")
+        || model_id.starts_with("../")
+        || as_path.exists()
+    {
+        return load_local_model(as_path);
+    }
+
     tracing::info!("Downloading model {} (revision: {})", model_id, revision);
 
     let api = Api::new().context("Failed to create HuggingFace API client")?;

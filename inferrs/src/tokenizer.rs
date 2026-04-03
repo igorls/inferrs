@@ -23,11 +23,28 @@ impl std::fmt::Display for Role {
     }
 }
 
-/// A chat message.
+/// Audio attachment on a chat message.
+///
+/// `data` is a base64-encoded audio file.  `format` should be `"wav"` (default)
+/// or `"pcm_f32"` (raw little-endian f32 samples at 16 kHz).
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+pub struct AudioInput {
+    pub data: String,
+    #[serde(default = "default_audio_format")]
+    pub format: String,
+}
+
+fn default_audio_format() -> String {
+    "wav".to_string()
+}
+
+/// A chat message (text + optional audio attachment).
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     pub content: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio: Option<AudioInput>,
 }
 
 /// Chat template format detected from the model.
@@ -328,26 +345,54 @@ fn apply_gemma3(messages: &[ChatMessage]) -> String {
     )
 }
 
-/// Gemma4 chat template.
+/// Gemma4 chat template (text-only, no audio).
 ///
 /// Format: `<bos>\n<|turn>role\ncontent<turn|>\n`
 /// The assistant turn uses "model" as the role label.
 fn apply_gemma4(messages: &[ChatMessage]) -> String {
-    // The Gemma4 jinja template emits `{{ bos_token }}\n` — there is a literal
-    // newline directly after the bos token before the first turn marker.
-    apply_gemma_family(
-        messages,
-        "<bos>\n",
-        "<|turn>",
-        "<turn|>\n",
-        "<|turn>model\n",
-        |role| match role {
+    apply_gemma4_inner(messages, &[])
+}
+
+/// Gemma4 template with audio soft-token placeholders.
+///
+/// For each message that has an `audio` field, `n_audio_tokens` audio soft
+/// token placeholders are inserted between `<boa>` and `<eoa>`.
+/// `audio_token_counts[i]` is the number of soft tokens for the i-th audio
+/// message (in encounter order across all messages).
+pub fn apply_gemma4_with_audio(messages: &[ChatMessage], audio_token_counts: &[usize]) -> String {
+    apply_gemma4_inner(messages, audio_token_counts)
+}
+
+fn apply_gemma4_inner(messages: &[ChatMessage], audio_token_counts: &[usize]) -> String {
+    // Reference format (from AutoProcessor.apply_chat_template):
+    //   <bos><|turn>user\n<|audio><|audio|>×N<audio|>text<turn|>\n<|turn>model\n
+    // No \n after <bos>, no \n between <audio|> and text.
+    let mut prompt = String::from("<bos>");
+    let mut audio_idx = 0usize;
+    for msg in messages {
+        let role = match msg.role {
             Role::System => "system",
             Role::User => "user",
             Role::Assistant => "model",
-        },
-        str::trim,
-    )
+        };
+        // Build the content, inserting audio tokens if this message has audio.
+        // Token strings from the Gemma4 tokenizer:
+        //   <|audio>   = begin-of-audio  (id 256000)
+        //   <|audio|>  = audio soft token (id 258881), repeated N times
+        //   <audio|>   = end-of-audio    (id 258883)
+        let content = if msg.audio.is_some() {
+            let n = audio_token_counts.get(audio_idx).copied().unwrap_or(0);
+            audio_idx += 1;
+            let soft_tokens = "<|audio|>".repeat(n);
+            // No newline between <audio|> and text — matches reference template.
+            format!("<|audio>{soft_tokens}<audio|>{}", msg.content.trim())
+        } else {
+            msg.content.trim().to_string()
+        };
+        prompt.push_str(&format!("<|turn>{}\n{}<turn|>\n", role, content));
+    }
+    prompt.push_str("<|turn>model\n");
+    prompt
 }
 
 fn apply_generic(messages: &[ChatMessage]) -> String {
@@ -366,6 +411,7 @@ mod tests {
     fn user_msg(content: &str) -> ChatMessage {
         ChatMessage {
             role: Role::User,
+            audio: None,
             content: content.to_string(),
         }
     }
@@ -373,6 +419,7 @@ mod tests {
     fn system_msg(content: &str) -> ChatMessage {
         ChatMessage {
             role: Role::System,
+            audio: None,
             content: content.to_string(),
         }
     }
@@ -380,6 +427,7 @@ mod tests {
     fn assistant_msg(content: &str) -> ChatMessage {
         ChatMessage {
             role: Role::Assistant,
+            audio: None,
             content: content.to_string(),
         }
     }

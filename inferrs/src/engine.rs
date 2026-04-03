@@ -183,12 +183,23 @@ impl TokenSender for std::sync::mpsc::SyncSender<StreamToken> {
     }
 }
 
+/// Audio input pending encoding on the engine thread.
+pub struct AudioEmbedContext {
+    /// Log-mel spectrogram: shape `[1, T, 128]` on CPU (f32).
+    /// The engine thread calls `model.encode_audio(mel)` before prefill.
+    pub mel: candle_core::Tensor,
+    /// Token ID for `<|audio|>` soft tokens; used to locate positions in
+    /// `prompt_tokens` where audio embeddings should be injected.
+    pub audio_token_id: u32,
+}
+
 /// Request to the engine (async/tokio version, used by the HTTP server).
 pub enum EngineRequest {
     /// Generate tokens for a chat completion.
     Generate {
         request_id: String,
         prompt_tokens: Vec<u32>,
+        audio: Option<AudioEmbedContext>,
         sampling_params: SamplingParams,
         response_tx: oneshot::Sender<GenerationResult>,
     },
@@ -200,6 +211,7 @@ pub enum EngineRequest {
     GenerateStream {
         request_id: String,
         prompt_tokens: Vec<u32>,
+        audio: Option<AudioEmbedContext>,
         sampling_params: SamplingParams,
         output_buf: OutputBuffer,
     },
@@ -321,6 +333,8 @@ struct ActiveSequence {
     all_tokens: Vec<u32>,
     sampling_params: SamplingParams,
     sink: TokenSink,
+    /// Pending audio context to be prepared before the first prefill.
+    audio: Option<AudioEmbedContext>,
     /// Per-sequence block table for paged attention.
     /// `None` when running without paged attention.
     block_table: Option<BlockTable>,
@@ -342,6 +356,7 @@ impl ActiveSequence {
             EngineRequest::Generate {
                 request_id,
                 prompt_tokens,
+                audio,
                 sampling_params,
                 response_tx,
             } => {
@@ -352,6 +367,7 @@ impl ActiveSequence {
                     output_tokens: Vec::new(),
                     all_tokens,
                     sampling_params,
+                    audio,
                     sink: TokenSink::OneShot(Some(response_tx)),
                     block_table: block_size.map(BlockTable::new),
                     prefilled: false,
@@ -361,6 +377,7 @@ impl ActiveSequence {
             EngineRequest::GenerateStream {
                 request_id,
                 prompt_tokens,
+                audio,
                 sampling_params,
                 output_buf,
             } => {
@@ -371,6 +388,7 @@ impl ActiveSequence {
                     output_tokens: Vec::new(),
                     all_tokens,
                     sampling_params,
+                    audio,
                     sink: TokenSink::Streaming {
                         request_id,
                         output_buf,
@@ -674,6 +692,21 @@ impl Engine {
                     continue;
                 }
 
+                // Prepare audio embeddings before the first prefill.
+                if !seq.prefilled {
+                    if let Some(audio_ctx) = seq.audio.take() {
+                        if let Err(e) = Self::cb_prepare_audio(
+                            &mut model,
+                            &device,
+                            &seq.prompt_tokens,
+                            audio_ctx,
+                        ) {
+                            seq.finish_error(e, paged.as_mut().map(|ps| &mut ps.block_pool));
+                            continue;
+                        }
+                    }
+                }
+
                 let logits_result = if !seq.prefilled {
                     // Prefill: run all prompt tokens through the model.
                     Self::cb_prefill(
@@ -767,6 +800,46 @@ impl Engine {
     // ── Continuous-batching helpers ────────────────────────────────────────
 
     /// Run a prefill forward pass for a single sequence (continuous batching).
+    /// Encode audio and register embeddings with the model before prefill.
+    ///
+    /// Finds all positions in `prompt_tokens` that match `ctx.audio_token_id`,
+    /// encodes the mel spectrogram via the model's audio tower, then stores
+    /// (embeddings, positions) so that the next `forward()` call injects them.
+    fn cb_prepare_audio(
+        model: &mut Box<dyn CausalLM>,
+        device: &Device,
+        prompt_tokens: &[u32],
+        ctx: AudioEmbedContext,
+    ) -> Result<()> {
+        let mel = ctx.mel.to_device(device)?;
+        let embeds = model.encode_audio(&mel)?;
+        let positions: Vec<usize> = prompt_tokens
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &id)| {
+                if id == ctx.audio_token_id {
+                    Some(i)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if positions.is_empty() {
+            tracing::warn!(
+                "Audio encoder produced {} embeddings but no <|audio|> tokens found in prompt",
+                embeds.dim(0)?
+            );
+        }
+        tracing::info!(
+            "Audio: encoded {} embeddings, found {} <|audio|> positions (token_id={})",
+            embeds.dim(0).unwrap_or(0),
+            positions.len(),
+            ctx.audio_token_id,
+        );
+        model.set_pending_audio(embeds, positions);
+        Ok(())
+    }
+
     ///
     /// When paged attention is active, allocates blocks and calls
     /// `forward_paged`.  Otherwise clears the model's internal KV cache and
@@ -850,6 +923,8 @@ impl Engine {
 
         tracing::info!("Engine loop stopped (sync)");
     }
+
+    // ── Audio helpers ─────────────────────────────────────────────────────────
 
     // ── Paged-attention helpers ───────────────────────────────────────────────
 
