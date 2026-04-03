@@ -76,6 +76,19 @@ pub struct RunArgs {
     /// 4-bit gives ~3.5× but may produce poor output on models with large QK-norm values.
     #[arg(long, num_args(0..=1), default_missing_value("8"), require_equals(true))]
     pub turbo_quant: Option<u8>,
+
+    /// Quantize model weights and cache the result on disk as a GGUF file.
+    /// On first use the weights are quantized and saved next to the HuggingFace cache;
+    /// subsequent runs reuse the cached GGUF, so the slow conversion only happens once.
+    ///
+    /// Accepted formats (case-insensitive): Q4_0, Q4_1, Q5_0, Q5_1, Q8_0,
+    /// Q2K, Q3K, Q4K (Q4_K_M), Q5K, Q6K.
+    ///
+    /// When used as a plain flag (`--quantize`) the default Q4_K_M (= Q4K) is used.
+    /// Embedding and output (lm_head) tensors are kept at F16 for accuracy.
+    #[arg(long, num_args(0..=1), default_missing_value("Q4K"), require_equals(true),
+          value_name = "FORMAT")]
+    pub quantize: Option<String>,
 }
 
 impl RunArgs {
@@ -99,6 +112,7 @@ impl RunArgs {
             max_tokens: self.max_tokens,
             paged_attention: self.paged_attention,
             turbo_quant: self.turbo_quant,
+            quantize: self.quantize.clone(),
         }
     }
 }
@@ -128,8 +142,15 @@ fn run_blocking(args: RunArgs) -> Result<()> {
     let device = serve.resolve_device()?;
     let dtype = serve.resolve_dtype()?;
 
-    // Download / locate model files from HuggingFace Hub
-    let model_files = hub::download_model(&args.model, &args.revision)?;
+    // Parse --quantize format string if provided.
+    let quant_dtype = args
+        .quantize
+        .as_deref()
+        .map(crate::quantize::parse_format)
+        .transpose()?;
+
+    // Download / locate model files from HuggingFace Hub (and quantize if requested).
+    let model_files = hub::download_and_maybe_quantize(&args.model, &args.revision, quant_dtype)?;
 
     // Load config and detect architecture
     let raw_config = RawConfig::from_file(&model_files.config_path)?;
@@ -150,6 +171,7 @@ fn run_blocking(args: RunArgs) -> Result<()> {
         &raw_config,
         &arch,
         &model_files.weight_paths,
+        model_files.gguf_path.as_deref(),
         dtype,
         &device,
         args.turbo_quant,

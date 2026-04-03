@@ -330,8 +330,6 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52c85c21827c28db94e7112e364abe7e0cf8d2b022c014edf08642be6b94f21e"
 dependencies = [
  "metal 0.27.0",
  "once_cell",
@@ -342,8 +340,6 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be1160c3b63f47d40d91110a3e1e1e566ae38edddbbf492a60b40ffc3bc1ff38"
 dependencies = [
  "candle-core",
  "candle-metal-kernels",
@@ -1615,6 +1611,7 @@ dependencies = [
  "futures",
  "half",
  "hf-hub",
+ "indicatif",
  "libloading",
  "serde",
  "serde_json",

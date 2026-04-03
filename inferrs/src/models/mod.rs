@@ -8,13 +8,14 @@ pub mod gemma4;
 pub mod qwen3;
 pub mod qwen3_5;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::VarBuilder;
 use std::path::Path;
 
 use crate::config::{ModelArchitecture, RawConfig};
 use crate::kv_cache::{BlockTable, PagedKvStore};
+use gemma4::QGgufVarBuilder;
 
 /// Unified model interface for the engine.
 pub trait CausalLM: Send {
@@ -137,21 +138,139 @@ impl CausalLM for Qwen35ModelWrapper {
     }
 }
 
+/// A lazy [`candle_nn::var_builder::SimpleBackend`] backed by a GGUF file.
+///
+/// Tensors are dequantized on demand — only when the model calls
+/// `VarBuilder::get` for that specific weight.  This avoids the huge memory
+/// spike and slow startup of the previous eager approach (loading all 2 000+
+/// tensors including multi-gigabyte embedding tables upfront).
+///
+/// The GGUF file is kept open for the lifetime of the backend; a `Mutex`
+/// around the `BufReader` satisfies the `Sync` requirement of `SimpleBackend`.
+struct GgufBackend {
+    content: candle_core::quantized::gguf_file::Content,
+    reader: std::sync::Mutex<std::io::BufReader<std::fs::File>>,
+    device: Device,
+}
+
+impl candle_nn::var_builder::SimpleBackend for GgufBackend {
+    fn get(
+        &self,
+        s: candle_core::Shape,
+        name: &str,
+        _: candle_nn::Init,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_core::Result<Tensor> {
+        let mut reader = self.reader.lock().expect("gguf reader lock poisoned");
+        let qt = self
+            .content
+            .tensor(&mut *reader, name, &self.device)
+            .map_err(|e| {
+                candle_core::Error::CannotFindTensor {
+                    path: format!("{name}: {e}"),
+                }
+                .bt()
+            })?;
+
+        let tensor = qt.dequantize(dev)?.to_dtype(dtype)?;
+
+        // Validate shape — same contract as VarBuilder::from_tensors.
+        if tensor.shape() != &s {
+            candle_core::bail!(
+                "shape mismatch for {name}: expected {s:?}, got {:?}",
+                tensor.shape()
+            );
+        }
+        Ok(tensor)
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        self.content.tensor_infos.contains_key(name)
+    }
+}
+
+/// Build a [`VarBuilder`] backed by a GGUF file.
+///
+/// Tensors are dequantized lazily — only on first access — so startup is
+/// fast and peak memory is bounded by the model's actual weight usage rather
+/// than the full file size.
+fn var_builder_from_gguf(
+    gguf_path: &Path,
+    dtype: DType,
+    device: &Device,
+) -> Result<VarBuilder<'static>> {
+    use candle_core::quantized::gguf_file;
+
+    let file = std::fs::File::open(gguf_path)
+        .with_context(|| format!("Cannot open GGUF {}", gguf_path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
+
+    let content = gguf_file::Content::read(&mut reader)
+        .with_context(|| format!("Failed to parse GGUF header in {}", gguf_path.display()))?;
+
+    tracing::info!(
+        "Opened GGUF with {} tensors: {}",
+        content.tensor_infos.len(),
+        gguf_path.display()
+    );
+
+    let backend = GgufBackend {
+        content,
+        reader: std::sync::Mutex::new(reader),
+        device: device.clone(),
+    };
+
+    Ok(VarBuilder::from_backend(
+        Box::new(backend),
+        dtype,
+        device.clone(),
+    ))
+}
+
 /// Load a model from weight files.
 pub fn load_model(
     raw_config: &RawConfig,
     arch: &ModelArchitecture,
     weight_paths: &[impl AsRef<Path>],
+    gguf_path: Option<&Path>,
     dtype: DType,
     device: &Device,
     turbo_quant_bits: Option<u8>,
 ) -> Result<Box<dyn CausalLM>> {
     tracing::info!("Loading model weights ({:?} architecture)...", arch);
 
-    let paths_ref: Vec<&Path> = weight_paths.iter().map(|p| p.as_ref()).collect();
+    // When a GGUF is present, load weights from it (dequantizing each tensor
+    // to `dtype`).  Otherwise fall back to the standard mmap'd safetensors path.
+    let vb: VarBuilder<'static> = if let Some(gguf) = gguf_path {
+        var_builder_from_gguf(gguf, dtype, device)?
+    } else {
+        let paths_ref: Vec<&Path> = weight_paths.iter().map(|p| p.as_ref()).collect();
+        // SAFETY: the mmap lifetime is extended to 'static by the unsafe block.
+        // The VarBuilder (and the model built from it) keep the mmap alive.
+        unsafe { VarBuilder::from_mmaped_safetensors(&paths_ref, dtype, device)? }
+    };
 
-    // Load safetensors into a VarBuilder
-    let vb = unsafe { VarBuilder::from_mmaped_safetensors(&paths_ref, dtype, device)? };
+    // For Gemma4 loaded from GGUF, also build a QGgufVarBuilder that keeps
+    // weights in their quantized form (e.g. Q4K) so that projection layers
+    // use QMatMul::QTensor → Metal's quantized GEMV kernel during decode.
+    // This is the same strategy llama.cpp uses and gives ~3-4× decode speedup.
+    let gemma4_qvb: Option<QGgufVarBuilder> = if matches!(arch, ModelArchitecture::Gemma4) {
+        gguf_path.and_then(|p| {
+            match QGgufVarBuilder::from_gguf(p, device) {
+                Ok(qvb) => {
+                    tracing::info!("Gemma4: using quantized weight projection (QMatMul) for GGUF model");
+                    Some(qvb)
+                }
+                Err(e) => {
+                    tracing::warn!("Gemma4: failed to build QGgufVarBuilder, falling back to dequantized weights: {e}");
+                    None
+                }
+            }
+        })
+    } else {
+        None
+    };
 
     // Warn if --turbo-quant was requested but this architecture doesn't support it.
     if turbo_quant_bits.is_some() {
@@ -244,7 +363,7 @@ pub fn load_model(
                 config.num_key_value_heads,
             );
             Box::new(Gemma4ModelWrapper {
-                inner: gemma4::Gemma4Model::new(&config, vb)?,
+                inner: gemma4::Gemma4Model::new(&config, vb, gemma4_qvb.as_ref())?,
             })
         }
     };

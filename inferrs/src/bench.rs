@@ -43,8 +43,16 @@ pub fn run(args: BenchArgs) -> Result<()> {
     let device = serve.resolve_device()?;
     let dtype = serve.resolve_dtype()?;
 
-    // Download / load model (same path as `serve`)
-    let model_files = crate::hub::download_model(&serve.model, &serve.revision)?;
+    // Parse --quantize format string if provided.
+    let quant_dtype = serve
+        .quantize
+        .as_deref()
+        .map(crate::quantize::parse_format)
+        .transpose()?;
+
+    // Download / load model (same path as `serve`, quantize if requested).
+    let model_files =
+        crate::hub::download_and_maybe_quantize(&serve.model, &serve.revision, quant_dtype)?;
     let raw_config = RawConfig::from_file(&model_files.config_path)?;
     let arch = raw_config.detect_architecture()?;
     tracing::info!("Detected architecture: {:?}", arch);
@@ -58,6 +66,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
         &raw_config,
         &arch,
         &model_files.weight_paths,
+        model_files.gguf_path.as_deref(),
         dtype,
         &device,
         serve.turbo_quant,

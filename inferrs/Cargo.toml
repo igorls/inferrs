@@ -54,6 +54,7 @@ futures = "0.3"
 async-stream = "0.3"
 anyhow = { workspace = true }
 crossterm = "0.28"
+indicatif = "0.17"
 
 # Dynamic backend loading (Linux only)
 [target.'cfg(target_os = "linux")'.dependencies]

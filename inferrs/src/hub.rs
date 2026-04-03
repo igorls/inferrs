@@ -1,6 +1,7 @@
 //! HuggingFace Hub model downloading.
 
 use anyhow::{Context, Result};
+use candle_core::quantized::GgmlDType;
 use hf_hub::api::sync::Api;
 use std::path::PathBuf;
 
@@ -9,7 +10,12 @@ pub struct ModelFiles {
     pub config_path: PathBuf,
     pub tokenizer_path: PathBuf,
     pub tokenizer_config_path: Option<PathBuf>,
+    /// Original safetensors shards (always present).
     pub weight_paths: Vec<PathBuf>,
+    /// Path to the quantized GGUF file, populated when `--quantize` was given.
+    /// When `Some`, callers should load weights from this GGUF instead of
+    /// `weight_paths`.
+    pub gguf_path: Option<PathBuf>,
 }
 
 /// Download model files from HuggingFace Hub.
@@ -49,7 +55,48 @@ pub fn download_model(model_id: &str, revision: &str) -> Result<ModelFiles> {
         tokenizer_path,
         tokenizer_config_path,
         weight_paths,
+        gguf_path: None,
     })
+}
+
+/// Download the model (same as [`download_model`]) and, when `quant_dtype` is
+/// `Some`, ensure a quantized GGUF is present on disk.
+///
+/// The GGUF is written next to the safetensors shards in the HF hub cache.
+/// If the file already exists it is reused without re-running the conversion.
+/// Quantization happens on the CPU and can take up to a few minutes for large
+/// models; progress is logged at INFO level.
+pub fn download_and_maybe_quantize(
+    model_id: &str,
+    revision: &str,
+    quant_dtype: Option<GgmlDType>,
+) -> Result<ModelFiles> {
+    let mut files = download_model(model_id, revision)?;
+
+    let Some(dtype) = quant_dtype else {
+        return Ok(files);
+    };
+
+    let gguf = crate::quantize::gguf_path(&files.weight_paths, dtype);
+
+    if gguf.exists() {
+        tracing::info!("Reusing cached GGUF at {} ({:?})", gguf.display(), dtype);
+    } else {
+        tracing::info!(
+            "Quantizing model to {:?} — this runs once and is then cached…",
+            dtype
+        );
+        // Write to a temp path then atomically rename so that an interrupted
+        // conversion (OOM, Ctrl-C, disk-full) never leaves a truncated file
+        // that would be silently reused on the next run.
+        let tmp = gguf.with_extension("gguf.tmp");
+        crate::quantize::convert_to_gguf(&files.weight_paths, &tmp, dtype)?;
+        std::fs::rename(&tmp, &gguf)
+            .with_context(|| format!("Failed to rename {} → {}", tmp.display(), gguf.display()))?;
+    }
+
+    files.gguf_path = Some(gguf);
+    Ok(files)
 }
 
 fn download_safetensors(repo: &hf_hub::api::sync::ApiRepo) -> Result<Vec<PathBuf>> {
