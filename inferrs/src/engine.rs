@@ -5,10 +5,95 @@ use candle_core::{DType, Device, Tensor};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::{ModelArchitecture, RawConfig};
+use crate::hub::ModelFiles;
 use crate::kv_cache::{BlockPool, BlockTable, PagedCacheConfig, PagedKvStore};
 use crate::models::CausalLM;
 use crate::sampler::{self, SamplingParams};
 use crate::tokenizer::Tokenizer;
+use crate::ServeArgs;
+
+// ---------------------------------------------------------------------------
+// Shared model-loading entry point
+// ---------------------------------------------------------------------------
+
+/// Everything produced by [`load_engine`] that callers may still need after
+/// the engine is constructed.
+pub struct EngineContext {
+    pub engine: Engine,
+    pub raw_config: RawConfig,
+    pub arch: ModelArchitecture,
+    pub model_files: ModelFiles,
+    pub dtype: DType,
+    pub max_seq_len: usize,
+}
+
+/// Build an [`Engine`] from [`ServeArgs`], handling the repeated sequence:
+/// parse quantize → download → load config → detect arch → load model →
+/// build engine tokenizer → construct Engine → attach paged KV.
+///
+/// The caller is responsible for building any *additional* tokenizer instances
+/// (e.g. the one used by the HTTP server / REPL) from the returned
+/// [`EngineContext::model_files`] and [`EngineContext::arch`].
+pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
+    let device = args.resolve_device()?;
+    let dtype = args.resolve_dtype()?;
+    let quant_dtype = args.resolve_quant_dtype()?;
+
+    let model_files =
+        crate::hub::download_and_maybe_quantize(&args.model, &args.revision, quant_dtype)?;
+
+    let raw_config = RawConfig::from_file(&model_files.config_path)?;
+    let arch = raw_config.detect_architecture()?;
+    tracing::info!("Detected architecture: {:?}", arch);
+
+    let max_seq_len = raw_config.effective_max_seq_len(&arch);
+    if max_seq_len < usize::MAX {
+        tracing::info!("Model KV cache capacity: {} tokens", max_seq_len);
+    }
+
+    let model = crate::models::load_model(
+        &raw_config,
+        &arch,
+        &model_files.weight_paths,
+        model_files.gguf_path.as_deref(),
+        dtype,
+        &device,
+        args.turbo_quant.0,
+    )?;
+
+    let engine_tokenizer = Tokenizer::from_file_with_arch(
+        &model_files.tokenizer_path,
+        model_files.tokenizer_config_path.as_deref(),
+        Some(&arch),
+    )?;
+
+    let mut engine = Engine::new(
+        model,
+        engine_tokenizer,
+        device.clone(),
+        args.max_batch_size,
+        args.max_tokens_per_step,
+    );
+
+    engine = attach_paged_kv_if_requested(
+        engine,
+        args.paged_attention,
+        args.block_size,
+        dtype,
+        &device,
+        &raw_config,
+        &arch,
+    )?;
+
+    Ok(EngineContext {
+        engine,
+        raw_config,
+        arch,
+        model_files,
+        dtype,
+        max_seq_len,
+    })
+}
 
 /// Abstraction over the two streaming channel flavours:
 /// - `tokio::sync::mpsc::Sender` (used by the HTTP server)

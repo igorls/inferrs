@@ -13,9 +13,7 @@ use crossterm::{
 use std::io::{self, Write};
 use std::sync::mpsc as stdmpsc;
 
-use crate::config::RawConfig;
-use crate::engine::{attach_paged_kv_if_requested, Engine, StreamToken, SyncEngineRequest};
-use crate::hub;
+use crate::engine::{load_engine, StreamToken, SyncEngineRequest};
 use crate::sampler::SamplingParams;
 use crate::tokenizer::{ChatMessage, Role, Tokenizer};
 use crate::ServeArgs;
@@ -139,73 +137,22 @@ pub fn run(args: RunArgs) -> Result<()> {
 /// This runs on a plain OS thread, never inside the Tokio executor.
 fn run_blocking(args: RunArgs) -> Result<()> {
     let serve = args.to_serve_args();
-    let device = serve.resolve_device()?;
-    let dtype = serve.resolve_dtype()?;
 
-    // Parse --quantize format string if provided.
-    let quant_dtype = args
-        .quantize
-        .as_deref()
-        .map(crate::quantize::parse_format)
-        .transpose()?;
+    // Load model, build engine, attach paged KV.
+    let ctx = load_engine(&serve)?;
 
-    // Download / locate model files from HuggingFace Hub (and quantize if requested).
-    let model_files = hub::download_and_maybe_quantize(&args.model, &args.revision, quant_dtype)?;
-
-    // Load config and detect architecture
-    let raw_config = RawConfig::from_file(&model_files.config_path)?;
-    let arch = raw_config.detect_architecture()?;
-    tracing::info!("Detected architecture: {:?}", arch);
-
-    let max_seq_len = raw_config.effective_max_seq_len(&arch);
-
-    // Load tokenizer (used by the REPL to build prompts)
+    // REPL needs its own tokenizer for chat-template encoding.
     let tokenizer = Tokenizer::from_file_with_arch(
-        &model_files.tokenizer_path,
-        model_files.tokenizer_config_path.as_deref(),
-        Some(&arch),
+        &ctx.model_files.tokenizer_path,
+        ctx.model_files.tokenizer_config_path.as_deref(),
+        Some(&ctx.arch),
     )?;
 
-    // Load model weights
-    let model = crate::models::load_model(
-        &raw_config,
-        &arch,
-        &model_files.weight_paths,
-        model_files.gguf_path.as_deref(),
-        dtype,
-        &device,
-        args.turbo_quant.0,
-    )?;
-
-    // Engine tokenizer (separate instance — engine runs on its own thread)
-    let engine_tokenizer = Tokenizer::from_file_with_arch(
-        &model_files.tokenizer_path,
-        model_files.tokenizer_config_path.as_deref(),
-        Some(&arch),
-    )?;
-
-    // Spawn engine on a dedicated OS thread.
-    // Use std::sync::mpsc (not tokio) so that sends/recvs are plain blocking
-    // calls with no Tokio runtime requirement.
+    // Spawn engine on a dedicated OS thread using stdlib channels (no Tokio).
     let (engine_tx, engine_rx) = stdmpsc::sync_channel::<SyncEngineRequest>(4);
-    let mut engine = Engine::new(model, engine_tokenizer, device.clone(), 1, 2048);
-
-    // Wire up paged attention if requested (same logic as `serve` and `bench`).
-    engine = attach_paged_kv_if_requested(
-        engine,
-        serve.paged_attention,
-        serve.block_size,
-        dtype,
-        &device,
-        &raw_config,
-        &arch,
-    )?;
-
-    let engine = engine;
-
     std::thread::Builder::new()
         .name("engine".to_string())
-        .spawn(move || engine.run_sync(engine_rx))
+        .spawn(move || ctx.engine.run_sync(engine_rx))
         .expect("Failed to spawn engine thread");
 
     let sampling_params = SamplingParams {
@@ -214,7 +161,7 @@ fn run_blocking(args: RunArgs) -> Result<()> {
         top_k: args.top_k,
         max_tokens: args
             .max_tokens
-            .min(max_seq_len.saturating_sub(4096).max(256)),
+            .min(ctx.max_seq_len.saturating_sub(4096).max(256)),
         ..SamplingParams::default()
     };
 

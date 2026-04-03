@@ -12,6 +12,7 @@ mod sampler;
 mod server;
 mod tokenizer;
 mod turbo_quant;
+mod util;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -241,6 +242,14 @@ impl ServeArgs {
             "bf16" => Ok(candle_core::DType::BF16),
             other => anyhow::bail!("Unknown dtype: {other}"),
         }
+    }
+
+    /// Parse the `--quantize` format string (if provided) into a `GgmlDType`.
+    pub fn resolve_quant_dtype(&self) -> Result<Option<candle_core::quantized::GgmlDType>> {
+        self.quantize
+            .as_deref()
+            .map(crate::quantize::parse_format)
+            .transpose()
     }
 }
 

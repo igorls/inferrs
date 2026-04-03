@@ -5,6 +5,8 @@ use clap::Parser;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use crate::util::format_bytes;
+
 #[derive(Parser, Clone)]
 pub struct RmArgs {
     /// HuggingFace model ID(s) to remove (e.g. google/gemma-3-1b-it)
@@ -34,7 +36,7 @@ pub fn run(args: RmArgs) -> Result<()> {
         let size = dir_size(&model_path).unwrap_or(0);
 
         if !args.force {
-            eprint!("Remove {} ({})? [y/N] ", model_id, human_size(size));
+            eprint!("Remove {} ({})? [y/N] ", model_id, format_bytes(size));
             std::io::stderr().flush()?;
             let mut input = String::new();
             std::io::stdin().read_line(&mut input)?;
@@ -45,7 +47,7 @@ pub fn run(args: RmArgs) -> Result<()> {
         }
 
         std::fs::remove_dir_all(&model_path)?;
-        println!("Removed {model_id} (freed {})", human_size(size));
+        println!("Removed {model_id} (freed {})", format_bytes(size));
     }
 
     Ok(())
@@ -87,19 +89,4 @@ fn dir_size(path: &Path) -> Result<u64> {
         }
     }
     Ok(total)
-}
-
-fn human_size(bytes: u64) -> String {
-    const GIB: u64 = 1 << 30;
-    const MIB: u64 = 1 << 20;
-    const KIB: u64 = 1 << 10;
-    if bytes >= GIB {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    } else if bytes >= MIB {
-        format!("{:.1} MiB", bytes as f64 / MIB as f64)
-    } else if bytes >= KIB {
-        format!("{:.1} KiB", bytes as f64 / KIB as f64)
-    } else {
-        format!("{bytes} B")
-    }
 }

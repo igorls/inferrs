@@ -12,10 +12,10 @@
 
 use anyhow::Result;
 
-use crate::config::RawConfig;
-use crate::engine::{attach_paged_kv_if_requested, Engine};
+use crate::engine::load_engine;
 use crate::sampler::SamplingParams;
 use crate::tokenizer::Tokenizer;
+use crate::util::format_bytes;
 use crate::ServeArgs;
 
 /// Extra options that only apply to the bench subcommand.
@@ -40,58 +40,18 @@ pub struct BenchArgs {
 
 pub fn run(args: BenchArgs) -> Result<()> {
     let serve = &args.serve;
-    let device = serve.resolve_device()?;
-    let dtype = serve.resolve_dtype()?;
 
-    // Parse --quantize format string if provided.
-    let quant_dtype = serve
-        .quantize
-        .as_deref()
-        .map(crate::quantize::parse_format)
-        .transpose()?;
+    // Load model, build engine, attach paged KV.
+    let ctx = load_engine(serve)?;
+    let mut engine = ctx.engine;
+    let raw_config = ctx.raw_config;
+    let arch = ctx.arch;
+    let dtype = ctx.dtype;
 
-    // Download / load model (same path as `serve`, quantize if requested).
-    let model_files =
-        crate::hub::download_and_maybe_quantize(&serve.model, &serve.revision, quant_dtype)?;
-    let raw_config = RawConfig::from_file(&model_files.config_path)?;
-    let arch = raw_config.detect_architecture()?;
-    tracing::info!("Detected architecture: {:?}", arch);
-
+    // Bench only needs a plain tokenizer (no chat template) for the BOS id.
     let tokenizer = Tokenizer::from_file(
-        &model_files.tokenizer_path,
-        model_files.tokenizer_config_path.as_deref(),
-    )?;
-
-    let model = crate::models::load_model(
-        &raw_config,
-        &arch,
-        &model_files.weight_paths,
-        model_files.gguf_path.as_deref(),
-        dtype,
-        &device,
-        serve.turbo_quant.0,
-    )?;
-
-    let mut engine = Engine::new(
-        model,
-        Tokenizer::from_file(
-            &model_files.tokenizer_path,
-            model_files.tokenizer_config_path.as_deref(),
-        )?,
-        device.clone(),
-        serve.max_batch_size,
-        serve.max_tokens_per_step,
-    );
-
-    // Wire up paged attention if requested (same logic as `serve`)
-    engine = attach_paged_kv_if_requested(
-        engine,
-        serve.paged_attention,
-        serve.block_size,
-        dtype,
-        &device,
-        &raw_config,
-        &arch,
+        &ctx.model_files.tokenizer_path,
+        ctx.model_files.tokenizer_config_path.as_deref(),
     )?;
 
     // Build a synthetic prompt of the requested length.
@@ -102,7 +62,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
     // Clamp max_tokens to the model's effective KV-cache capacity so that
     // models with a sliding-window limit (e.g. Gemma3 at 512 tokens) don't
     // crash mid-generation with an opaque tensor error.
-    let max_seq_len = raw_config.effective_max_seq_len(&arch);
+    let max_seq_len = ctx.max_seq_len;
     let max_tokens = {
         let available = if max_seq_len == usize::MAX {
             serve.max_tokens
@@ -242,7 +202,7 @@ pub fn run(args: BenchArgs) -> Result<()> {
             max_seq_len
         };
         let total_bytes = bytes_per_token * effective_seq_len;
-        format_bytes(total_bytes)
+        format_bytes(total_bytes as u64)
     };
 
     println!();
@@ -262,18 +222,6 @@ pub fn run(args: BenchArgs) -> Result<()> {
     println!("  End-to-end p90          : {p90:.1} ms");
 
     Ok(())
-}
-
-fn format_bytes(bytes: usize) -> String {
-    if bytes >= 1024 * 1024 * 1024 {
-        format!("{:.2} GiB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    } else if bytes >= 1024 * 1024 {
-        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
-    } else if bytes >= 1024 {
-        format!("{:.1} KiB", bytes as f64 / 1024.0)
-    } else {
-        format!("{} B", bytes)
-    }
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {

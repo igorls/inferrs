@@ -18,8 +18,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tower_http::cors::CorsLayer;
 
-use crate::config::RawConfig;
-use crate::engine::{attach_paged_kv_if_requested, EngineRequest, GenerationResult, StreamToken};
+use crate::engine::{load_engine, EngineRequest, GenerationResult, StreamToken};
 use crate::sampler::SamplingParams;
 use crate::tokenizer::{ChatMessage, Tokenizer};
 use crate::ServeArgs;
@@ -199,49 +198,15 @@ struct AppState {
 // ─── Server startup ─────────────────────────────────────────────────────────
 
 pub async fn run(args: ServeArgs) -> Result<()> {
-    let device = args.resolve_device()?;
-    let dtype = args.resolve_dtype()?;
+    // Load model, build engine, attach paged KV.
+    let ctx = load_engine(&args)?;
 
-    // Parse --quantize format string if provided.
-    let quant_dtype = args
-        .quantize
-        .as_deref()
-        .map(crate::quantize::parse_format)
-        .transpose()?;
-
-    // Download model (and quantize/cache as GGUF if requested).
-    let model_files =
-        crate::hub::download_and_maybe_quantize(&args.model, &args.revision, quant_dtype)?;
-
-    // Load config
-    let raw_config = RawConfig::from_file(&model_files.config_path)?;
-    let arch = raw_config.detect_architecture()?;
-    tracing::info!("Detected architecture: {:?}", arch);
-
-    // Load tokenizer
-    let tokenizer = Tokenizer::from_file_with_arch(
-        &model_files.tokenizer_path,
-        model_files.tokenizer_config_path.as_deref(),
-        Some(&arch),
-    )?;
-    let tokenizer = Arc::new(tokenizer);
-
-    // Load model
-    let model = crate::models::load_model(
-        &raw_config,
-        &arch,
-        &model_files.weight_paths,
-        model_files.gguf_path.as_deref(),
-        dtype,
-        &device,
-        args.turbo_quant.0,
-    )?;
-
-    // Effective sequence-length cap for this model.
-    let max_seq_len = raw_config.effective_max_seq_len(&arch);
-    if max_seq_len < usize::MAX {
-        tracing::info!("Model KV cache capacity: {} tokens", max_seq_len);
-    }
+    // The server needs its own tokenizer for chat-template encoding.
+    let tokenizer = Arc::new(Tokenizer::from_file_with_arch(
+        &ctx.model_files.tokenizer_path,
+        ctx.model_files.tokenizer_config_path.as_deref(),
+        Some(&ctx.arch),
+    )?);
 
     // Default sampling params from CLI args
     let default_params = SamplingParams {
@@ -252,36 +217,11 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         ..SamplingParams::default()
     };
 
-    // Create engine channel
+    // Create engine channel and spawn engine on a dedicated thread.
     let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(64);
-
-    // Spawn engine on a dedicated thread
-    let mut engine = crate::engine::Engine::new(
-        model,
-        // The engine needs its own tokenizer for decoding
-        Tokenizer::from_file_with_arch(
-            &model_files.tokenizer_path,
-            model_files.tokenizer_config_path.as_deref(),
-            Some(&arch),
-        )?,
-        device.clone(),
-        args.max_batch_size,
-        args.max_tokens_per_step,
-    );
-
-    engine = attach_paged_kv_if_requested(
-        engine,
-        args.paged_attention,
-        args.block_size,
-        dtype,
-        &device,
-        &raw_config,
-        &arch,
-    )?;
-
     std::thread::Builder::new()
         .name("engine".to_string())
-        .spawn(move || engine.run(engine_rx))
+        .spawn(move || ctx.engine.run(engine_rx))
         .expect("Failed to spawn engine thread");
 
     // Build app state
@@ -290,7 +230,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         engine_tx,
         tokenizer,
         default_params,
-        max_seq_len,
+        max_seq_len: ctx.max_seq_len,
     });
 
     // Build router
