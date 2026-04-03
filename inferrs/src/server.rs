@@ -248,8 +248,8 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         temperature: args.temperature,
         top_p: args.top_p,
         top_k: args.top_k,
-        repetition_penalty: 1.0,
         max_tokens: args.max_tokens,
+        ..SamplingParams::default()
     };
 
     // Create engine channel

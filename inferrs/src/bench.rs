@@ -125,8 +125,8 @@ pub fn run(args: BenchArgs) -> Result<()> {
         temperature: serve.temperature,
         top_p: serve.top_p,
         top_k: serve.top_k,
-        repetition_penalty: 1.0,
         max_tokens,
+        ..SamplingParams::default()
     };
 
     let total_runs = args.warmup + args.runs;

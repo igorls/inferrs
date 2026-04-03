@@ -212,10 +212,10 @@ fn run_blocking(args: RunArgs) -> Result<()> {
         temperature: args.temperature,
         top_p: args.top_p,
         top_k: args.top_k,
-        repetition_penalty: 1.0,
         max_tokens: args
             .max_tokens
             .min(max_seq_len.saturating_sub(4096).max(256)),
+        ..SamplingParams::default()
     };
 
     // Build initial message history (optional system prompt)
@@ -234,7 +234,7 @@ fn run_blocking(args: RunArgs) -> Result<()> {
             content: prompt,
         });
         let prompt_tokens = tokenizer.apply_chat_template_and_encode(&messages)?;
-        stream_response(&engine_tx, prompt_tokens, &sampling_params)?;
+        stream_response_collect(&engine_tx, prompt_tokens, &sampling_params)?;
         println!();
         return Ok(());
     }
@@ -485,16 +485,6 @@ fn stream_response_collect(
     }
 
     Ok(full_text)
-}
-
-/// Stream tokens to stdout without collecting (used for non-interactive one-shot mode).
-fn stream_response(
-    engine_tx: &stdmpsc::SyncSender<SyncEngineRequest>,
-    prompt_tokens: Vec<u32>,
-    sampling_params: &SamplingParams,
-) -> Result<()> {
-    stream_response_collect(engine_tx, prompt_tokens, sampling_params)?;
-    Ok(())
 }
 
 // ─── Raw-mode line reader ────────────────────────────────────────────────────

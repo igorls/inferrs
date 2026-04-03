@@ -283,45 +283,71 @@ fn apply_gemma(messages: &[ChatMessage], bos_token: &Option<String>) -> String {
     prompt
 }
 
+/// Shared turn-building helper for Gemma-family templates.
+///
+/// `prefix`        — string prepended before any turns (e.g. `"<bos>"` or `"<bos>\n"`)
+/// `turn_start`    — opening delimiter for a turn (e.g. `"<start_of_turn>"` or `"<|turn>"`)
+/// `turn_end`      — closing delimiter after content (e.g. `"<end_of_turn>\n"` or `"<turn|>\n"`)
+/// `final_marker`  — appended after all turns (e.g. `"<start_of_turn>model\n"`)
+/// `map_role`      — closure that maps a `&Role` to the string label used in the template
+/// `transform`     — closure that transforms message content (e.g. trim for Gemma4)
+fn apply_gemma_family(
+    messages: &[ChatMessage],
+    prefix: &str,
+    turn_start: &str,
+    turn_end: &str,
+    final_marker: &str,
+    map_role: impl Fn(&Role) -> &'static str,
+    transform: impl Fn(&str) -> &str,
+) -> String {
+    let mut prompt = String::from(prefix);
+    for msg in messages {
+        let role = map_role(&msg.role);
+        let content = transform(&msg.content);
+        prompt.push_str(&format!("{turn_start}{role}\n{content}{turn_end}"));
+    }
+    prompt.push_str(final_marker);
+    prompt
+}
+
 /// Gemma3 chat template: <bos> then <start_of_turn>role\ncontent<end_of_turn>\n
 /// The assistant turn uses "model" as the role label.
 /// System messages are folded into the user turn as Gemma3 doesn't have a system role.
 fn apply_gemma3(messages: &[ChatMessage]) -> String {
-    let mut prompt = String::from("<bos>");
-    for msg in messages {
-        let role = match msg.role {
+    apply_gemma_family(
+        messages,
+        "<bos>",
+        "<start_of_turn>",
+        "<end_of_turn>\n",
+        "<start_of_turn>model\n",
+        |role| match role {
             Role::System | Role::User => "user",
             Role::Assistant => "model",
-        };
-        prompt.push_str(&format!(
-            "<start_of_turn>{}\n{}<end_of_turn>\n",
-            role, msg.content
-        ));
-    }
-    // Add the model turn marker
-    prompt.push_str("<start_of_turn>model\n");
-    prompt
+        },
+        |s| s,
+    )
 }
 
 /// Gemma4 chat template.
 ///
-/// Format: `<bos><|turn>role\ncontent<turn|>\n`
+/// Format: `<bos>\n<|turn>role\ncontent<turn|>\n`
 /// The assistant turn uses "model" as the role label.
 fn apply_gemma4(messages: &[ChatMessage]) -> String {
     // The Gemma4 jinja template emits `{{ bos_token }}\n` — there is a literal
     // newline directly after the bos token before the first turn marker.
-    let mut prompt = String::from("<bos>\n");
-    for msg in messages {
-        let role = match msg.role {
+    apply_gemma_family(
+        messages,
+        "<bos>\n",
+        "<|turn>",
+        "<turn|>\n",
+        "<|turn>model\n",
+        |role| match role {
             Role::System => "system",
             Role::User => "user",
             Role::Assistant => "model",
-        };
-        prompt.push_str(&format!("<|turn>{}\n{}<turn|>\n", role, msg.content.trim()));
-    }
-    // Add the model turn marker
-    prompt.push_str("<|turn>model\n");
-    prompt
+        },
+        str::trim,
+    )
 }
 
 fn apply_generic(messages: &[ChatMessage]) -> String {
