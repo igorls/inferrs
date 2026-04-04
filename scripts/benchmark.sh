@@ -254,23 +254,23 @@ kill_server "$INFERRS_PID"
 ok "inferrs serve --quantize stopped"
 
 # ════════════════════════════════════════════════════════════════════════════
-# 2. inferrs serve --turbo-quant --quantize
+# 2. inferrs serve --turbo-quant=false --quantize
 # ════════════════════════════════════════════════════════════════════════════
-log "Benchmark 2/3 — inferrs serve --turbo-quant --quantize $INFERRS_MODEL"
+log "Benchmark 2/3 — inferrs serve --turbo-quant=false --quantize $INFERRS_MODEL"
 
 INFERRS_TQ_LOG="$TMPDIR_BENCH/inferrs-serve-tq.log"
 
 "$INFERRS_BIN" serve "$INFERRS_MODEL" \
   --host 127.0.0.1 \
   --port "$INFERRS_TQ_PORT" \
-  --turbo-quant \
+  --turbo-quant=false \
   --quantize \
   > "$INFERRS_TQ_LOG" 2>&1 &
 INFERRS_TQ_PID=$!
 ok "inferrs serve --turbo-quant --quantize started (pid $INFERRS_TQ_PID)"
 
 if ! wait_for_health "http://127.0.0.1:${INFERRS_TQ_PORT}/health" "$SERVER_READY_TIMEOUT"; then
-  err "inferrs serve --turbo-quant --quantize failed to start. Log tail:"
+  err "inferrs serve --turbo-quant=false --quantize failed to start. Log tail:"
   tail -20 "$INFERRS_TQ_LOG" >&2
   kill_server "$INFERRS_TQ_PID"
   exit 1
@@ -280,7 +280,7 @@ BENCH_SUMMARY_FILE="$SUMMARY_INFERRS_TQ" \
   bench_http "127.0.0.1" "$INFERRS_TQ_PORT" "$WARMUP" "$RUNS"
 
 kill_server "$INFERRS_TQ_PID"
-ok "inferrs serve --turbo-quant --quantize stopped"
+ok "inferrs serve --turbo-quant=false --quantize stopped"
 
 # ════════════════════════════════════════════════════════════════════════════
 # 3. llama-server -hf ggml-org/gemma-4-E2B-it-GGUF
