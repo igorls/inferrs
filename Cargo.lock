@@ -1667,6 +1667,7 @@ dependencies = [
  "half",
  "hf-hub",
  "indicatif",
+ "libc",
  "libloading 0.8.9",
  "rayon",
  "rustfft",
@@ -1679,6 +1680,13 @@ dependencies = [
  "tracing-subscriber",
  "ureq",
  "uuid",
+]
+
+[[package]]
+name = "inferrs-backend-cann"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

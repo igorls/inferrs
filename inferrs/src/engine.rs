@@ -579,6 +579,9 @@ fn check_stop(
 /// * **Metal** – `MTLDevice.recommendedMaxWorkingSetSize`, the OS-reported
 ///   upper bound for the GPU's working set on Apple Silicon.
 /// * **CUDA**  – `cuDeviceTotalMem` via cudarc's `CudaContext::total_mem()`.
+/// * **CANN**  – `aclrtGetMemInfo(ACL_HBM_MEM, &free, &total)` via dlopen,
+///   querying HBM (High Bandwidth Memory) on the Ascend NPU.  Falls back to
+///   an 8 GiB heuristic when the CANN runtime is not reachable.
 /// * **CPU**   – 4 GiB conservative fallback (Candle has no RAM query API).
 fn query_device_memory(device: &Device) -> usize {
     match device {
@@ -600,8 +603,95 @@ fn query_device_memory(device: &Device) -> usize {
                 }
             }
         }
-        _ => 4 * 1024 * 1024 * 1024,
+        _ => {
+            // On Linux/Android with a CANN device, the `Device` is still
+            // `Device::Cpu` (candle has no native CANN variant yet).  We try
+            // to query Ascend HBM via `aclrtGetMemInfo` through dlopen so that
+            // paged-attention allocates the right number of blocks.
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if let Some(hbm) = query_cann_hbm_memory() {
+                return hbm;
+            }
+            4 * 1024 * 1024 * 1024
+        }
     }
+}
+
+/// Attempt to query total HBM memory from the CANN runtime via `dlopen`.
+///
+/// Uses `aclrtGetMemInfo(ACL_HBM_MEM = 0, &free, &total)` which returns the
+/// available and total HBM bytes on the currently-set Ascend device.
+///
+/// Returns `None` when:
+/// * The CANN runtime library (`libascendcl.so`) is not installed.
+/// * No Ascend device is set as current (i.e. CANN is not in use).
+/// * The call fails for any other reason.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn query_cann_hbm_memory() -> Option<usize> {
+    use std::ffi::CString;
+
+    // `aclrtGetMemInfo(aclrtMemAttr attr, size_t *free, size_t *total)`
+    // aclrtMemAttr is an enum; ACL_HBM_MEM == 0.
+    // Returns aclError (i32); 0 == ACL_SUCCESS.
+    type AclrtGetMemInfo = unsafe extern "C" fn(i32, *mut usize, *mut usize) -> i32;
+    const ACL_HBM_MEM: i32 = 0;
+
+    let lib_name = CString::new("libascendcl.so").ok()?;
+
+    // Open the library.  We use RTLD_LAZY | RTLD_LOCAL — the same flags used
+    // in the backend probe — so the library is loaded on demand without
+    // polluting the global symbol namespace.
+    //
+    // Note: RTLD_NOLOAD would be wrong here.  The backend probe in
+    // inferrs-backend-cann opens and then dlcloses libascendcl.so, so the
+    // library is not kept resident after the probe.  RTLD_NOLOAD would
+    // therefore always return null, making HBM detection permanently
+    // unreachable.
+    //
+    // SAFETY: dlopen is safe to call with a valid C string and flags.
+    let handle = unsafe { libc::dlopen(lib_name.as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+    if handle.is_null() {
+        return None;
+    }
+
+    let sym_name = CString::new("aclrtGetMemInfo").ok()?;
+    // SAFETY: handle is non-null; sym_name is a valid C string.
+    let sym_ptr = unsafe { libc::dlsym(handle, sym_name.as_ptr()) };
+
+    if sym_ptr.is_null() {
+        // SAFETY: handle is non-null and was returned by dlopen.
+        unsafe { libc::dlclose(handle) };
+        return None;
+    }
+
+    // SAFETY: we verified the symbol exists and cast it to the known signature.
+    let get_mem_info: AclrtGetMemInfo = unsafe { std::mem::transmute(sym_ptr) };
+
+    let mut free_bytes: usize = 0;
+    let mut total_bytes: usize = 0;
+    // SAFETY: stack-allocated output pointers are valid for the call duration.
+    // The handle remains open across this call so the library text is still
+    // mapped — the dlclose comes after.
+    let acl_err = unsafe { get_mem_info(ACL_HBM_MEM, &mut free_bytes, &mut total_bytes) };
+
+    // Release our reference now that we're done with the function pointer.
+    // SAFETY: handle is non-null and was returned by dlopen.
+    unsafe { libc::dlclose(handle) };
+
+    if acl_err != 0 || total_bytes == 0 {
+        tracing::debug!(
+            "aclrtGetMemInfo returned {acl_err} (total={total_bytes}); \
+             CANN HBM query failed, using CPU memory fallback"
+        );
+        return None;
+    }
+
+    tracing::debug!(
+        "CANN HBM memory: total={:.2} GiB, free={:.2} GiB",
+        total_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+        free_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+    );
+    Some(total_bytes)
 }
 
 /// Attach a paged KV store to `engine` if `--paged-attention` was requested.

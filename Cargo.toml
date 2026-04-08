@@ -2,14 +2,18 @@
 members = [
     "inferrs",
     "inferrs-benchmark",
+    "backends/inferrs-backend-cann",
     "backends/inferrs-backend-cuda",
     "backends/inferrs-backend-rocm",
     "backends/inferrs-backend-vulkan",
 ]
-# Default members exclude the CUDA/ROCm backends, which require the CUDA/ROCm
-# toolchain (nvcc, nvidia-smi, hipcc) and only make sense on Linux with a GPU.
-# `cargo build` (no -p flag) will only build these. To build a GPU backend
-# explicitly: `cargo build -p inferrs-backend-cuda`
+# Default members exclude GPU backends that require vendor-specific toolchains.
+# `cargo build` (no -p flag) builds only the listed members.
+# To build a specific backend explicitly:
+#   cargo build -p inferrs-backend-cuda     (requires nvcc / CUDA SDK)
+#   cargo build -p inferrs-backend-rocm     (requires hipcc / ROCm)
+#   cargo build -p inferrs-backend-cann     (Linux/Android only; requires
+#                                            libascendcl.so from CANN SDK)
 default-members = [
     "inferrs",
     "inferrs-benchmark",

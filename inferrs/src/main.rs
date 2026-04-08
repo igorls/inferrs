@@ -263,6 +263,20 @@ impl ServeArgs {
                     disable_cuda_event_tracking(&device);
                     return Ok(device);
                 }
+                #[cfg(target_os = "linux")]
+                BackendKind::Cann => {
+                    // Huawei Ascend NPU detected via CANN runtime.
+                    // candle-core does not yet have a native CANN Device
+                    // variant, so we fall through to CPU for now.
+                    // Full NPU acceleration will be enabled once candle
+                    // integrates CANN support (aclrtXxx ops via candle backend).
+                    tracing::info!(
+                        "Huawei Ascend NPU detected (CANN) but candle does not \
+                         yet have a native CANN Device — falling back to CPU. \
+                         NPU acceleration will be enabled automatically once \
+                         candle integrates CANN support."
+                    );
+                }
                 BackendKind::Vulkan => {
                     // Vulkan driver detected. candle 0.8 does not yet have a
                     // Vulkan/wgpu Device variant, so we fall through to CPU.
@@ -272,6 +286,25 @@ impl ServeArgs {
                         "Vulkan driver detected but candle 0.8 has no Vulkan \
                          Device yet — falling back to CPU. Recompile with a \
                          candle version that supports wgpu to enable Vulkan."
+                    );
+                }
+                BackendKind::Cpu => {}
+            }
+        }
+
+        // Android (aarch64): probe CANN plugin for Huawei Ascend NPU.
+        // CUDA and ROCm are not available on Android.
+        #[cfg(target_os = "android")]
+        {
+            use crate::backend::BackendKind;
+            match crate::backend::detect_backend() {
+                BackendKind::Cann => {
+                    // Huawei Ascend NPU on Android — same candle limitation
+                    // as on Linux: fall back to CPU until candle CANN lands.
+                    tracing::info!(
+                        "Huawei Ascend NPU detected (CANN) on Android but \
+                         candle does not yet have a native CANN Device — \
+                         falling back to CPU."
                     );
                 }
                 BackendKind::Cpu => {}

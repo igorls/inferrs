@@ -1,0 +1,16 @@
+[package]
+name = "inferrs-backend-cann"
+version = "0.1.0"
+edition = "2021"
+description = "CANN (Huawei Ascend NPU) backend plugin for inferrs"
+license = "Apache-2.0"
+
+[lib]
+name = "inferrs_backend_cann"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Use libc for low-level dlopen to probe libascendcl without linking it at
+# compile time.  This means the plugin loads on any system; only the probe
+# call returns non-zero when the CANN runtime is absent.
+libc = "0.2"
