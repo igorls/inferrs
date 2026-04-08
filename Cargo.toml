@@ -7,8 +7,9 @@ members = [
     "backends/inferrs-backend-musa",
     "backends/inferrs-backend-rocm",
     "backends/inferrs-backend-vulkan",
+    "backends/inferrs-backend-hexagon",
 ]
-# Default members exclude GPU backends that require vendor-specific toolchains.
+# Default members exclude GPU/NPU backends that require vendor-specific toolchains.
 # `cargo build` (no -p flag) builds only the listed members.
 # To build a specific backend explicitly:
 #   cargo build -p inferrs-backend-cuda     (requires nvcc / CUDA SDK)
@@ -17,11 +18,14 @@ members = [
 #                                            libascendcl.so from CANN SDK)
 # The MUSA backend has no compile-time SDK dependency (it probes libmusart.so
 # via dlopen at runtime) so it is included in default-members.
+# The Hexagon backend likewise has no exotic toolchain requirement and compiles
+# to a no-op fast-fail on x86_64 / macOS.
 default-members = [
     "inferrs",
     "inferrs-benchmark",
     "backends/inferrs-backend-musa",
     "backends/inferrs-backend-vulkan",
+    "backends/inferrs-backend-hexagon",
 ]
 resolver = "2"
 

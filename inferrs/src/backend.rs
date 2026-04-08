@@ -1,5 +1,5 @@
 //! GPU/NPU backend discovery via dynamic loading (`dlopen` on Linux/Android,
-//! `LoadLibrary` on Windows).
+//! `LoadLibraryW` on Windows).
 //!
 //! The `inferrs` binary is compiled with the `cuda` feature (so
 //! `Device::new_cuda()` is available) but candle-core is patched to use
@@ -20,42 +20,50 @@
 //!
 //! ## Platform support matrix
 //!
-//! | Platform                  | CUDA | ROCm | CANN | Vulkan |
-//! |---------------------------|------|------|------|--------|
-//! | Linux x86_64              | ✓    | ✓    | ✓    | ✓      |
-//! | Linux aarch64             | ✓    | ✓    | ✓    | ✓      |
-//! | Windows x86_64            | ✓    | ✓    | —    | ✓      |
-//! | Windows aarch64           | —    | —    | —    | —      |
-//! | macOS aarch64             | —    | —    | —    | —      |
-//! | Android aarch64           | —    | —    | ✓    | —      |
+//! | Platform                  | CUDA | ROCm | CANN | Hexagon | Vulkan |
+//! |---------------------------|------|------|------|---------|--------|
+//! | Linux x86_64              | ✓    | ✓    | ✓    | —       | ✓      |
+//! | Linux aarch64             | ✓    | ✓    | ✓    | ✓       | ✓      |
+//! | Windows x86_64            | ✓    | ✓    | —    | —       | ✓      |
+//! | Windows aarch64           | —    | —    | —    | ✓       | ✓      |
+//! | macOS aarch64             | —    | —    | —    | —       | —      |
+//! | Android aarch64           | —    | —    | ✓    | ✓       | —      |
 //!
 //! ROCm on Windows is supported from ROCm 5.5+ (HIP SDK for Windows).
 //! ROCm on Linux aarch64 is supported on hardware such as AMD MI300A APUs
 //! and Radeon-equipped AArch64 platforms.
 //! CANN (Huawei Ascend NPU) is not supported on Windows (Huawei SDK constraint).
+//! Hexagon (Qualcomm HTP NPU) is only present on Snapdragon SoCs (aarch64).
 //!
 //! Plugin search order (highest priority first):
 //!
 //! **Linux x86_64 / aarch64:**
-//!   1. CUDA   (`.so`)  → `Device::new_cuda(0)`
-//!   2. MUSA   (`.so`)  → `Device::new_cuda(0)` (Moore Threads)
-//!   3. ROCm   (`.so`)  → `Device::new_cuda(0)` (HIP)
-//!   4. CANN   (`.so`)  → CPU fallback with info log (pending candle CANN Device)
-//!   5. Vulkan (`.so`)  → CPU fallback with info log
-//!   6. CPU    (always available)
+//!   1. CUDA    (`.so`)  → `Device::new_cuda(0)`
+//!   2. MUSA    (`.so`)  → `Device::new_cuda(0)` (Moore Threads)
+//!   3. ROCm    (`.so`)  → `Device::new_cuda(0)` (HIP)
+//!   4. CANN    (`.so`)  → CPU fallback with info log (pending candle CANN Device)
+//!   5. Hexagon (`.so`)  → CPU fallback with info log (pending candle Hexagon Device)
+//!   6. Vulkan  (`.so`)  → CPU fallback with info log
+//!   7. CPU     (always available)
 //!
 //! **Windows x86_64:**
-//!   1. CUDA   (`.dll`) → `Device::new_cuda(0)`
-//!   2. MUSA   (`.dll`) → `Device::new_cuda(0)` (Moore Threads)
-//!   3. ROCm   (`.dll`) → `Device::new_cuda(0)` (HIP SDK for Windows)
-//!   4. Vulkan (`.dll`) → CPU fallback with info log
-//!   5. CPU    (always available)
+//!   1. CUDA    (`.dll`) → `Device::new_cuda(0)`
+//!   2. MUSA    (`.dll`) → `Device::new_cuda(0)` (Moore Threads)
+//!   3. ROCm    (`.dll`) → `Device::new_cuda(0)` (HIP SDK for Windows)
+//!   4. Vulkan  (`.dll`) → CPU fallback with info log
+//!   5. CPU     (always available)
+//!
+//! **Windows aarch64:**
+//!   1. Hexagon (`.dll`) → CPU fallback with info log (pending candle Hexagon Device)
+//!   2. Vulkan  (`.dll`) → CPU fallback with info log
+//!   3. CPU     (always available)
 //!
 //! **Android aarch64:**
-//!   1. CANN   (`.so`)  → CPU fallback with info log (pending candle CANN Device)
-//!   2. CPU    (always available)
+//!   1. CANN    (`.so`)  → CPU fallback with info log (pending candle CANN Device)
+//!   2. Hexagon (`.so`)  → CPU fallback with info log (pending candle Hexagon Device)
+//!   3. CPU     (always available)
 //!
-//! **macOS / Windows ARM:**
+//! **macOS / Windows ARM (no Hexagon):**
 //!   No plugin system needed — Metal is linked directly on macOS;
 //!   CUDA/ROCm/CANN are unavailable on Windows ARM.
 
@@ -85,6 +93,11 @@ mod linux {
         ///
         /// Supported CANN SDK architectures: x86_64, aarch64.
         Cann,
+        /// Qualcomm Hexagon HTP NPU.
+        /// Falls back to CPU while candle gains a Hexagon device variant.
+        /// Only present on aarch64 Snapdragon SoCs; the plugin won't exist
+        /// on x86_64 so the probe skips it silently.
+        Hexagon,
         /// Vulkan is detected but candle 0.8 has no Vulkan Device variant yet.
         /// Falls back to CPU while logging the detection.
         Vulkan,
@@ -99,7 +112,7 @@ mod linux {
     pub fn detect_backend() -> BackendKind {
         let search_dirs = plugin_search_dirs();
 
-        // Priority order: CUDA → MUSA → ROCm → CANN → Vulkan → CPU.
+        // Priority order: CUDA → MUSA → ROCm → CANN → Hexagon → Vulkan → CPU.
         // Both x86_64 and aarch64 Linux support CUDA, MUSA, and ROCm.
         //
         // MUSA (Moore Threads) mirrors the CUDA API; its plugin probes
@@ -111,6 +124,9 @@ mod linux {
         // placed before Vulkan because it represents dedicated neural-network
         // silicon rather than a general graphics API.
         //
+        // Hexagon (Qualcomm HTP) is placed after CANN for the same reason.
+        // On x86_64 Linux the Hexagon plugin won't exist, so it is skipped.
+        //
         // The CANN plugin is arch-gated at build time (x86_64 / aarch64 only)
         // so on unsupported architectures the `.so` simply won't exist.
         let candidates: &[(&str, BackendKind)] = &[
@@ -118,6 +134,7 @@ mod linux {
             ("libinferrs_backend_musa.so", BackendKind::Musa),
             ("libinferrs_backend_rocm.so", BackendKind::Rocm),
             ("libinferrs_backend_cann.so", BackendKind::Cann),
+            ("libinferrs_backend_hexagon.so", BackendKind::Hexagon),
             ("libinferrs_backend_vulkan.so", BackendKind::Vulkan),
         ];
 
@@ -200,8 +217,8 @@ mod linux {
 pub use linux::{detect_backend, BackendKind};
 
 // ── Android ──────────────────────────────────────────────────────────────────
-// Android aarch64 hosts Ascend NPUs in some Huawei embedded/edge devices.
-// Only CANN is probed; CUDA and ROCm are not available on Android.
+// Android aarch64 hosts both Huawei Ascend NPUs (CANN, in some edge devices)
+// and Qualcomm Hexagon NPUs (Snapdragon SoCs).  CUDA and ROCm are unavailable.
 
 #[cfg(target_os = "android")]
 mod android {
@@ -217,16 +234,24 @@ mod android {
         /// Only aarch64 is supported.  The CANN plugin is compiled with an
         /// arch guard so it is absent on other Android ABIs.
         Cann,
+        /// Qualcomm Hexagon HTP NPU (Snapdragon SoCs).
+        ///
+        /// Falls back to CPU while candle gains a Hexagon device variant.
+        Hexagon,
         Cpu,
     }
 
-    /// Probe the CANN plugin and return the detected backend.
+    /// Probe the CANN and Hexagon plugins and return the detected backend.
     pub fn detect_backend() -> BackendKind {
         let search_dirs = plugin_search_dirs();
 
-        // Android only supports CANN among the current plugin backends.
-        let candidates: &[(&str, BackendKind)] =
-            &[("libinferrs_backend_cann.so", BackendKind::Cann)];
+        // Priority: CANN → Hexagon → CPU.
+        // CANN is probed first; on Snapdragon devices the CANN plugin won't
+        // exist so the probe falls through to Hexagon.
+        let candidates: &[(&str, BackendKind)] = &[
+            ("libinferrs_backend_cann.so", BackendKind::Cann),
+            ("libinferrs_backend_hexagon.so", BackendKind::Hexagon),
+        ];
 
         for (lib_name, kind) in candidates {
             if probe_plugin(&search_dirs, lib_name) {
@@ -287,7 +312,10 @@ mod android {
             }
         }
 
-        // 2. Common Android data-app directories (for sideloaded builds).
+        // 2. Qualcomm vendor library path (standard on Snapdragon Android).
+        dirs.push(PathBuf::from("/vendor/lib64/inferrs"));
+
+        // 3. Common Android data-app / on-device dev directories.
         dirs.push(PathBuf::from("/data/local/tmp/inferrs"));
 
         dirs
@@ -302,10 +330,10 @@ pub use android::{detect_backend, BackendKind};
 // x86_64-only.  ROCm on Windows is supported from ROCm 5.5+ (HIP SDK for
 // Windows); the plugin DLL is named `inferrs_backend_rocm.dll` and follows
 // the same ABI as the Linux `.so`.
-// CANN is not supported on Windows (Huawei SDK constraint).
+// CANN and Hexagon are not supported on Windows x86_64.
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-mod windows {
+mod windows_x86_64 {
     use std::path::PathBuf;
 
     use libloading::{Library, Symbol};
@@ -336,6 +364,7 @@ mod windows {
         // ROCm on Windows x86_64 is supported via AMD's HIP SDK (ROCm 5.5+).
         // MUSA Windows support is announced by Moore Threads.
         // CANN is not supported on Windows (Huawei SDK constraint).
+        // Hexagon does not exist on x86_64.
         let candidates: &[(&str, BackendKind)] = &[
             ("inferrs_backend_cuda.dll", BackendKind::Cuda),
             ("inferrs_backend_musa.dll", BackendKind::Musa),
@@ -418,18 +447,216 @@ mod windows {
 }
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
-pub use windows::{detect_backend, BackendKind};
+pub use windows_x86_64::{detect_backend, BackendKind};
 
-// ── macOS (and any other unsupported platform) ────────────────────────────────
-//
+// ── Windows aarch64 (Snapdragon X / 8cx) ─────────────────────────────────────
+// Qualcomm ARM64 Windows devices ship a Hexagon NPU but no CUDA/ROCm GPU.
+// CANN is not supported on Windows (Huawei SDK constraint).
+// Priority: Hexagon → Vulkan → CPU.
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+mod windows_aarch64 {
+    use std::path::PathBuf;
+
+    use libloading::{Library, Symbol};
+
+    /// The detected NPU / GPU backend, in priority order.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BackendKind {
+        /// Hexagon HTP NPU (Qualcomm).  Falls back to CPU while candle gains
+        /// a Hexagon device variant.
+        Hexagon,
+        /// Vulkan GPU (if present).  Falls back to CPU while candle 0.8 has
+        /// no Vulkan Device variant.
+        Vulkan,
+        Cpu,
+    }
+
+    /// Probe backend plugins and return the highest-priority available kind.
+    ///
+    /// Plugins are searched next to the running executable first, then in
+    /// `%ProgramFiles%\inferrs`.
+    pub fn detect_backend() -> BackendKind {
+        let search_dirs = plugin_search_dirs();
+
+        // Priority: Hexagon → Vulkan → CPU  (no CUDA/ROCm/CANN on ARM64 Windows)
+        let candidates: &[(&str, BackendKind)] = &[
+            ("inferrs_backend_hexagon.dll", BackendKind::Hexagon),
+            ("inferrs_backend_vulkan.dll", BackendKind::Vulkan),
+        ];
+
+        for (lib_name, kind) in candidates {
+            if probe_plugin(&search_dirs, lib_name) {
+                return *kind;
+            }
+        }
+
+        BackendKind::Cpu
+    }
+
+    fn probe_plugin(search_dirs: &[PathBuf], lib_name: &str) -> bool {
+        type ProbeFn = unsafe extern "C" fn() -> i32;
+
+        for dir in search_dirs {
+            let path = dir.join(lib_name);
+            if !path.exists() {
+                continue;
+            }
+
+            let lib = match unsafe { Library::new(&path) } {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::debug!("Failed to load {}: {e}", path.display());
+                    continue;
+                }
+            };
+
+            let probe: Symbol<ProbeFn> = match unsafe { lib.get(b"inferrs_backend_probe\0") } {
+                Ok(sym) => sym,
+                Err(e) => {
+                    tracing::debug!("Symbol not found in {}: {e}", path.display());
+                    continue;
+                }
+            };
+
+            let result = unsafe { probe() };
+            if result == 0 {
+                tracing::debug!("Backend probe succeeded: {}", path.display());
+                drop(lib);
+                return true;
+            }
+            tracing::debug!(
+                "Backend probe returned {result} (unavailable): {}",
+                path.display()
+            );
+        }
+
+        false
+    }
+
+    fn plugin_search_dirs() -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+
+        if let Ok(pf) = std::env::var("ProgramFiles") {
+            dirs.push(PathBuf::from(pf).join("inferrs"));
+        }
+
+        dirs
+    }
+}
+
+#[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+pub use windows_aarch64::{detect_backend, BackendKind};
+
+// ── macOS ─────────────────────────────────────────────────────────────────────
+// Metal is linked directly into the binary on macOS (see Cargo.toml).
 // On macOS and Windows ARM, no plugin system is needed:
 //   - macOS: Metal is linked directly via the `metal` feature of candle-core.
-//   - Windows ARM: CUDA, ROCm, and CANN are unavailable; CPU is the only option.
+//   - Windows ARM: handled above by windows_aarch64 (Hexagon + Vulkan).
+
+#[cfg(target_os = "macos")]
+mod macos {
+    use std::path::PathBuf;
+
+    use libloading::{Library, Symbol};
+
+    /// The detected accelerator backend on macOS.
+    ///
+    /// `detect_backend()` always returns `Metal` — this enum and function are
+    /// kept as an extension point for future optional plugin probing.
+    #[allow(dead_code)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum BackendKind {
+        /// Metal is always available on Apple Silicon and Intel Macs with
+        /// Metal-capable GPUs.  It is linked directly, not via a plugin.
+        Metal,
+        Cpu,
+    }
+
+    /// On macOS, Metal is linked at compile time — no plugin probe needed.
+    #[allow(dead_code)]
+    pub fn detect_backend() -> BackendKind {
+        let _ = plugin_search_dirs; // silence unused-fn lint
+        BackendKind::Metal
+    }
+
+    #[allow(dead_code)]
+    fn probe_plugin(search_dirs: &[PathBuf], lib_name: &str) -> bool {
+        type ProbeFn = unsafe extern "C" fn() -> i32;
+
+        for dir in search_dirs {
+            let path = dir.join(lib_name);
+            if !path.exists() {
+                continue;
+            }
+
+            let lib = match unsafe { Library::new(&path) } {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::debug!("Failed to load {}: {e}", path.display());
+                    continue;
+                }
+            };
+
+            let probe: Symbol<ProbeFn> = match unsafe { lib.get(b"inferrs_backend_probe\0") } {
+                Ok(sym) => sym,
+                Err(e) => {
+                    tracing::debug!("Symbol not found in {}: {e}", path.display());
+                    continue;
+                }
+            };
+
+            let result = unsafe { probe() };
+            if result == 0 {
+                tracing::debug!("Backend probe succeeded: {}", path.display());
+                drop(lib);
+                return true;
+            }
+            tracing::debug!(
+                "Backend probe returned {result} (unavailable): {}",
+                path.display()
+            );
+        }
+
+        false
+    }
+
+    #[allow(dead_code)]
+    fn plugin_search_dirs() -> Vec<PathBuf> {
+        let mut dirs: Vec<PathBuf> = Vec::new();
+
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(parent) = exe.parent() {
+                dirs.push(parent.to_path_buf());
+            }
+        }
+
+        dirs.push(PathBuf::from("/usr/local/lib/inferrs"));
+        dirs
+    }
+}
+
+// On macOS, Metal is linked at compile time and `main.rs` uses
+// `Device::new_metal()` directly — it never calls `detect_backend()` via the
+// plugin system.  The macOS module is kept as a documented extension point.
+#[cfg(target_os = "macos")]
+#[allow(unused_imports)]
+pub use macos::{detect_backend, BackendKind};
+
+// ── Any remaining platform (e.g. FreeBSD, bare-metal) ────────────────────────
 
 #[cfg(not(any(
     target_os = "linux",
     target_os = "android",
-    all(target_os = "windows", target_arch = "x86_64")
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "aarch64"),
+    target_os = "macos",
 )))]
 #[allow(dead_code)]
 pub fn detect_backend() -> BackendKind {
@@ -439,7 +666,9 @@ pub fn detect_backend() -> BackendKind {
 #[cfg(not(any(
     target_os = "linux",
     target_os = "android",
-    all(target_os = "windows", target_arch = "x86_64")
+    all(target_os = "windows", target_arch = "x86_64"),
+    all(target_os = "windows", target_arch = "aarch64"),
+    target_os = "macos",
 )))]
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

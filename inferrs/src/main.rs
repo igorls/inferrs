@@ -236,24 +236,34 @@ impl ServeArgs {
             }
         }
 
-        // Linux / Windows x86_64: probe backend plugins via dynamic loading in
-        // priority order.  The main binary is compiled with the cuda feature
-        // but candle-core uses cudarc fallback-dynamic-loading so CUDA libs
-        // are opened on demand — they are not hard-linked into the binary.
-        // Windows ARM does not support CUDA and uses CPU only.
-        #[cfg(any(
-            target_os = "linux",
-            all(target_os = "windows", target_arch = "x86_64")
-        ))]
+        // Linux / Android / Windows: probe backend plugins via dynamic loading
+        // in priority order.  The main binary is compiled with the cuda feature
+        // but candle-core uses cudarc fallback-dynamic-loading so CUDA libs are
+        // opened on demand — they are not hard-linked into the binary.
+        //
+        // Platform notes:
+        //   Linux x86_64 / aarch64 : CUDA → ROCm → Hexagon → Vulkan → CPU
+        //   Android aarch64         : Hexagon → CPU
+        //   Windows x86_64          : CUDA → Vulkan → CPU
+        //   Windows aarch64         : Hexagon → Vulkan → CPU
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows",))]
         {
             use crate::backend::BackendKind;
             match crate::backend::detect_backend() {
+                #[cfg(any(
+                    target_os = "linux",
+                    all(target_os = "windows", target_arch = "x86_64")
+                ))]
                 BackendKind::Cuda => {
                     let device = candle_core::Device::new_cuda(0)?;
                     tracing::info!("Using CUDA device (via plugin)");
                     disable_cuda_event_tracking(&device);
                     return Ok(device);
                 }
+                #[cfg(any(
+                    target_os = "linux",
+                    all(target_os = "windows", target_arch = "x86_64")
+                ))]
                 BackendKind::Musa => {
                     // Moore Threads MUSA mirrors the CUDA API.  candle-core's
                     // `cuda` feature covers MUSA when the binary is loaded in
@@ -266,6 +276,10 @@ impl ServeArgs {
                     disable_cuda_event_tracking(&device);
                     return Ok(device);
                 }
+                #[cfg(any(
+                    target_os = "linux",
+                    all(target_os = "windows", target_arch = "x86_64")
+                ))]
                 BackendKind::Rocm => {
                     // ROCm uses the same HIP/CUDA device path in candle.
                     // Supported on Linux x86_64, Linux aarch64, and Windows
@@ -275,7 +289,7 @@ impl ServeArgs {
                     disable_cuda_event_tracking(&device);
                     return Ok(device);
                 }
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "android"))]
                 BackendKind::Cann => {
                     // Huawei Ascend NPU detected via CANN runtime.
                     // candle-core does not yet have a native CANN Device
@@ -289,6 +303,25 @@ impl ServeArgs {
                          candle integrates CANN support."
                     );
                 }
+                #[cfg(any(
+                    target_os = "linux",
+                    target_os = "android",
+                    all(target_os = "windows", target_arch = "aarch64")
+                ))]
+                BackendKind::Hexagon => {
+                    // Hexagon HTP NPU detected (Qualcomm Snapdragon).
+                    // candle does not yet have a native Hexagon Device variant;
+                    // fall back to CPU and log the detection so the user knows
+                    // the NPU was found.  Hexagon acceleration will be enabled
+                    // automatically once candle gains Hexagon device support
+                    // and this backend is updated.
+                    tracing::info!(
+                        "Qualcomm Hexagon HTP detected but candle has no \
+                         Hexagon Device variant yet — falling back to CPU. \
+                         NPU acceleration will be enabled in a future release."
+                    );
+                }
+                #[cfg(any(target_os = "linux", target_os = "windows",))]
                 BackendKind::Vulkan => {
                     // Vulkan driver detected. candle 0.8 does not yet have a
                     // Vulkan/wgpu Device variant, so we fall through to CPU.
