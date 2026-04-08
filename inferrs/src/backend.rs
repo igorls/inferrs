@@ -18,9 +18,24 @@
 //! If a probe succeeds the matching `candle_core::Device` variant is returned.
 //! The caller (`resolve_device`) uses this to construct the actual device.
 //!
+//! ## Platform support matrix
+//!
+//! | Platform                  | CUDA | ROCm | Vulkan |
+//! |---------------------------|------|------|--------|
+//! | Linux x86_64              | ✓    | ✓    | ✓      |
+//! | Linux aarch64             | ✓    | ✓    | ✓      |
+//! | Windows x86_64            | ✓    | ✓    | ✓      |
+//! | Windows aarch64           | —    | —    | —      |
+//! | macOS aarch64             | —    | —    | —      |
+//! | Android                   | —    | —    | —      |
+//!
+//! ROCm on Windows is supported from ROCm 5.5+ (HIP SDK for Windows).
+//! ROCm on Linux aarch64 is supported on hardware such as AMD MI300A APUs
+//! and Radeon-equipped AArch64 platforms.
+//!
 //! Plugin search order (highest priority first):
 //!   1. CUDA   (`.so` / `.dll`)  → `Device::new_cuda(0)`
-//!   2. ROCm   (`.so`)           → `Device::new_cuda(0)` (HIP, Linux only)
+//!   2. ROCm   (`.so` / `.dll`)  → `Device::new_cuda(0)` (HIP)
 //!   3. Vulkan (`.so` / `.dll`)  → CPU fallback with warning
 //!   4. CPU    (always available)
 
@@ -51,7 +66,8 @@ mod linux {
     pub fn detect_backend() -> BackendKind {
         let search_dirs = plugin_search_dirs();
 
-        // Priority order: CUDA → ROCm → Vulkan → CPU
+        // Priority order: CUDA → ROCm → Vulkan → CPU.
+        // Both x86_64 and aarch64 Linux support CUDA and ROCm.
         let candidates: &[(&str, BackendKind)] = &[
             ("libinferrs_backend_cuda.so", BackendKind::Cuda),
             ("libinferrs_backend_rocm.so", BackendKind::Rocm),
@@ -137,7 +153,10 @@ mod linux {
 pub use linux::{detect_backend, BackendKind};
 
 // ── Windows x86_64 ───────────────────────────────────────────────────────────
-// CUDA is not available on Windows ARM, so the plugin system is x86_64-only.
+// CUDA and ROCm are not available on Windows ARM, so the plugin system is
+// x86_64-only.  ROCm on Windows is supported from ROCm 5.5+ (HIP SDK for
+// Windows); the plugin DLL is named `inferrs_backend_rocm.dll` and follows
+// the same ABI as the Linux `.so`.
 
 #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
 mod windows {
@@ -149,6 +168,8 @@ mod windows {
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum BackendKind {
         Cuda,
+        /// ROCm/HIP device (AMD GPU via ROCm 5.5+ HIP SDK for Windows).
+        Rocm,
         /// Vulkan is detected but candle 0.8 has no Vulkan Device variant yet.
         /// Falls back to CPU while logging the detection.
         Vulkan,
@@ -162,9 +183,11 @@ mod windows {
     pub fn detect_backend() -> BackendKind {
         let search_dirs = plugin_search_dirs();
 
-        // Priority order: CUDA → Vulkan → CPU  (ROCm is Linux-only)
+        // Priority order: CUDA → ROCm → Vulkan → CPU.
+        // ROCm on Windows x86_64 is supported via AMD's HIP SDK (ROCm 5.5+).
         let candidates: &[(&str, BackendKind)] = &[
             ("inferrs_backend_cuda.dll", BackendKind::Cuda),
+            ("inferrs_backend_rocm.dll", BackendKind::Rocm),
             ("inferrs_backend_vulkan.dll", BackendKind::Vulkan),
         ];
 

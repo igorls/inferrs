@@ -10,6 +10,10 @@
 /// available and will accelerate inference once candle gains wgpu support.
 /// Until then the binary falls back to CPU after logging the detection.
 ///
+/// Platform coverage: Linux only. The probe always returns 1 (unavailable) on
+/// Windows and macOS. When candle gains wgpu support and the Vulkan probe is
+/// extended to Windows, update the cfg guard below and the release workflow.
+///
 /// Returns 0 if `libvulkan.so.1` can be opened, 1 otherwise.
 #[no_mangle]
 pub extern "C" fn inferrs_backend_probe() -> i32 {

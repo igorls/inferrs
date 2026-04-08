@@ -254,9 +254,10 @@ impl ServeArgs {
                     disable_cuda_event_tracking(&device);
                     return Ok(device);
                 }
-                #[cfg(target_os = "linux")]
                 BackendKind::Rocm => {
                     // ROCm uses the same HIP/CUDA device path in candle.
+                    // Supported on Linux x86_64, Linux aarch64, and Windows
+                    // x86_64 (via AMD HIP SDK / ROCm 5.5+).
                     let device = candle_core::Device::new_cuda(0)?;
                     tracing::info!("Using ROCm device (via plugin)");
                     disable_cuda_event_tracking(&device);

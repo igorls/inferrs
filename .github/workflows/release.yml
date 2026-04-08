@@ -134,7 +134,7 @@ jobs:
           name: inferrs-x86_64-unknown-linux-gnu
           path: inferrs-x86_64-unknown-linux-gnu.tar.gz
 
-  # ── Linux aarch64: main binary + CUDA/Vulkan plugins ─────────────────────
+  # ── Linux aarch64: main binary + CUDA/ROCm/Vulkan plugins ───────────────
   build-linux-arm64:
     name: Build (aarch64-unknown-linux-gnu)
     runs-on: ubuntu-24.04-arm
@@ -169,6 +169,26 @@ jobs:
           cargo build --release --target aarch64-unknown-linux-gnu \
             -p inferrs -p inferrs-backend-cuda
 
+      # ── ROCm backend plugin (aarch64 supports ROCm on MI300A / Radeon) ──
+      # amdgpu-install does not yet provide a pre-built sbsa ROCm package in
+      # the same DEB form as x86_64, so we install the upstream ROCm apt repo
+      # directly (supported since ROCm 6.0 for sbsa/aarch64).
+      - name: Install ROCm toolkit
+        run: |
+          wget -q https://repo.radeon.com/amdgpu-install/6.3.3/ubuntu/noble/amdgpu-install_6.3.60303-1_all.deb
+          sudo dpkg -i amdgpu-install_6.3.60303-1_all.deb || true
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            rocm-dev hip-dev
+
+      - name: Build ROCm backend plugin
+        env:
+          ROCM_PATH: /opt/rocm
+          HIP_PATH: /opt/rocm
+        run: |
+          cargo build --release --target aarch64-unknown-linux-gnu \
+            -p inferrs-backend-rocm
+
       # ── Vulkan backend plugin (arm64 systems can have Vulkan drivers) ────
       - name: Build Vulkan backend plugin
         run: |
@@ -184,6 +204,7 @@ jobs:
           cp "$RELEASE_DIR/inferrs" "$STAGE/"
           for lib in \
             libinferrs_backend_cuda.so \
+            libinferrs_backend_rocm.so \
             libinferrs_backend_vulkan.so; do
             [ -f "$RELEASE_DIR/$lib" ] && cp "$RELEASE_DIR/$lib" "$STAGE/"
           done
@@ -194,7 +215,7 @@ jobs:
           name: inferrs-aarch64-unknown-linux-gnu
           path: inferrs-aarch64-unknown-linux-gnu.tar.gz
 
-  # ── Windows x86_64 binary (with CUDA support) ────────────────────────────
+  # ── Windows x86_64 binary (with CUDA + ROCm support) ────────────────────
   build-windows-x86:
     name: Build (x86_64-pc-windows-msvc)
     runs-on: windows-2022
@@ -236,6 +257,45 @@ jobs:
           cargo build --release --target x86_64-pc-windows-msvc `
             -p inferrs -p inferrs-backend-cuda
 
+      # ── ROCm backend plugin (Windows x86_64, ROCm 5.5+ HIP SDK) ─────────
+      # AMD provides a native HIP SDK installer for Windows. The choco package
+      # `amd-hip-sdk` wraps the official AMD HIP SDK installer.  The plugin is
+      # built separately from the CUDA steps because hipcc sets conflicting
+      # environment variables (ROCM_PATH vs CUDA_PATH).
+      #
+      # The resulting DLL uses the same `inferrs_backend_probe` ABI as the
+      # Linux .so, so the Windows runtime LoadLibrary probe finds it using
+      # the same logic as on Linux.
+      - name: Install AMD HIP SDK (Windows)
+        shell: pwsh
+        run: choco install --no-progress -y amd-hip-sdk
+
+      - name: Build ROCm backend plugin
+        shell: pwsh
+        run: |
+          # Resolve the versioned ROCm install path dynamically so the build
+          # does not break when Chocolatey installs a newer HIP SDK version.
+          $rocmRoot = "C:\Program Files\AMD\ROCm"
+          $rocmPath = Get-ChildItem $rocmRoot -Directory |
+                        Sort-Object Name -Descending |
+                        Select-Object -First 1 -ExpandProperty FullName
+          if (-not $rocmPath) {
+            Write-Error "No ROCm installation found under $rocmRoot"
+            exit 1
+          }
+          Write-Host "Using ROCm at: $rocmPath"
+          $env:ROCM_PATH = $rocmPath
+          $env:HIP_PATH   = $rocmPath
+          $env:PATH = "$rocmPath\bin;$env:PATH"
+          cargo build --release --target x86_64-pc-windows-msvc `
+            -p inferrs-backend-rocm
+
+      # Note: inferrs-backend-vulkan is intentionally NOT built for Windows.
+      # The Vulkan probe body is cfg(not(target_os = "linux")) → always returns
+      # 1 (unavailable), so shipping the DLL would waste space with no benefit.
+      # When candle gains wgpu support and the Vulkan probe is extended to
+      # Windows, add a build step and DLL entry here.
+
       - name: Package
         shell: pwsh
         run: |
@@ -243,10 +303,15 @@ jobs:
           $stage = "inferrs-windows-x86_64"
           New-Item -ItemType Directory -Force $stage | Out-Null
           Copy-Item "$releaseDir\inferrs.exe" "$stage\"
-          # Ship the CUDA plugin alongside the binary so the runtime dlopen
-          # search (next to the executable) finds it automatically.
-          if (Test-Path "$releaseDir\inferrs_backend_cuda.dll") {
-            Copy-Item "$releaseDir\inferrs_backend_cuda.dll" "$stage\"
+          # Ship all GPU backend plugins alongside the binary so the runtime
+          # LoadLibrary search (next to the executable) finds them automatically.
+          foreach ($dll in @(
+            "inferrs_backend_cuda.dll",
+            "inferrs_backend_rocm.dll"
+          )) {
+            if (Test-Path "$releaseDir\$dll") {
+              Copy-Item "$releaseDir\$dll" "$stage\"
+            }
           }
           Compress-Archive -Path "$stage\*" -DestinationPath "inferrs-x86_64-pc-windows-msvc.zip"
 
