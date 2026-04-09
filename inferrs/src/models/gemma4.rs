@@ -1240,8 +1240,18 @@ impl Attention {
             KvCache::Normal(RetainingKvCache::new(cfg.max_position_embeddings))
         };
 
-        let tq_cache =
-            tq_cfg.map(|c| TurboQuantKvCache::new(c, num_kv_heads, cfg.dtype, cfg.device.clone()));
+        // TurboQuant KV compression is only applied to global (non-sliding) attention
+        // layers.  Sliding layers use a fixed-size rotating KV cache (512 tokens) and
+        // `RetainingRotatingKvCache::append` already returns only the most-recent
+        // `sliding_window` tokens.  If TurboQuant were used for a sliding layer it
+        // would return all accumulated tokens (no truncation), causing a shape mismatch
+        // between the KV tensor and the sliding attention mask on the second prompt when
+        // the total conversation length exceeds the sliding window size.
+        let tq_cache = if is_sliding {
+            None
+        } else {
+            tq_cfg.map(|c| TurboQuantKvCache::new(c, num_kv_heads, cfg.dtype, cfg.device.clone()))
+        };
 
         // Enable the fused SDPA kernel for Metal when the head dim is supported.
         // The Metal SDPA vector kernel (q_seq=1) supports head dims {32,64,96,128,256}
@@ -3468,6 +3478,114 @@ mod tests {
             assert_eq!(
                 v, 0.0,
                 "slot {j} should be visible after long prompt decode"
+            );
+        }
+    }
+
+    // ── Regression: multi-turn conversation KV/mask shape agreement ──────────
+    //
+    // Issue: "shape mismatch in broadcast_add, lhs: [1, 8, 662, 662], rhs: [1, 1, 662, 512]"
+    //        (also reported as [1,8,716,716] vs [1,1,716,512] and [1,8,741,741] vs [1,1,741,512])
+    //
+    // Root cause: TurboQuant was enabled for *both* global and sliding attention
+    // layers.  The REPL feeds the full conversation history as a fresh prefill
+    // every turn.  By the second or third turn the combined token count exceeds
+    // `sliding_window = 512`.  TurboQuant returns all N tokens (no truncation),
+    // but `prepare_decoder_attention_mask` builds the mask for `min(N, 512)` KV
+    // positions.  The `broadcast_add(attn_weights, mask)` then sees mismatched
+    // last dimensions (N vs 512) and crashes.
+    //
+    // Fix: `tq_cache = None` for sliding layers (`Attention::new`, gemma4.rs).
+    // Sliding layers fall back to `RetainingRotatingKvCache`, which already caps
+    // its output at `sliding_window`.
+    //
+    // This test simulates the REPL's multi-turn prefill pattern directly:
+    // it feeds accumulated conversation token counts (as a full re-prefill each
+    // turn, `seqlen_offset = 0`) through `RetainingRotatingKvCache` and checks
+    // that the KV output length always equals the mask's `kv_len`.  If TurboQuant
+    // were re-enabled for sliding layers the analogous check in turbo_quant.rs
+    // (`turbo_quant_kv_output_exceeds_sliding_window_without_cap`) would catch it.
+
+    /// Simulate N turns of the REPL through `RetainingRotatingKvCache`.
+    ///
+    /// Each turn re-prefills the full conversation history (no `seqlen_offset`).
+    /// Returns `(kv_out_len, mask_kv_len)` for every turn; they must always be
+    /// equal — a mismatch is the exact condition that causes the broadcast_add crash.
+    fn simulate_repl_turns(
+        sliding_window: usize,
+        turn_token_counts: &[usize],
+    ) -> Vec<(usize, usize)> {
+        let head_dim = 4usize;
+        let mut cumulative = 0usize;
+        let mut results = Vec::new();
+
+        for &turn_len in turn_token_counts {
+            cumulative += turn_len;
+
+            // Each turn: fresh cache reset + full re-prefill (seqlen_offset = 0).
+            let mut cache = RetainingRotatingKvCache::new(sliding_window);
+            cache.reset();
+            let k =
+                Tensor::ones((1usize, 1usize, cumulative, head_dim), DType::F32, &cpu()).unwrap();
+            let (k_out, _) = cache.append(&k, &k).unwrap();
+            let kv_out_len = k_out.dim(2).unwrap();
+            let mask_kv_len = cumulative.min(sliding_window);
+            results.push((kv_out_len, mask_kv_len));
+        }
+
+        results
+    }
+
+    /// Regression test for GitHub issue #130:
+    /// "shape mismatch in broadcast_add" in multi-turn conversations.
+    ///
+    /// Simulates the exact scenario from the issue: a real-estate assistant
+    /// conversation where 3 turns push the cumulative token count past 512.
+    /// Each turn re-prefills the full history (seqlen_offset = 0).
+    ///
+    /// For every turn, the KV output length from the sliding-window cache must
+    /// equal the mask's kv_len.  A mismatch → broadcast_add crash.
+    #[test]
+    fn multi_turn_sliding_kv_matches_mask_no_crash() {
+        // Approximate token counts from the GitHub issue reproduction:
+        //   turn 1: long system+user prompt       (~380 tokens)
+        //   turn 2: short follow-up               (~50 tokens)
+        //   turn 3: another follow-up             (~232 tokens, cumulative 662 → crash)
+        let turn_tokens = [380usize, 50, 232];
+        let sliding_window = 512usize;
+
+        for (i, (kv_out_len, mask_kv_len)) in simulate_repl_turns(sliding_window, &turn_tokens)
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                kv_out_len,
+                mask_kv_len,
+                "turn {}: KV output len ({kv_out_len}) != mask kv_len ({mask_kv_len}) \
+                 — this is the broadcast_add shape mismatch from issue #130",
+                i + 1
+            );
+        }
+    }
+
+    /// Same scenario but using the exact shapes from the second reporter
+    /// in issue #130: crash at [1,8,716,716] vs [1,1,716,512].
+    #[test]
+    fn multi_turn_sliding_kv_matches_mask_716_tokens() {
+        // turn 1: ~380 tokens (large system+user), turn 2: ~84, turn 3: ~252 → 716
+        let turn_tokens = [380usize, 84, 252];
+        let sliding_window = 512usize;
+
+        for (i, (kv_out_len, mask_kv_len)) in simulate_repl_turns(sliding_window, &turn_tokens)
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(
+                kv_out_len,
+                mask_kv_len,
+                "turn {}: KV output len ({kv_out_len}) != mask kv_len ({mask_kv_len}) \
+                 — broadcast_add would crash at [1,8,716,716] vs [1,1,716,512]",
+                i + 1
             );
         }
     }

@@ -1757,6 +1757,18 @@ fn format_tools_as_system_context(tools: &serde_json::Value) -> String {
         return String::new();
     }
 
+    // Collect the set of required parameter names for a tool schema, if any.
+    fn required_set(tool: &serde_json::Value) -> std::collections::HashSet<&str> {
+        tool.pointer("/function/parameters/required")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<std::collections::HashSet<_>>()
+            })
+            .unwrap_or_default()
+    }
+
     let mut lines = Vec::new();
     lines.push("Available tools:".to_string());
     for tool in arr {
@@ -1775,14 +1787,25 @@ fn format_tools_as_system_context(tools: &serde_json::Value) -> String {
         } else {
             lines.push(format!("- {name}: {description}"));
         }
-        // Include parameter names when present so the model can form valid calls.
+        // Include parameter names, types, and whether each is required so the
+        // model can form valid calls with the correct argument shapes.
         if let Some(props) = tool
             .pointer("/function/parameters/properties")
             .and_then(|v| v.as_object())
         {
-            let param_names: Vec<&str> = props.keys().map(String::as_str).collect();
-            if !param_names.is_empty() {
-                lines.push(format!("  parameters: {}", param_names.join(", ")));
+            if !props.is_empty() {
+                let required = required_set(tool);
+                let mut param_parts: Vec<String> = Vec::with_capacity(props.len());
+                for (param_name, schema) in props {
+                    let type_str = schema.get("type").and_then(|v| v.as_str()).unwrap_or("any");
+                    let req_marker = if required.contains(param_name.as_str()) {
+                        ""
+                    } else {
+                        "?"
+                    };
+                    param_parts.push(format!("{param_name}{req_marker}: {type_str}"));
+                }
+                lines.push(format!("  parameters: {}", param_parts.join(", ")));
             }
         }
     }
@@ -1884,10 +1907,12 @@ async fn ollama_show(
     Json(req): Json<OllamaShowRequest>,
 ) -> impl IntoResponse {
     // Check that the requested model matches the loaded model (if any).
+    // Uses flexible matching so clients that omit the org prefix (e.g.
+    // "gemma-4-E2B-it" vs "google/gemma-4-E2B-it") are not rejected.
     let model_matches = state
         .model_id
         .as_deref()
-        .map(|id| id == req.model)
+        .map(|id| model_matches_id(id, &req.model))
         .unwrap_or(false);
     if !model_matches {
         return Err((
@@ -1983,12 +2008,41 @@ fn ollama_options_to_params(
 /// HTTP error response type for Ollama-compatible endpoints.
 type OllamaHttpError = (StatusCode, Json<serde_json::Value>);
 
+/// Check whether a client-supplied `model` string matches the loaded model ID.
+///
+/// Ollama clients may omit the HuggingFace org prefix — for example a client
+/// may send `"gemma-4-E2B-it"` while the server was started with
+/// `"google/gemma-4-E2B-it"`.  Both forms are accepted:
+///
+/// - Exact match: `"google/gemma-4-E2B-it"` == `"google/gemma-4-E2B-it"`
+/// - Prefix-stripped match: `"gemma-4-E2B-it"` matches `"google/gemma-4-E2B-it"`
+///   (client omitted the `org/` prefix)
+fn model_matches_id(loaded_id: &str, requested: &str) -> bool {
+    if loaded_id == requested {
+        return true;
+    }
+    // Allow clients that strip the `org/` prefix.
+    if let Some(after_slash) = loaded_id.split_once('/').map(|(_, name)| name) {
+        if after_slash == requested {
+            return true;
+        }
+    }
+    false
+}
+
 fn require_ollama_tokenizer<'a>(
     state: &'a AppState,
     model: &str,
 ) -> Result<&'a Tokenizer, OllamaHttpError> {
     match state.tokenizer.as_deref() {
-        Some(t) if state.model_id.as_deref() == Some(model) => Ok(t),
+        Some(t)
+            if state
+                .model_id
+                .as_deref()
+                .is_some_and(|id| model_matches_id(id, model)) =>
+        {
+            Ok(t)
+        }
         Some(_) => Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({

@@ -1218,4 +1218,60 @@ mod tests {
             t_prefill + 1
         );
     }
+
+    /// Document that `TurboQuantKvCache` returns *all* accumulated tokens with no
+    /// sliding-window cap — confirming why it must not be used for sliding-window
+    /// attention layers.
+    ///
+    /// The multi-turn crash (GitHub issue #130, "shape mismatch in broadcast_add,
+    /// lhs: [1,8,662,662], rhs: [1,1,662,512]") occurred because TurboQuant was
+    /// used for sliding layers: it returned all N > 512 tokens from the combined
+    /// multi-turn prefill, while `prepare_decoder_attention_mask` built a mask only
+    /// 512 columns wide.  `broadcast_add` then saw mismatched last dimensions.
+    ///
+    /// `RetainingRotatingKvCache` is the correct cache for sliding layers because it
+    /// caps its output at `sliding_window`; this test verifies TurboQuant does NOT.
+    #[test]
+    fn turbo_quant_kv_output_exceeds_sliding_window_without_cap() {
+        // Reproduce the exact token count from issue #130 (662 tokens, window 512).
+        let head_dim = 32usize;
+        let n_kv_heads = 1usize;
+        let sliding_window = 512usize;
+        let combined_prefill = 662usize; // cumulative turns 1+2+3 token count at crash
+
+        let device = test_device();
+        let dtype = test_dtype(&device);
+        let mut tq_cache = TurboQuantKvCache::new(
+            &TurboQuantConfig { bits: 8, head_dim },
+            n_kv_heads,
+            dtype,
+            device.clone(),
+        )
+        .without_warmup();
+
+        let k = Tensor::zeros((1, n_kv_heads, combined_prefill, head_dim), dtype, &device).unwrap();
+        tq_cache.append(&k, &k).unwrap();
+        let (k_out, _) = tq_cache.dequantize().unwrap();
+
+        // TurboQuant returns all 662 tokens — no sliding-window cap.
+        assert_eq!(
+            k_out.dim(2).unwrap(),
+            combined_prefill,
+            "TurboQuantKvCache must return all tokens (no sliding cap); \
+             if this fails the cache has been made sliding-window-aware"
+        );
+
+        // The mask would be built for min(662, 512) = 512 columns.
+        let mask_kv_len = combined_prefill.min(sliding_window);
+
+        // These differ → broadcast_add would crash: [1,8,662,662] vs [1,1,662,512].
+        // This is why `Attention::new` sets `tq_cache = None` for sliding layers.
+        assert_ne!(
+            k_out.dim(2).unwrap(),
+            mask_kv_len,
+            "Expected TurboQuant ({} tokens) to differ from mask kv_len ({mask_kv_len}); \
+             if they match, TurboQuant now caps at the window and this test should be updated",
+            k_out.dim(2).unwrap()
+        );
+    }
 }
