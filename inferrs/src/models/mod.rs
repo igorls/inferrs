@@ -451,7 +451,7 @@ pub fn load_model(
     // TurboQuant is on by default; warn if this architecture doesn't support it.
     if turbo_quant_bits.is_some() {
         match arch {
-            ModelArchitecture::Qwen3 | ModelArchitecture::Gemma4 => {} // supported
+            ModelArchitecture::Qwen3 | ModelArchitecture::Gemma4 | ModelArchitecture::Qwen35 => {} // supported
             other => {
                 tracing::warn!(
                     "--turbo-quant is not supported for {:?} and will be ignored. \
@@ -518,7 +518,7 @@ pub fn load_model(
             })
         }
         ModelArchitecture::Qwen35 => {
-            let config = raw_config.to_qwen35_config(dtype, device.clone());
+            let config = raw_config.to_qwen35_config(dtype, device.clone(), turbo_quant_bits);
             tracing::info!(
                 "Qwen3.5 config: {} layers, {} attn heads, {} hidden, {} kv_heads",
                 config.num_hidden_layers,
