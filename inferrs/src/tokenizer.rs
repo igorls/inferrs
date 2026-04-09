@@ -412,13 +412,76 @@ fn detect_chat_template(config: &Option<TokenizerConfig>) -> ChatTemplate {
     ChatTemplate::ChatML
 }
 
+/// Normalize a message list for template rendering.
+///
+/// Two transformations are applied to reduce prompt-pressure issues that arise
+/// when an OpenAI-compatible agent runtime (e.g. OpenClaw) sends a full
+/// multi-turn conversation that includes tool calls:
+///
+/// 1. **Drop empty assistant turns** — assistant messages that have no text
+///    content (i.e. they carry only `tool_calls`) are skipped.  Rendering them
+///    as an empty model turn wastes tokens and can confuse local models like
+///    Gemma that do not natively process tool-call payloads.
+///
+/// 2. **Merge consecutive same-role turns** — `role: "tool"` messages are
+///    folded into the "user" role so that tool results appear as user context.
+///    This can create consecutive "user" turns.  Consecutive turns with the
+///    same rendered role are merged (separated by `"\n\n"`) into a single turn
+///    so the model sees a well-formed alternating conversation.
+///
+/// The `map_role` parameter mirrors the same closure used by the calling
+/// template function so that role folding (e.g. system→user for Gemma3) is
+/// applied consistently before deduplication.
+fn normalize_messages<'a>(
+    messages: &'a [ChatMessage],
+    map_role: impl Fn(&'a Role) -> &'static str,
+) -> Vec<(&'static str, String)> {
+    // Step 1: map roles and drop empty assistant turns.
+    let mapped: Vec<(&'static str, &'a ChatMessage)> = messages
+        .iter()
+        .filter_map(|msg| {
+            let role = map_role(&msg.role);
+            // Skip assistant messages with no text content — these are tool-call
+            // invocation turns that contain only a `tool_calls` JSON payload.
+            // They add no useful text context for a local inference backend.
+            if (role == "model" || role == "assistant")
+                && msg.content.0.is_empty()
+                && msg.tool_calls.is_some()
+            {
+                return None;
+            }
+            Some((role, msg))
+        })
+        .collect();
+
+    // Step 2: merge consecutive turns that share the same rendered role.
+    let mut result: Vec<(&'static str, String)> = Vec::new();
+    for (role, msg) in mapped {
+        let content = msg.content.0.clone();
+        if let Some(last) = result.last_mut() {
+            if last.0 == role {
+                // Append to the previous turn rather than emitting a new one.
+                if !last.1.is_empty() && !content.is_empty() {
+                    last.1.push_str("\n\n");
+                }
+                last.1.push_str(&content);
+                continue;
+            }
+        }
+        result.push((role, content));
+    }
+    result
+}
+
 fn apply_chatml_inner(messages: &[ChatMessage], assistant_suffix: &str) -> String {
+    let normalized = normalize_messages(messages, |role| match role {
+        Role::System => "system",
+        Role::User | Role::Tool | Role::Function => "user",
+        Role::Assistant => "assistant",
+    });
     let mut prompt = String::new();
-    for msg in messages {
-        prompt.push_str(&format!(
-            "<|im_start|>{}\n{}<|im_end|>\n",
-            msg.role, msg.content
-        ));
+    for (role, content) in &normalized {
+        prompt.push_str(&format!("<|im_start|>{role}\n{content}<|im_end|>\n"));
     }
     prompt.push_str("<|im_start|>assistant\n");
     prompt.push_str(assistant_suffix);
@@ -442,45 +505,19 @@ fn apply_qwen35(messages: &[ChatMessage]) -> String {
 }
 
 fn apply_gemma(messages: &[ChatMessage], bos_token: &Option<String>) -> String {
+    let normalized = normalize_messages(messages, |role| match role {
+        Role::System | Role::User | Role::Tool | Role::Function => "user",
+        Role::Assistant => "model",
+    });
     let mut prompt = String::new();
     if let Some(bos) = bos_token {
         prompt.push_str(bos);
     }
-    for msg in messages {
-        prompt.push_str(&format!(
-            "<start_of_turn>{}\n{}<end_of_turn>\n",
-            msg.role, msg.content
-        ));
+    for (role, content) in &normalized {
+        prompt.push_str(&format!("<start_of_turn>{role}\n{content}<end_of_turn>\n"));
     }
     // Add the assistant turn marker
     prompt.push_str("<start_of_turn>model\n");
-    prompt
-}
-
-/// Shared turn-building helper for Gemma-family templates.
-///
-/// `prefix`        — string prepended before any turns (e.g. `"<bos>"` or `"<bos>\n"`)
-/// `turn_start`    — opening delimiter for a turn (e.g. `"<start_of_turn>"` or `"<|turn>"`)
-/// `turn_end`      — closing delimiter after content (e.g. `"<end_of_turn>\n"` or `"<turn|>\n"`)
-/// `final_marker`  — appended after all turns (e.g. `"<start_of_turn>model\n"`)
-/// `map_role`      — closure that maps a `&Role` to the string label used in the template
-/// `transform`     — closure that transforms message content (e.g. trim for Gemma4)
-fn apply_gemma_family(
-    messages: &[ChatMessage],
-    prefix: &str,
-    turn_start: &str,
-    turn_end: &str,
-    final_marker: &str,
-    map_role: impl Fn(&Role) -> &'static str,
-    transform: impl Fn(&str) -> &str,
-) -> String {
-    let mut prompt = String::from(prefix);
-    for msg in messages {
-        let role = map_role(&msg.role);
-        let content = transform(&msg.content);
-        prompt.push_str(&format!("{turn_start}{role}\n{content}{turn_end}"));
-    }
-    prompt.push_str(final_marker);
     prompt
 }
 
@@ -488,18 +525,16 @@ fn apply_gemma_family(
 /// The assistant turn uses "model" as the role label.
 /// System messages are folded into the user turn as Gemma3 doesn't have a system role.
 fn apply_gemma3(messages: &[ChatMessage]) -> String {
-    apply_gemma_family(
-        messages,
-        "<bos>",
-        "<start_of_turn>",
-        "<end_of_turn>\n",
-        "<start_of_turn>model\n",
-        |role| match role {
-            Role::System | Role::User | Role::Tool | Role::Function => "user",
-            Role::Assistant => "model",
-        },
-        |s| s,
-    )
+    let normalized = normalize_messages(messages, |role| match role {
+        Role::System | Role::User | Role::Tool | Role::Function => "user",
+        Role::Assistant => "model",
+    });
+    let mut prompt = String::from("<bos>");
+    for (role, content) in &normalized {
+        prompt.push_str(&format!("<start_of_turn>{role}\n{content}<end_of_turn>\n"));
+    }
+    prompt.push_str("<start_of_turn>model\n");
+    prompt
 }
 
 /// Gemma4 chat template (text-only, no audio).
@@ -524,28 +559,60 @@ fn apply_gemma4_inner(messages: &[ChatMessage], audio_token_counts: &[usize]) ->
     // Reference format (from AutoProcessor.apply_chat_template):
     //   <bos><|turn>user\n<|audio><|audio|>×N<audio|>text<turn|>\n<|turn>model\n
     // No \n after <bos>, no \n between <audio|> and text.
+    //
+    // Audio-bearing messages cannot be merged into their neighbours (the audio
+    // tensor injection depends on per-message identity), so normalization is
+    // applied only to the non-audio subset here: empty tool-call assistant turns
+    // are dropped, and consecutive same-role non-audio turns are merged.
     let mut prompt = String::from("<bos>");
     let mut audio_idx = 0usize;
+
+    // Collect (role_str, content_str, has_audio) before merging so that audio
+    // messages retain their per-message audio_idx assignment.
+    let mut turns: Vec<(&'static str, String, bool)> = Vec::new();
     for msg in messages {
         let role = match msg.role {
             Role::System => "system",
             Role::User | Role::Tool | Role::Function => "user",
             Role::Assistant => "model",
         };
-        // Build the content, inserting audio tokens if this message has audio.
+        let has_audio = msg.audio.is_some();
+
+        // Build content, inserting audio tokens if this message has audio.
         // Token strings from the Gemma4 tokenizer:
         //   <|audio>   = begin-of-audio  (id 256000)
         //   <|audio|>  = audio soft token (id 258881), repeated N times
         //   <audio|>   = end-of-audio    (id 258883)
-        let content = if msg.audio.is_some() {
+        let content = if has_audio {
             let n = audio_token_counts.get(audio_idx).copied().unwrap_or(0);
             audio_idx += 1;
             let soft_tokens = "<|audio|>".repeat(n);
             // No newline between <audio|> and text — matches reference template.
             format!("<|audio>{soft_tokens}<audio|>{}", msg.content.trim())
         } else {
+            // Drop empty assistant (tool-call-only) turns.
+            if role == "model" && msg.content.0.is_empty() && msg.tool_calls.is_some() {
+                continue;
+            }
             msg.content.trim().to_string()
         };
+
+        // Merge consecutive non-audio same-role turns.
+        if !has_audio {
+            if let Some(last) = turns.last_mut() {
+                if last.0 == role && !last.2 {
+                    if !last.1.is_empty() && !content.is_empty() {
+                        last.1.push_str("\n\n");
+                    }
+                    last.1.push_str(&content);
+                    continue;
+                }
+            }
+        }
+        turns.push((role, content, has_audio));
+    }
+
+    for (role, content, _) in &turns {
         prompt.push_str(&format!("<|turn>{}\n{}<turn|>\n", role, content));
     }
     prompt.push_str("<|turn>model\n");
@@ -640,12 +707,15 @@ mod tests {
     #[test]
     fn gemma3_template_system_becomes_user() {
         // Gemma3 has no system role; system messages are treated as user turns.
+        // Consecutive same-role turns (system→user + user) are merged into one.
         let msgs = vec![system_msg("You are a translator."), user_msg("Hello")];
         let prompt = apply_gemma3(&msgs);
-        // Both should use "user" role
+        // Merged into a single user turn.
         let user_turns: Vec<_> = prompt.match_indices("<start_of_turn>user").collect();
-        assert_eq!(user_turns.len(), 2);
+        assert_eq!(user_turns.len(), 1);
         assert!(!prompt.contains("<start_of_turn>system"));
+        assert!(prompt.contains("You are a translator."));
+        assert!(prompt.contains("Hello"));
     }
 
     #[test]
@@ -833,5 +903,131 @@ mod tests {
         assert!(prompt.contains("What is the weather?"));
         assert!(prompt.contains("72°F"));
         assert!(prompt.contains("Thanks!"));
+    }
+
+    // ── Tests for agent-turn normalization (empty assistant turns + role merging) ──
+
+    #[test]
+    fn empty_assistant_tool_call_turn_is_dropped_in_chatml() {
+        // An assistant message with only tool_calls (null content) should not
+        // produce an empty <|im_start|>assistant\n<|im_end|> turn.
+        let json = r#"[
+            {"role":"user","content":"What is 2+2?"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"calc","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"4"},
+            {"role":"user","content":"Thanks!"}
+        ]"#;
+        let messages: Vec<ChatMessage> = serde_json::from_str(json).unwrap();
+        let prompt = apply_chatml(&messages, &None);
+        // The empty assistant turn must not appear.
+        assert!(!prompt.contains("<|im_start|>assistant\n<|im_end|>"));
+        // Tool result and next user message are merged into a single user turn.
+        let user_turns: Vec<_> = prompt.match_indices("<|im_start|>user").collect();
+        assert_eq!(
+            user_turns.len(),
+            1,
+            "tool result and user msg should be one merged user turn"
+        );
+        assert!(prompt.contains("4"));
+        assert!(prompt.contains("Thanks!"));
+    }
+
+    #[test]
+    fn tool_result_and_next_user_msg_merge_in_chatml() {
+        // tool result (folded to user) + subsequent user message = single user turn.
+        let tool_result: ChatMessage =
+            serde_json::from_str(r#"{"role":"tool","tool_call_id":"c1","content":"42"}"#).unwrap();
+        let next_user = user_msg("Got it.");
+        let prompt = apply_chatml(&[tool_result, next_user], &None);
+        let user_turns: Vec<_> = prompt.match_indices("<|im_start|>user").collect();
+        assert_eq!(user_turns.len(), 1);
+        assert!(prompt.contains("42"));
+        assert!(prompt.contains("Got it."));
+    }
+
+    #[test]
+    fn empty_assistant_tool_call_turn_is_dropped_in_gemma3() {
+        // Same as above but for the Gemma3 template.
+        let json = r#"[
+            {"role":"user","content":"What is 2+2?"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"calc","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"4"},
+            {"role":"user","content":"Thanks!"}
+        ]"#;
+        let messages: Vec<ChatMessage> = serde_json::from_str(json).unwrap();
+        let prompt = apply_gemma3(&messages);
+        // Empty model turn must not appear.
+        assert!(!prompt.contains("<start_of_turn>model\n<end_of_turn>"));
+        // Tool result and user message merge into a single user turn.
+        let user_turns: Vec<_> = prompt.match_indices("<start_of_turn>user").collect();
+        assert_eq!(user_turns.len(), 1);
+        assert!(prompt.contains("4"));
+        assert!(prompt.contains("Thanks!"));
+    }
+
+    #[test]
+    fn empty_assistant_tool_call_turn_is_dropped_in_gemma4() {
+        // Same normalization for the Gemma4 template.
+        let json = r#"[
+            {"role":"user","content":"What is 2+2?"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"calc","arguments":"{}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"4"},
+            {"role":"user","content":"Thanks!"}
+        ]"#;
+        let messages: Vec<ChatMessage> = serde_json::from_str(json).unwrap();
+        let prompt = apply_gemma4(&messages);
+        // Empty model turn must not appear.
+        assert!(!prompt.contains("<|turn>model\n<turn|>"));
+        // Tool result and user message merge into a single user turn.
+        let user_turns: Vec<_> = prompt.match_indices("<|turn>user").collect();
+        assert_eq!(user_turns.len(), 1);
+        assert!(prompt.contains("4"));
+        assert!(prompt.contains("Thanks!"));
+    }
+
+    #[test]
+    fn assistant_with_text_content_and_tool_calls_is_kept() {
+        // An assistant message that has BOTH text content and tool_calls should
+        // not be dropped — the text is real context for the model.
+        let json = r#"{"role":"assistant","content":"Let me check that.","tool_calls":[{"id":"c1","type":"function","function":{"name":"calc","arguments":"{}"}}]}"#;
+        let msg: ChatMessage = serde_json::from_str(json).unwrap();
+        let prompt = apply_chatml(&[msg], &None);
+        assert!(prompt.contains("<|im_start|>assistant\nLet me check that.<|im_end|>"));
+    }
+
+    #[test]
+    fn full_openclaw_agent_turn_chatml_is_well_formed() {
+        // Simulate a realistic OpenClaw multi-tool-call agent conversation:
+        //   system prompt → user → assistant (tool call, null content) →
+        //   tool result → assistant (text reply) → user follow-up
+        let json = r#"[
+            {"role":"system","content":"You are a helpful assistant."},
+            {"role":"user","content":"What is the weather in Paris?"},
+            {"role":"assistant","content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}}]},
+            {"role":"tool","tool_call_id":"c1","content":"Partly cloudy, 18°C"},
+            {"role":"assistant","content":"The weather in Paris is partly cloudy at 18°C."},
+            {"role":"user","content":"Thanks!"}
+        ]"#;
+        let messages: Vec<ChatMessage> = serde_json::from_str(json).unwrap();
+        let prompt = apply_chatml(&messages, &None);
+
+        // System and first user turn are separate (different roles).
+        assert!(prompt.contains("<|im_start|>system\nYou are a helpful assistant.<|im_end|>"));
+        // No empty assistant turn from the tool-call message.
+        assert!(!prompt.contains("<|im_start|>assistant\n<|im_end|>"));
+        // Tool result + user follow-up are merged into a single user turn.
+        let user_turns: Vec<_> = prompt.match_indices("<|im_start|>user").collect();
+        assert_eq!(
+            user_turns.len(),
+            2,
+            "expected: 'What is the weather?' turn + merged (tool-result + Thanks!) turn"
+        );
+        // Text assistant reply is present.
+        assert!(prompt.contains("partly cloudy at 18°C"));
+        // Tool result is present.
+        assert!(prompt.contains("Partly cloudy, 18°C"));
+        // User follow-up is present.
+        assert!(prompt.contains("Thanks!"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n"));
     }
 }
