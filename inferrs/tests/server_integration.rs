@@ -145,6 +145,41 @@ fn chat_completion(port: u16, user_message: &str) -> String {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Returns a synthetic prompt of approximately `target_len` tokens by
+/// repeating a short sentence.  Each word is roughly 1.3 tokens on average,
+/// so `target_len / 6` repetitions ≈ `target_len` tokens.
+fn synthetic_prompt(target_tokens: usize) -> String {
+    let sentence = "The quick brown fox jumps over the lazy dog. ";
+    // Approximately 10 tokens per repetition (9 words × ~1.1 tokens/word).
+    let reps = (target_tokens / 10).max(1);
+    sentence.repeat(reps)
+}
+
+/// Starts `inferrs serve <model_id>` with paged attention enabled.
+fn spawn_server_paged(model_id: &str, port: u16) -> std::process::Child {
+    let bin = env!("CARGO_BIN_EXE_inferrs");
+    std::process::Command::new(bin)
+        .args([
+            "serve",
+            model_id,
+            "--port",
+            &port.to_string(),
+            "--host",
+            "127.0.0.1",
+            "--max-tokens",
+            "64",
+            "--dtype",
+            "bf16",
+            "--device",
+            "auto",
+            "--paged-attention",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("failed to spawn inferrs with paged attention")
+}
+
 /// Verifies that `google/gemma-4-E2B-it` returns a coherent (intelligible)
 /// response to a trivial chat message.
 ///
@@ -227,6 +262,128 @@ fn gemma4_e2b_returns_intelligible_output() {
     });
 
     // Always kill the server child process, even on panic.
+    let _ = server.kill();
+    let _ = server.wait();
+
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
+/// Verifies that `google/gemma-4-E2B-it` handles a prompt longer than the
+/// sliding-window size (512 tokens) without crashing.
+///
+/// This directly exercises the `RetainingRotatingKvCache` wrap-around path and
+/// the sliding-window attention mask clamping code, both of which are bypassed
+/// by short "Hello"-style prompts.
+///
+/// Run with:
+/// ```
+/// cargo test --test server_integration gemma4_e2b_long_context_no_crash -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires model download and significant compute; run with --ignored"]
+fn gemma4_e2b_long_context_no_crash() {
+    let model_id = "google/gemma-4-E2B-it";
+    let port = free_port();
+
+    let mut server = spawn_server(model_id, port);
+
+    let result = std::panic::catch_unwind(|| {
+        wait_for_health(port, Duration::from_secs(300));
+
+        // A prompt of ~600 tokens exercises the sliding-window wrap (window=512).
+        let long_prompt = synthetic_prompt(600);
+        let prompt = format!(
+            "{}. In one word, what animal did the fox jump over?",
+            long_prompt
+        );
+
+        let url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
+        let body = serde_json::json!({
+            "model": model_id,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 32,
+            "temperature": 0.0
+        });
+
+        let resp = ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .send_string(&body.to_string())
+            .expect("HTTP request failed with long prompt");
+
+        assert_eq!(
+            resp.status(),
+            200,
+            "expected 200 OK for long-context request (got {})",
+            resp.status()
+        );
+
+        let json: serde_json::Value = resp.into_json().expect("response is not valid JSON");
+        let content = json["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("");
+
+        assert!(
+            looks_intelligible(content),
+            "long-context response is not intelligible.\nGot: {:?}",
+            content
+        );
+
+        eprintln!("gemma4 long-context response: {:?}", content);
+    });
+
+    let _ = server.kill();
+    let _ = server.wait();
+
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}
+
+/// Verifies that `google/gemma-4-E2B-it` with `--paged-attention` handles a
+/// long prompt (>512 tokens) and that a second request after the first
+/// completes successfully (exercises block reuse correctness).
+///
+/// Run with:
+/// ```
+/// cargo test --test server_integration gemma4_e2b_paged_long_context_and_second_request -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires model download and significant compute; run with --ignored"]
+fn gemma4_e2b_paged_long_context_and_second_request() {
+    let model_id = "google/gemma-4-E2B-it";
+    let port = free_port();
+
+    let mut server = spawn_server_paged(model_id, port);
+
+    let result = std::panic::catch_unwind(|| {
+        wait_for_health(port, Duration::from_secs(300));
+
+        // First request: long prompt to exercise the paged sliding-window path.
+        let long_prompt = synthetic_prompt(600);
+        let prompt1 = format!(
+            "{}. In one word, what animal did the fox jump over?",
+            long_prompt
+        );
+        let resp1 = chat_completion(port, &prompt1);
+        assert!(
+            looks_intelligible(&resp1),
+            "paged long-context first request not intelligible.\nGot: {:?}",
+            resp1
+        );
+        eprintln!("paged long-context first response: {:?}", resp1);
+
+        // Second request: short, to verify block reuse doesn't corrupt the cache.
+        let resp2 = chat_completion(port, "What is 2 + 2?");
+        assert!(
+            resp2.contains('4'),
+            "paged second request (after long-context) expected '4'.\nGot: {:?}",
+            resp2
+        );
+        eprintln!("paged second request response: {:?}", resp2);
+    });
+
     let _ = server.kill();
     let _ = server.wait();
 

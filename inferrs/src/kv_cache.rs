@@ -287,4 +287,41 @@ impl PagedKvStore {
         let v = self.value_caches[layer_idx].index_select(&idx, 0)?;
         Ok((k, v))
     }
+
+    /// Zero out the given slots in all layers so that `index_add` writes
+    /// don't accumulate stale values from a previous sequence.
+    ///
+    /// This must be called once per new sequence (at `seqlen_offset == 0`)
+    /// after blocks have been allocated for the prompt.  Without it, reused
+    /// physical blocks carry K/V data from the previous occupant, and the
+    /// `index_add` writes in `forward_returning_kv_paged` would add the new
+    /// values on top of the old ones instead of replacing them.
+    pub fn zero_slots(&mut self, slot_ids: &[u32]) -> candle_core::Result<()> {
+        if slot_ids.is_empty() {
+            return Ok(());
+        }
+        let n_slots = slot_ids.len();
+        // All layers share the same device; build the index tensor once.
+        let device = self.key_caches[0].device().clone();
+        let idx_t = Tensor::new(slot_ids, &device)?;
+
+        for layer_idx in 0..self.key_caches.len() {
+            // Read current values at those slots, negate, and add back to zero them.
+            // This is equivalent to: kv_cache[slot] = 0 for each slot.
+            // We use index_add(idx, -current_values) which sets:
+            //   kv_cache[slot] += (-kv_cache[slot]) = 0
+            //
+            // candle-core does not expose a direct index_set (scatter-assign) on
+            // the Tensor API, so this read-negate-add pattern is the cleanest
+            // available approach without adding a new kernel.
+            let (cur_k, cur_v) = self.gather_slots(layer_idx, slot_ids)?;
+            debug_assert_eq!(cur_k.dim(0).unwrap_or(0), n_slots);
+            let neg_k = cur_k.neg()?;
+            let neg_v = cur_v.neg()?;
+            self.key_caches[layer_idx] = self.key_caches[layer_idx].index_add(&idx_t, &neg_k, 0)?;
+            self.value_caches[layer_idx] =
+                self.value_caches[layer_idx].index_add(&idx_t, &neg_v, 0)?;
+        }
+        Ok(())
+    }
 }

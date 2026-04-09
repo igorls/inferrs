@@ -44,7 +44,9 @@ struct BenchmarkArgs {
     warmup: usize,
 
     /// Approximate number of prompt tokens to generate synthetically.
-    #[arg(long, default_value_t = 128)]
+    /// Default of 512 exercises the sliding-window boundary for Gemma 4
+    /// (sliding_window=512); use 1024+ to test wrap-around behaviour.
+    #[arg(long, default_value_t = 512)]
     prompt_len: usize,
 
     /// Maximum tokens to generate per request.

@@ -2305,6 +2305,40 @@ pub struct Gemma4Model {
     skip_final_softcap: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Standalone mask helper — used by prepare_decoder_attention_mask and tests
+// ---------------------------------------------------------------------------
+
+/// Compute the flat `Vec<f32>` for a sliding-window attention mask of shape
+/// `[tgt_len, kv_len]`.
+///
+/// `kv_len` must already be clamped to `sliding_window` by the caller.
+/// Each entry is `0.0` (visible) or `f32::NEG_INFINITY` (masked) following
+/// the additive-mask convention.
+fn sliding_attention_mask_values(
+    tgt_len: usize,
+    seqlen_offset: usize,
+    sliding_window: usize,
+    kv_len: usize,
+) -> Vec<f32> {
+    let unclamped_kv_len = tgt_len + seqlen_offset;
+    let kv_start_abs = unclamped_kv_len - kv_len; // absolute position of the oldest KV slot
+    (0..tgt_len)
+        .flat_map(|i| {
+            let abs_i = seqlen_offset + i; // absolute position of this query token
+            (0..kv_len).map(move |j| {
+                let abs_j = kv_start_abs + j; // absolute position of this KV slot
+                                              // Mask future tokens and tokens older than the sliding window.
+                if abs_j > abs_i || abs_j + sliding_window < abs_i {
+                    f32::NEG_INFINITY
+                } else {
+                    0.0
+                }
+            })
+        })
+        .collect()
+}
+
 impl Gemma4Model {
     /// Build the model.
     ///
@@ -2592,12 +2626,6 @@ impl Gemma4Model {
             return cached.expand((b_size, 1, tgt_len, kv_len));
         }
 
-        let window = if is_sliding {
-            self.sliding_window
-        } else {
-            usize::MAX
-        };
-
         // Build the mask over the visible KV context.
         //
         // For global layers: kv_len == tgt_len + seqlen_offset, so we first
@@ -2610,24 +2638,8 @@ impl Gemma4Model {
         // [tgt_len, min(tgt_len, kv_len)] window where each query position i
         // can attend to KV positions within the sliding window.
         let mask = if is_sliding {
-            // Number of KV slots from the current prefill chunk that are visible.
-            let mask: Vec<f32> = (0..tgt_len)
-                .flat_map(|i| {
-                    // For each query row, the KV columns run over the last `kv_len`
-                    // positions of the sequence.  Column j in the clamped mask
-                    // corresponds to absolute position (unclamped_kv_len - kv_len + j).
-                    let kv_start_abs = unclamped_kv_len - kv_len; // oldest visible KV position
-                    (0..kv_len).map(move |j| {
-                        let abs_j = kv_start_abs + j; // absolute position of this KV slot
-                        let abs_i = seqlen_offset + i; // absolute position of this query
-                        if abs_j > abs_i || (window != usize::MAX && abs_j + window < abs_i) {
-                            f32::NEG_INFINITY
-                        } else {
-                            0.0
-                        }
-                    })
-                })
-                .collect();
+            let mask =
+                sliding_attention_mask_values(tgt_len, seqlen_offset, self.sliding_window, kv_len);
             Tensor::from_slice(&mask, (tgt_len, kv_len), &self.device)?
         } else {
             // Global (full) attention: standard causal mask + cached-prefix columns.
@@ -3264,5 +3276,199 @@ impl Gemma4Model {
     pub fn hint_sampling_temperature(&mut self, temperature: f64) {
         const SAMPLING_EPS: f64 = 1e-5;
         self.skip_final_softcap = temperature < SAMPLING_EPS;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device, Tensor};
+
+    fn cpu() -> Device {
+        Device::Cpu
+    }
+
+    // Helper: create a RetainingRotatingKvCache and feed `n` tokens of
+    // shape [1, 1, n, 4] through it, returning the cache output shape.
+    fn rotating_cache_output_len(max_seq_len: usize, n_tokens: usize) -> usize {
+        let mut cache = RetainingRotatingKvCache::new(max_seq_len);
+        let k = Tensor::ones((1usize, 1usize, n_tokens, 4usize), DType::F32, &cpu()).unwrap();
+        let v = k.clone();
+        let (k_out, _) = cache.append(&k, &v).unwrap();
+        k_out.dim(2).unwrap()
+    }
+
+    #[test]
+    fn rotating_cache_under_capacity() {
+        // 128 tokens, window = 512 → output has 128 tokens.
+        assert_eq!(rotating_cache_output_len(512, 128), 128);
+    }
+
+    #[test]
+    fn rotating_cache_at_capacity() {
+        // 512 tokens, window = 512 → output has 512 tokens.
+        assert_eq!(rotating_cache_output_len(512, 512), 512);
+    }
+
+    #[test]
+    fn rotating_cache_over_capacity() {
+        // 600 tokens, window = 512 → output capped at 512 (last 512 kept).
+        assert_eq!(rotating_cache_output_len(512, 600), 512);
+    }
+
+    #[test]
+    fn rotating_cache_multi_step_grows_then_caps() {
+        // Simulate prefill of 300 tokens, then decode of 300 more 1-at-a-time.
+        let max_seq_len = 512;
+        let mut cache = RetainingRotatingKvCache::new(max_seq_len);
+        let k_prefill =
+            Tensor::ones((1usize, 1usize, 300usize, 4usize), DType::F32, &cpu()).unwrap();
+        let v_prefill = k_prefill.clone();
+        let (k_out, _) = cache.append(&k_prefill, &v_prefill).unwrap();
+        assert_eq!(k_out.dim(2).unwrap(), 300);
+
+        // Decode tokens 300..600 one at a time.
+        for step in 300..600 {
+            let k_dec = Tensor::ones((1usize, 1usize, 1usize, 4usize), DType::F32, &cpu()).unwrap();
+            let v_dec = k_dec.clone();
+            let (k_out, _) = cache.append(&k_dec, &v_dec).unwrap();
+            let expected = (step + 1).min(max_seq_len);
+            assert_eq!(
+                k_out.dim(2).unwrap(),
+                expected,
+                "step {step}: expected output len {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn rotating_cache_reset_and_reuse() {
+        // Verify reset() zeroes the counters so a fresh prefill works correctly.
+        let max_seq_len = 512;
+        let mut cache = RetainingRotatingKvCache::new(max_seq_len);
+
+        // First sequence: 300 tokens.
+        let k1 = Tensor::ones((1usize, 1usize, 300usize, 4usize), DType::F32, &cpu()).unwrap();
+        cache.append(&k1, &k1).unwrap();
+
+        cache.reset();
+        assert_eq!(cache.current_seq_len, 0);
+        assert_eq!(cache.offset, 0);
+
+        // Second sequence after reset: 128 tokens.
+        let k2 = Tensor::ones((1usize, 1usize, 128usize, 4usize), DType::F32, &cpu()).unwrap();
+        let (k_out, _) = cache.append(&k2, &k2).unwrap();
+        assert_eq!(k_out.dim(2).unwrap(), 128);
+    }
+
+    // ── Mask building tests ────────────────────────────────────────────────
+
+    /// Thin wrapper around the production `sliding_attention_mask_values` that
+    /// computes `kv_len = min(tgt_len + seqlen_offset, sliding_window)` first,
+    /// matching what `prepare_decoder_attention_mask` does before calling it.
+    fn mask_values(tgt_len: usize, seqlen_offset: usize, sliding_window: usize) -> Vec<f32> {
+        let kv_len = (tgt_len + seqlen_offset).min(sliding_window);
+        sliding_attention_mask_values(tgt_len, seqlen_offset, sliding_window, kv_len)
+    }
+
+    #[test]
+    fn sliding_mask_short_prompt_is_causal() {
+        // A 128-token prompt with sliding_window=512 should produce a plain
+        // causal mask (lower-triangular) since no token exceeds the window.
+        let mask = mask_values(128, 0, 512);
+        // Verify the diagonal is visible (0.0) and upper-triangle is -inf.
+        // Row i, col j: visible if j <= i (causal) AND j + window >= i (always true for short seq).
+        for i in 0..128usize {
+            for j in 0..128usize {
+                let val = mask[i * 128 + j];
+                if j > i {
+                    assert_eq!(
+                        val,
+                        f32::NEG_INFINITY,
+                        "row {i} col {j} should be -inf (future)"
+                    );
+                } else {
+                    assert_eq!(val, 0.0, "row {i} col {j} should be 0.0 (visible)");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sliding_mask_decode_step_no_mask() {
+        // During decode (tgt_len=1), the mask is None in the actual code path.
+        // But if we did compute it, it should show all cached tokens visible
+        // within the sliding window.
+        let sliding_window = 512usize;
+        let seqlen_offset = 300usize;
+        let mask = mask_values(1, seqlen_offset, sliding_window);
+        // kv_len = min(301, 512) = 301; all 301 KV positions should be visible
+        // (oldest abs position = 0, newest = 300; all within window of query at 300).
+        assert_eq!(mask.len(), 301);
+        for &v in &mask {
+            assert_eq!(v, 0.0, "all KV positions within window should be visible");
+        }
+    }
+
+    #[test]
+    fn sliding_mask_long_prompt_clamped_kv() {
+        // A 600-token prompt with sliding_window=512.
+        // kv_len is clamped to 512; kv_start_abs = 600 - 512 = 88.
+        // Query token 0 (abs_i=0): all KV positions have abs_j >= 88 > 0, so all -inf.
+        // Query token 88 (abs_i=88): first KV (abs_j=88) is visible (0.0).
+        let sliding_window = 512usize;
+        let mask = mask_values(600, 0, sliding_window);
+        assert_eq!(mask.len(), 600 * 512);
+
+        // Row 0: all -inf (token 0 cannot see tokens 88-599, they're in its future).
+        for j in 0..512usize {
+            assert_eq!(
+                mask[j],
+                f32::NEG_INFINITY,
+                "row 0 col {j}: should be -inf (all KV in future or evicted)"
+            );
+        }
+
+        // Row 88 (abs_i=88): KV col 0 has abs_j=88 == abs_i → visible.
+        let row88_start = 88 * 512;
+        assert_eq!(mask[row88_start], 0.0, "row 88, col 0 should be visible");
+        // KV col 1 has abs_j=89 > abs_i=88 → future.
+        assert_eq!(
+            mask[row88_start + 1],
+            f32::NEG_INFINITY,
+            "row 88, col 1 should be -inf (future)"
+        );
+
+        // Row 599 (abs_i=599): all 512 KV slots should be visible (within window).
+        let row599_start = 599 * 512;
+        for j in 0..512usize {
+            assert_eq!(
+                mask[row599_start + j],
+                0.0,
+                "row 599 col {j} should be visible (all in window)"
+            );
+        }
+    }
+
+    #[test]
+    fn sliding_mask_decode_after_long_prompt() {
+        // After a 600-token prefill, decode step 1: seqlen_offset=600, tgt_len=1.
+        // kv_len = min(601, 512) = 512; kv_start_abs = 601 - 512 = 89.
+        // The single query (abs_i=600) should see all 512 KV slots within window.
+        let sliding_window = 512usize;
+        let mask = mask_values(1, 600, sliding_window);
+        assert_eq!(mask.len(), 512);
+        // abs_j ranges from 89 to 600; abs_i = 600.
+        // All abs_j <= abs_i and abs_j + 512 >= 600 (since abs_j >= 89 → 89+512=601 > 600). ✓
+        for (j, &v) in mask.iter().enumerate() {
+            assert_eq!(
+                v, 0.0,
+                "slot {j} should be visible after long prompt decode"
+            );
+        }
     }
 }

@@ -1234,6 +1234,15 @@ impl Engine {
                         anyhow::bail!("paged attention: out of KV blocks at position {pos}");
                     }
                 }
+                // Zero out the paged KV-store slots for this sequence before the
+                // prefill forward pass.  Physical blocks may have been freed and
+                // reallocated from a previous sequence, and `index_add` in the
+                // paged attention kernel accumulates rather than replaces, so
+                // stale values from the prior occupant must be cleared first.
+                let all_slots: Vec<u32> = (0..prompt_tokens.len())
+                    .filter_map(|pos| bt.slot_for(pos))
+                    .collect();
+                ps.kv_store.zero_slots(&all_slots)?;
                 model.forward_paged(&input_ids, 0, bt, &mut ps.kv_store)
             }
             _ => {
@@ -1265,6 +1274,13 @@ impl Engine {
             (Some(bt), Some(ps)) => {
                 if !bt.ensure_allocated(seqlen_offset, &mut ps.block_pool) {
                     anyhow::bail!("paged attention: out of KV blocks at position {seqlen_offset}");
+                }
+                // Zero out the newly-allocated slot for this decode position before
+                // writing.  Blocks may have been reused from a previous sequence;
+                // the `index_add` in `forward_returning_kv_paged` accumulates values,
+                // so stale data from the prior occupant must be cleared first.
+                if let Some(slot) = bt.slot_for(seqlen_offset) {
+                    ps.kv_store.zero_slots(&[slot])?;
                 }
                 model.forward_paged(&input_ids, seqlen_offset, bt, &mut ps.kv_store)
             }

@@ -375,15 +375,21 @@ impl TurboQuantKvCache {
         // Warmup threshold: keep KV data on-device unquantized until the sequence
         // is long enough for KV bandwidth to dominate over weight bandwidth.
         //
-        // At short contexts, the per-layer CPU↔GPU round-trips (35 pairs per decode
-        // step for Gemma4-E2B) add more latency than they save in KV bandwidth.
-        // The break-even point depends on model size and hardware, but ~256 tokens
-        // is a conservative lower bound before KV bandwidth matters on Metal.
+        // On CUDA (discrete GPU) the KV cache lives in VRAM and every decode step
+        // reads it across PCIe/NVLink.  TurboQuant's 4:1 compression meaningfully
+        // reduces that bandwidth, with the CPU round-trip as a smaller overhead.
+        // Break-even on CUDA is roughly 256–512 tokens.
         //
-        // With this threshold, `--turbo-quant` matches plain-bf16 decode speed
-        // for contexts under 256 tokens, while still providing compression benefits
-        // for long conversations and documents.
-        let warmup_seq_len = 256;
+        // On Metal (Apple Silicon unified memory) the KV cache already lives in
+        // the same fast LPDDR pool that the GPU uses (M4 Max: ~546 GB/s).  There
+        // is no PCIe bottleneck, so TurboQuant's bandwidth saving is negligible
+        // while the per-layer CPU dequantization cost (35 layers × 2 tensors for
+        // Gemma4-E2B) dominates.  The break-even point is well above 4096 tokens
+        // in practice — keep data unquantized (warmup) for all typical contexts.
+        let warmup_seq_len = match &device {
+            candle_core::Device::Metal(_) => 8192,
+            _ => 256,
+        };
 
         Self {
             bits: cfg.bits,
@@ -488,15 +494,22 @@ impl TurboQuantKvCache {
 
         // Check whether we're in the warmup phase for this token.
         let total_buffered = self.warmup_kv_buf_len + self.seq_len;
-        let in_warmup = self.warmup_seq_len > 0 && total_buffered < self.warmup_seq_len;
+        let needed = self.warmup_kv_buf_len + new_seq;
+        // Stay in warmup only if the resulting buffer would still fit within
+        // the warmup budget.  A prefill larger than `warmup_seq_len` must go
+        // directly to the quantized path; allowing it into the warmup path
+        // would cap the buffer at `warmup_seq_len` and cause a `slice_set`
+        // shape-mismatch panic (dst: 256, src: N + 0) for N > warmup_seq_len.
+        let in_warmup = self.warmup_seq_len > 0
+            && total_buffered < self.warmup_seq_len
+            && needed <= self.warmup_seq_len;
 
         if in_warmup {
-            // Warmup path (prefill and decode): write into the pre-allocated
-            // warmup buffer via `slice_set`.  This avoids `Tensor::cat` on
-            // every decode step (128+ allocations per request).
-            let needed = self.warmup_kv_buf_len + new_seq;
+            // Warmup path (decode only once past prefill): write into the
+            // pre-allocated warmup buffer via `slice_set`.  This avoids
+            // `Tensor::cat` on every decode step (128+ allocations per request).
             if needed > self.warmup_kv_buf_cap {
-                // Grow the buffer by doubling.
+                // Grow the buffer by doubling, capped at the warmup threshold.
                 let new_cap = needed
                     .next_power_of_two()
                     .max(MIN_KV_BUFFER_CAP)
@@ -1127,5 +1140,82 @@ mod tests {
                 &format!("decode step={step}"),
             );
         }
+    }
+
+    /// Regression test: a prefill longer than `warmup_seq_len` (256) must not
+    /// panic with "shape mismatch on target dim, dst: 256, src: N + 0".
+    ///
+    /// Previously, `append` would enter the warmup path for a 297-token prefill
+    /// (total_buffered=0 < 256), allocate a buffer capped at 256, then fail
+    /// when trying to `slice_set` 297 tokens into it.
+    #[test]
+    fn prefill_longer_than_warmup_threshold_does_not_crash() {
+        let head_dim = 256usize;
+        let n_kv_heads = 1usize;
+        // warmup_seq_len is hard-coded to 256 inside TurboQuantKvCache::new.
+        // A prefill of 297 tokens must bypass the warmup path entirely.
+        let t_prefill = 297usize;
+
+        let mut cache = make_cache_multihead(head_dim, 8, n_kv_heads);
+        let device = cache.device.clone();
+
+        let data: Vec<f32> = (0..n_kv_heads * t_prefill * head_dim)
+            .map(|i| (i as f32 * 0.01).sin())
+            .collect();
+        let k = Tensor::from_slice(&data, (1, n_kv_heads, t_prefill, head_dim), &device).unwrap();
+
+        // This must not panic or return an error.
+        cache
+            .append(&k, &k)
+            .expect("prefill > warmup_seq_len must not crash");
+
+        // Dequantize should return the full 297-token sequence.
+        let (k_hat, _) = cache.dequantize().expect("dequantize after long prefill");
+        assert_eq!(
+            k_hat.dim(2).unwrap(),
+            t_prefill,
+            "dequantized output should have {t_prefill} tokens"
+        );
+    }
+
+    /// After a prefill of exactly warmup_seq_len tokens the first decode step
+    /// must also work without crashing (the flush path is exercised).
+    #[test]
+    fn prefill_at_warmup_boundary_then_decode() {
+        let head_dim = 128usize;
+        let n_kv_heads = 1usize;
+        let warmup = 256usize; // matches TurboQuantKvCache::new hard-coded value
+        let t_prefill = warmup; // exactly at boundary
+
+        let mut cache = make_cache_multihead(head_dim, 8, n_kv_heads);
+        let device = cache.device.clone();
+
+        let prefill_data: Vec<f32> = (0..n_kv_heads * t_prefill * head_dim)
+            .map(|i| (i as f32 * 0.01).sin())
+            .collect();
+        let k_pre =
+            Tensor::from_slice(&prefill_data, (1, n_kv_heads, t_prefill, head_dim), &device)
+                .unwrap();
+        cache.append(&k_pre, &k_pre).expect("prefill at boundary");
+
+        // One decode step should flush the warmup buffer and quantize.
+        let decode_data: Vec<f32> = (0..n_kv_heads * head_dim)
+            .map(|i| i as f32 * 0.001)
+            .collect();
+        let k_dec =
+            Tensor::from_slice(&decode_data, (1, n_kv_heads, 1, head_dim), &device).unwrap();
+        cache
+            .append(&k_dec, &k_dec)
+            .expect("decode step after prefill at boundary");
+
+        let (k_hat, _) = cache
+            .dequantize()
+            .expect("dequantize after boundary decode");
+        assert_eq!(
+            k_hat.dim(2).unwrap(),
+            t_prefill + 1,
+            "expected {} tokens after boundary+1 decode",
+            t_prefill + 1
+        );
     }
 }
