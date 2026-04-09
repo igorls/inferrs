@@ -106,7 +106,6 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<usize>,
     #[serde(default)]
     pub max_completion_tokens: Option<usize>,
-    #[allow(dead_code)]
     #[serde(default)]
     pub stream: Option<bool>,
     #[serde(default)]
@@ -116,14 +115,29 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub stop: StopSequences,
     /// Tool definitions forwarded by agent runtimes (e.g. OpenClaw).
-    /// Accepted but not used: this backend does not execute tool calls.
+    /// This backend does not execute tool calls, but when tools are provided
+    /// they are serialized as a system-prompt context block so the model still
+    /// receives the function signatures as readable context.
     #[serde(default)]
-    #[allow(dead_code)]
     pub tools: Option<serde_json::Value>,
-    /// Tool-choice directive from agent runtimes.  Accepted but not used.
+    /// Tool-choice directive from agent runtimes.  Accepted and ignored;
+    /// the model generates freely — tool results must be fed back by the caller.
     #[serde(default)]
     #[allow(dead_code)]
     pub tool_choice: Option<serde_json::Value>,
+    /// OpenAI-only `service_tier` field.  Accepted and silently ignored for
+    /// compatibility with clients that always send it.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub service_tier: Option<serde_json::Value>,
+    /// OpenAI Responses API `store` flag.  Accepted and silently ignored.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub store: Option<serde_json::Value>,
+    /// OpenAI reasoning effort hint.  Accepted and silently ignored.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub reasoning_effort: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -383,9 +397,9 @@ pub struct AnthropicErrorDetail {
 pub struct OllamaGenerateRequest {
     pub model: String,
     pub prompt: Option<String>,
-    /// Optional system prompt (accepted but not yet forwarded to the engine).
+    /// Optional system prompt forwarded as a `system` role message before the
+    /// user prompt when chat-template mode is active.
     #[serde(default)]
-    #[allow(dead_code)]
     pub system: Option<String>,
     #[serde(default)]
     pub stream: Option<bool>,
@@ -939,7 +953,31 @@ async fn chat_completions(
             .tokenizer
             .as_deref()
             .ok_or_else(|| server_error("No model loaded"))?;
-        let tokens = match tokenizer.apply_chat_template_and_encode(&req.messages) {
+
+        // When the caller provides tool definitions (e.g. from an OpenClaw agent
+        // runtime), prepend a synthetic system message that describes the available
+        // tools in plain text.  This gives models that do not natively process
+        // OpenAI tool schemas (e.g. Gemma) the information they need to reason
+        // about tool calls, without triggering schema-validation failures inside
+        // the model or the chat template renderer.
+        //
+        // If the message list already begins with a system message the tool
+        // summary is appended to it so the context stays in a single system turn
+        // (avoiding two consecutive system messages which some templates reject).
+        let messages_with_tools: Vec<ChatMessage>;
+        let messages = if let Some(ref tools) = req.tools {
+            tracing::info!(
+                "Request {}: tools provided — injecting as system context for prompt-only rendering",
+                request_id
+            );
+            let tool_summary = format_tools_as_system_context(tools);
+            messages_with_tools = inject_tools_into_messages(&req.messages, &tool_summary);
+            &messages_with_tools[..]
+        } else {
+            &req.messages[..]
+        };
+
+        let tokens = match tokenizer.apply_chat_template_and_encode(messages) {
             Ok(t) => t,
             Err(e) => return Err(tokenization_error(e)),
         };
@@ -1697,6 +1735,100 @@ fn clamp_max_tokens(requested: usize, prompt_len: usize, max_seq_len: usize) -> 
     requested.min(available)
 }
 
+// ─── Tool-injection helpers ─────────────────────────────────────────────────
+
+/// Render tool definitions as a plain-text system-context block.
+///
+/// OpenAI-compatible agent runtimes (e.g. OpenClaw) include tool schemas in
+/// every request so the model knows which functions are callable.  Local
+/// models that don't natively process the `tools` array (e.g. Gemma) will
+/// crash or produce garbled output when the raw JSON schema is forced through
+/// a chat template that has no tool-calling support.
+///
+/// This function converts the tool array into a readable description that can
+/// be prepended to the system prompt, letting the model understand what tools
+/// are available without needing native schema support.
+fn format_tools_as_system_context(tools: &serde_json::Value) -> String {
+    let Some(arr) = tools.as_array() else {
+        return String::new();
+    };
+    if arr.is_empty() {
+        return String::new();
+    }
+
+    let mut lines = Vec::new();
+    lines.push("Available tools:".to_string());
+    for tool in arr {
+        let name = tool
+            .pointer("/function/name")
+            .or_else(|| tool.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unnamed>");
+        let description = tool
+            .pointer("/function/description")
+            .or_else(|| tool.get("description"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if description.is_empty() {
+            lines.push(format!("- {name}"));
+        } else {
+            lines.push(format!("- {name}: {description}"));
+        }
+        // Include parameter names when present so the model can form valid calls.
+        if let Some(props) = tool
+            .pointer("/function/parameters/properties")
+            .and_then(|v| v.as_object())
+        {
+            let param_names: Vec<&str> = props.keys().map(String::as_str).collect();
+            if !param_names.is_empty() {
+                lines.push(format!("  parameters: {}", param_names.join(", ")));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// Prepend tool context to the message list.
+///
+/// If the first message is already a system message, append the tool summary
+/// to it (separated by a blank line) so there is only one system turn.
+/// Otherwise insert a new system message at the front.
+fn inject_tools_into_messages(messages: &[ChatMessage], tool_summary: &str) -> Vec<ChatMessage> {
+    if tool_summary.is_empty() {
+        return messages.to_vec();
+    }
+    let mut out = Vec::with_capacity(messages.len() + 1);
+    if let Some(first) = messages.first() {
+        if matches!(first.role, Role::System) {
+            // Merge into the existing system message.
+            let merged = if first.content.0.is_empty() {
+                tool_summary.to_string()
+            } else {
+                format!("{}\n\n{}", first.content.0, tool_summary)
+            };
+            out.push(ChatMessage {
+                role: Role::System,
+                content: MessageContent::from_string(merged),
+                audio: first.audio.clone(),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+            out.extend_from_slice(&messages[1..]);
+            return out;
+        }
+    }
+    // No existing system message — prepend one.
+    out.push(ChatMessage {
+        role: Role::System,
+        content: MessageContent::from_string(tool_summary),
+        audio: None,
+        tool_calls: None,
+        tool_call_id: None,
+    });
+    out.extend_from_slice(messages);
+    out
+}
+
 // ─── Ollama-compatible handlers ─────────────────────────────────────────────
 
 /// `GET /` and `HEAD /` — Ollama running check.
@@ -1990,13 +2122,26 @@ async fn ollama_generate(
     let prompt_tokens = if is_raw {
         tokenizer.encode(prompt, true)
     } else {
-        let msgs = vec![ChatMessage {
+        // Prepend a system message when the caller provides one.
+        let mut msgs: Vec<ChatMessage> = Vec::with_capacity(2);
+        if let Some(ref sys) = req.system {
+            if !sys.is_empty() {
+                msgs.push(ChatMessage {
+                    role: Role::System,
+                    content: MessageContent::from_string(sys),
+                    audio: None,
+                    tool_calls: None,
+                    tool_call_id: None,
+                });
+            }
+        }
+        msgs.push(ChatMessage {
             role: Role::User,
             content: MessageContent::from_string(prompt),
             audio: None,
             tool_calls: None,
             tool_call_id: None,
-        }];
+        });
         tokenizer.apply_chat_template_and_encode(&msgs)
     }
     .map_err(|e| {
@@ -2240,5 +2385,136 @@ fn ollama_done_reason(reason: &str) -> String {
         "stop" => "stop".to_string(),
         "length" => "length".to_string(),
         other => other.to_string(),
+    }
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── format_tools_as_system_context ───────────────────────────────────────
+
+    #[test]
+    fn format_tools_empty_array_returns_empty() {
+        let tools = serde_json::json!([]);
+        assert!(format_tools_as_system_context(&tools).is_empty());
+    }
+
+    #[test]
+    fn format_tools_not_array_returns_empty() {
+        let tools = serde_json::json!({"type": "function"});
+        assert!(format_tools_as_system_context(&tools).is_empty());
+    }
+
+    #[test]
+    fn format_tools_single_tool_with_description() {
+        let tools = serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Get current weather for a city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "unit": {"type": "string"}
+                        }
+                    }
+                }
+            }
+        ]);
+        let result = format_tools_as_system_context(&tools);
+        assert!(result.contains("Available tools:"));
+        assert!(result.contains("get_weather"));
+        assert!(result.contains("Get current weather for a city"));
+        // Both parameter names must appear — format_tools_as_system_context joins
+        // all parameter names, so a regression that silently drops one would only
+        // be caught by &&, not ||.
+        assert!(result.contains("city") && result.contains("unit"));
+    }
+
+    #[test]
+    fn format_tools_tool_without_description() {
+        let tools = serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "noop",
+                    "parameters": {"type": "object", "properties": {}}
+                }
+            }
+        ]);
+        let result = format_tools_as_system_context(&tools);
+        assert!(result.contains("noop"));
+        // Should not crash with empty description.
+    }
+
+    #[test]
+    fn format_tools_multiple_tools() {
+        let tools = serde_json::json!([
+            {"type": "function", "function": {"name": "tool_a", "description": "Alpha"}},
+            {"type": "function", "function": {"name": "tool_b", "description": "Beta"}}
+        ]);
+        let result = format_tools_as_system_context(&tools);
+        assert!(result.contains("tool_a"));
+        assert!(result.contains("tool_b"));
+        assert!(result.contains("Alpha"));
+        assert!(result.contains("Beta"));
+    }
+
+    // ── inject_tools_into_messages ───────────────────────────────────────────
+
+    fn make_msg(role: Role, content: &str) -> ChatMessage {
+        ChatMessage {
+            role,
+            content: MessageContent::from_string(content),
+            audio: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn inject_tools_empty_summary_returns_clone() {
+        let msgs = vec![make_msg(Role::User, "Hello")];
+        let result = inject_tools_into_messages(&msgs, "");
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].content.0, "Hello");
+    }
+
+    #[test]
+    fn inject_tools_no_existing_system_prepends() {
+        let msgs = vec![make_msg(Role::User, "Hello")];
+        let result = inject_tools_into_messages(&msgs, "Available tools:\n- noop");
+        assert_eq!(result.len(), 2);
+        assert!(matches!(result[0].role, Role::System));
+        assert!(result[0].content.0.contains("Available tools"));
+        assert_eq!(result[1].content.0, "Hello");
+    }
+
+    #[test]
+    fn inject_tools_existing_system_is_merged() {
+        let msgs = vec![
+            make_msg(Role::System, "You are helpful."),
+            make_msg(Role::User, "Hello"),
+        ];
+        let result = inject_tools_into_messages(&msgs, "Available tools:\n- noop");
+        // Should still be two messages — tool summary merged into system.
+        assert_eq!(result.len(), 2);
+        assert!(matches!(result[0].role, Role::System));
+        assert!(result[0].content.0.contains("You are helpful."));
+        assert!(result[0].content.0.contains("Available tools"));
+        assert_eq!(result[1].content.0, "Hello");
+    }
+
+    #[test]
+    fn inject_tools_empty_system_replaced_by_summary() {
+        let msgs = vec![make_msg(Role::System, ""), make_msg(Role::User, "Hi")];
+        let result = inject_tools_into_messages(&msgs, "Available tools:\n- noop");
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].content.0, "Available tools:\n- noop");
     }
 }
