@@ -49,15 +49,27 @@ scoop install inferrs
 inferrs run google/gemma-4-E2B-it
 ```
 
-## Serve
+### Serve
 
-### Serve a specific model (OpenAI/Anthropic/Ollama API on port 8080)
+#### Serve a specific model (OpenAI/Anthropic/Ollama API on port 8080)
 
 ```bash
 inferrs serve google/gemma-4-E2B-it
 ```
 
-### Serve without a model (Ollama-compatible mode on port 11434)
+#### Serve a specific model vLLM-style
+
+```bash
+inferrs serve --paged-attention google/gemma-4-E2B-it
+```
+
+#### Serve a specific model llama.cpp-style
+
+```bash
+inferrs serve --quantize google/gemma-4-E2B-it
+```
+
+#### Serve without a model (Ollama-compatible mode on port 11434)
 
 ```bash
 inferrs serve
