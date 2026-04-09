@@ -28,11 +28,6 @@ pub struct ModelFiles {
 pub fn load_local_model(path: &std::path::Path) -> Result<ModelFiles> {
     tracing::info!("Loading model from local path: {}", path.display());
 
-    // ── CNCF ModelPack bundle detection ─────────────────────────────────
-    if crate::modelpack::is_modelpack_bundle(path) {
-        return crate::modelpack::load_bundle(path);
-    }
-
     let config_path = path.join("config.json");
     anyhow::ensure!(
         config_path.exists(),
@@ -112,19 +107,21 @@ pub fn download_model(
     // This allows `inferrs run gemma3` and `inferrs serve docker.io/org/model`
     // to work seamlessly — reusing DMR's cache or pulling on demand.
     if let crate::pull::RefKind::Oci = crate::pull::classify_reference(model_id) {
-        // 1. Already cached?
-        if let Some(bundle_path) = crate::pull::oci_bundle(model_id) {
-            tracing::info!(
-                "Found OCI model in local store: {} → {}",
-                model_id,
-                bundle_path.display()
-            );
-            return load_local_model(&bundle_path);
-        }
-        // 2. Not cached — pull it from the OCI registry.
-        tracing::info!("OCI model not cached, pulling: {}", model_id);
-        let bundle_path = crate::pull::oci_pull(model_id)?;
-        return load_local_model(&bundle_path);
+        let bundle_path = match crate::pull::oci_bundle(model_id) {
+            Some(p) => {
+                tracing::info!(
+                    "Found OCI model in local store: {} → {}",
+                    model_id,
+                    p.display()
+                );
+                p
+            }
+            None => {
+                tracing::info!("OCI model not cached, pulling: {}", model_id);
+                crate::pull::oci_pull(model_id)?
+            }
+        };
+        return crate::modelpack::load_bundle(&bundle_path);
     }
 
     tracing::info!("Downloading model {} (revision: {})", model_id, revision);

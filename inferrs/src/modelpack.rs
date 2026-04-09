@@ -61,32 +61,6 @@ struct Descriptor {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// Returns `true` when `path` looks like an unpacked CNCF ModelPack bundle,
-/// i.e. it has a `model/` subdirectory and a root `config.json` that contains
-/// ModelPack-specific JSON fields (`descriptor`, `modelfs`).
-pub fn is_modelpack_bundle(path: &Path) -> bool {
-    let model_dir = path.join("model");
-    if !model_dir.is_dir() {
-        return false;
-    }
-    let config_path = path.join("config.json");
-    if !config_path.exists() {
-        return false;
-    }
-    // Quick heuristic: parse the root config.json and look for ModelPack
-    // markers.  We intentionally do NOT use serde here for detection so that
-    // a malformed file doesn't cause a hard error — we simply fall through to
-    // the normal HuggingFace local-model loader.
-    if let Ok(content) = std::fs::read_to_string(&config_path) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-            // ModelPack configs have "descriptor" and/or "modelfs" at top level.
-            // HuggingFace configs have "architectures" and "model_type".
-            return json.get("descriptor").is_some() || json.get("modelfs").is_some();
-        }
-    }
-    false
-}
-
 /// Load model files from an unpacked CNCF ModelPack bundle directory.
 ///
 /// Returns a [`ModelFiles`] ready to be consumed by the engine, with either
