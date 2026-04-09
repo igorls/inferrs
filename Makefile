@@ -29,7 +29,8 @@ HEXAGON_PKG := -p inferrs-backend-hexagon
 # and can be built anywhere (they probe at runtime via dlopen/LoadLibrary).
 NO_GPU_PKGS := -p inferrs -p inferrs-benchmark -p inferrs-multimodal -p inferrs-kernels -p inferrs-backend-vulkan $(HEXAGON_PKG) -p inferrs-backend-openvino $(CUDA_PKG) $(METAL_PKG)
 
-.PHONY: all build release lint test ui
+.PHONY: all build release lint test ui oci-pull
+.PHONY: all build release fmt clippy test ui oci-pull
 
 all: lint test build
 
@@ -38,10 +39,10 @@ all: lint test build
 ui:
 	cargo build -p inferrs
 
-build:
+build: oci-pull
 	cargo build $(NO_GPU_PKGS)
 
-release:
+release: oci-pull-release
 	cargo build --release $(NO_GPU_PKGS)
 
 lint:
@@ -50,3 +51,10 @@ lint:
 
 test:
 	cargo test $(NO_GPU_PKGS)
+
+# Go helper binary for OCI registry pulls (shared with Docker Model Runner).
+oci-pull:
+	cd oci-pull && go build -o ../target/debug/inferrs-oci-pull .
+
+oci-pull-release:
+	cd oci-pull && go build -trimpath -ldflags='-s -w' -o ../target/release/inferrs-oci-pull .

@@ -105,6 +105,22 @@ pub fn download_model(
         return load_local_model(as_path);
     }
 
+    // ── OCI store lookup ────────────────────────────────────────────────
+    // Before hitting the network, check if the model is already available
+    // in the Docker Model Runner OCI store (~/.docker/models).  This
+    // allows `inferrs serve gemma3` to reuse models pulled by DMR (or
+    // by `inferrs pull`) without re-downloading.
+    if let crate::pull::RefKind::Oci = crate::pull::classify_reference(model_id) {
+        if let Some(bundle_path) = crate::pull::oci_bundle(model_id) {
+            tracing::info!(
+                "Found OCI model in local store: {} → {}",
+                model_id,
+                bundle_path.display()
+            );
+            return load_local_model(&bundle_path);
+        }
+    }
+
     tracing::info!("Downloading model {} (revision: {})", model_id, revision);
 
     let api = Api::new().context("Failed to create HuggingFace API client")?;
