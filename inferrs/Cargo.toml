@@ -80,9 +80,9 @@ candle-core = { workspace = true, features = ["cuda"] }
 candle-nn = { workspace = true, features = ["cuda"] }
 candle-transformers = { workspace = true, features = ["cuda"] }
 
-# Android aarch64: dynamic backend loading for CANN (Huawei Ascend NPU).
-# No CUDA feature — CUDA is not available on Android.  The CANN plugin is
-# probed at runtime via libloading; libascendcl.so is dlopen'd on demand.
+# Android aarch64: dynamic backend loading for CANN and Hexagon.
+# No CUDA feature — CUDA is not available on Android.  Both plugins are
+# probed at runtime via libloading.
 [target.'cfg(target_os = "android")'.dependencies]
 libloading = "0.8"
 
@@ -90,6 +90,16 @@ libloading = "0.8"
 # memory query in engine.rs (aclrtGetMemInfo via RTLD_NOLOAD).
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
 libc = "0.2"
+
+# Windows aarch64 (Snapdragon X / 8cx): no CUDA, but Hexagon probing via
+# the plugin system needs libloading.
+[target.'cfg(all(target_os = "windows", target_arch = "aarch64"))'.dependencies]
+libloading = "0.8"
+
+# macOS: Metal is linked directly, but libloading is still needed for the
+# macOS plugin extension point to compile cleanly.
+[target.'cfg(target_os = "macos")'.dependencies.libloading]
+version = "0.8"
 
 [dev-dependencies]
 ureq = { version = "2", features = ["json"] }

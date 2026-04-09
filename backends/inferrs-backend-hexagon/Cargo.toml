@@ -1,0 +1,23 @@
+[package]
+name = "inferrs-backend-hexagon"
+version = "0.1.0"
+edition = "2021"
+description = "Qualcomm Hexagon HTP backend plugin for inferrs (probe via FastRPC/libcdsprpc)"
+license = "Apache-2.0"
+
+[lib]
+name = "inferrs_backend_hexagon"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Use libc for low-level dlopen on Linux/Android/macOS without linking libcdsprpc.
+# On Windows the winapi crate provides LoadLibraryW / GetProcAddress / FreeLibrary.
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Services",
+    "Win32_System_Registry",
+] }
