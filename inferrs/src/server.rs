@@ -2688,6 +2688,7 @@ fn secs_to_ymd_hms(mut secs: u64) -> (u64, u64, u64, u64, u64, u64) {
 }
 
 /// Extract sampling params from optional [`OllamaOptions`].
+#[allow(clippy::type_complexity)]
 fn ollama_options_to_params(
     opts: Option<&OllamaOptions>,
     defaults: &SamplingParams,
@@ -2707,8 +2708,24 @@ fn ollama_options_to_params(
         .and_then(|o| o.num_predict)
         .unwrap_or(defaults.max_tokens);
     let stop = opts.and_then(|o| o.stop.clone()).unwrap_or_default();
-    // TODO(phase-3): wire seed / min_p / presence_penalty / frequency_penalty
-    // into the sampler (requires RNG refactor + new penalty stages).
+
+    // Warn when the client sends sampling params that the engine doesn't
+    // support yet, so callers know they have no effect.
+    if let Some(o) = opts {
+        if o.seed.is_some() {
+            tracing::warn!("option 'seed' is not yet supported and will be ignored");
+        }
+        if o.min_p.is_some() {
+            tracing::warn!("option 'min_p' is not yet supported and will be ignored");
+        }
+        if o.presence_penalty.is_some() {
+            tracing::warn!("option 'presence_penalty' is not yet supported and will be ignored");
+        }
+        if o.frequency_penalty.is_some() {
+            tracing::warn!("option 'frequency_penalty' is not yet supported and will be ignored");
+        }
+    }
+
     (
         temperature,
         top_p,
@@ -3034,33 +3051,40 @@ async fn ollama_generate(
 
     let is_stream = req.stream.unwrap_or(true); // Ollama streams by default
 
-    // Determine if thinking mode is active
+    let think_id = tokenizer
+        .token_to_id("<|think|>")
+        .or_else(|| tokenizer.token_to_id("<think>"))
+        .or_else(|| {
+            tokenizer
+                .id_to_token(98)
+                .filter(|t| t.contains("think"))
+                .map(|_| 98u32)
+        });
+
+    // For raw completions (/api/generate), defaulting to think=true and appending <|think|>
+    // can break unstructured prompts. Only enable if explicitly requested.
     let think_enabled = req.think.unwrap_or(false);
 
-    // When thinking is enabled, append the thinking token to prompt.
     let mut prompt_tokens = prompt_tokens;
     if think_enabled {
-        let think_id = tokenizer
-            .token_to_id("<|think|>")
-            .or_else(|| tokenizer.token_to_id("<think>"))
-            .or_else(|| {
-                tokenizer
-                    .id_to_token(98)
-                    .filter(|t| t.contains("think"))
-                    .map(|_| 98u32)
-            });
         if let Some(id) = think_id {
             prompt_tokens.push(id);
         }
     }
 
     if is_stream {
+        let prompt_eval_count = prompt_tokens.len();
         let token_rx =
             ollama_dispatch_stream(&lm.backend, &request_id, prompt_tokens, params).await?;
 
         let model_name = req.model.clone();
-        let stream =
-            make_ollama_generate_stream(token_rx, model_name, created_at, think_enabled);
+        let stream = make_ollama_generate_stream(
+            token_rx,
+            model_name,
+            created_at,
+            think_enabled,
+            prompt_eval_count,
+        );
         Ok((
             [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
             axum::body::Body::from_stream(stream),
@@ -3107,6 +3131,7 @@ fn make_ollama_generate_stream(
     model_name: String,
     created_at: String,
     think_enabled: bool,
+    prompt_eval_count: usize,
 ) -> impl Stream<Item = Result<axum::body::Bytes, Infallible>> {
     async_stream::stream! {
         let mut eval_count: usize = 0;
@@ -3149,7 +3174,7 @@ fn make_ollama_generate_stream(
                     response: content_text,
                     done: true,
                     done_reason: token.finish_reason.as_deref().map(ollama_done_reason),
-                    prompt_eval_count: None,
+                    prompt_eval_count: Some(prompt_eval_count),
                     eval_count: Some(eval_count),
                     thinking,
                     total_duration: token.total_duration_ns,
@@ -3246,41 +3271,45 @@ async fn ollama_chat(
     );
     params.extra_stop_token_ids = resolve_stop_token_ids(stop, tokenizer);
 
-    // Determine if thinking mode is active: explicit think=true from request
-    let think_enabled = req.think.unwrap_or(false);
+    let think_id = tokenizer
+        .token_to_id("<|think|>")
+        .or_else(|| tokenizer.token_to_id("<think>"))
+        .or_else(|| {
+            // Fallback: check well-known ID 98 (Gemma4 <|think|>).
+            // Some tokenizers don't expose added tokens via token_to_id.
+            tokenizer
+                .id_to_token(98)
+                .filter(|t| t.contains("think"))
+                .map(|_| 98u32)
+        });
 
-    // When thinking is enabled, append the <|think|> token to the prompt so the
-    // model enters thinking mode — matching Ollama's behavior where the think
-    // token is injected at the start of the assistant turn.
+    let think_enabled = req.think.unwrap_or(think_id.is_some());
+
     let mut prompt_tokens = prompt_tokens;
     if think_enabled {
-        let think_id = tokenizer
-            .token_to_id("<|think|>")
-            .or_else(|| tokenizer.token_to_id("<think>"))
-            .or_else(|| {
-                // Fallback: check well-known ID 98 (Gemma4 <|think|>).
-                // Some tokenizers don't expose added tokens via token_to_id.
-                tokenizer
-                    .id_to_token(98)
-                    .filter(|t| t.contains("think"))
-                    .map(|_| 98u32)
-            });
         if let Some(id) = think_id {
             prompt_tokens.push(id);
-            tracing::info!("Think mode: injected token ID {} into prompt", id);
+            tracing::debug!("Think mode: injected token ID {} into prompt", id);
         } else {
-            tracing::warn!("Think mode requested but no thinking token found in vocabulary");
+            tracing::debug!("Think mode requested but no thinking token found in vocabulary");
         }
     }
 
     let is_stream = req.stream.unwrap_or(true); // Ollama streams by default
 
     if is_stream {
+        let prompt_eval_count = prompt_tokens.len();
         let token_rx =
             ollama_dispatch_stream(&lm.backend, &request_id, prompt_tokens, params).await?;
 
         let model_name = req.model.clone();
-        let stream = make_ollama_chat_stream(token_rx, model_name, created_at, think_enabled);
+        let stream = make_ollama_chat_stream(
+            token_rx,
+            model_name,
+            created_at,
+            think_enabled,
+            prompt_eval_count,
+        );
         Ok((
             [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
             axum::body::Body::from_stream(stream),
@@ -3328,6 +3357,7 @@ fn make_ollama_chat_stream(
     model_name: String,
     created_at: String,
     think_enabled: bool,
+    prompt_eval_count: usize,
 ) -> impl Stream<Item = Result<axum::body::Bytes, Infallible>> {
     async_stream::stream! {
         let mut eval_count: usize = 0;
@@ -3369,7 +3399,7 @@ fn make_ollama_chat_stream(
                     },
                     done: true,
                     done_reason: token.finish_reason.as_deref().map(ollama_done_reason),
-                    prompt_eval_count: None,
+                    prompt_eval_count: Some(prompt_eval_count),
                     eval_count: Some(eval_count),
                     total_duration: token.total_duration_ns,
                     load_duration: token.total_duration_ns.map(|_| 0u128),

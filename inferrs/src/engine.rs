@@ -366,7 +366,7 @@ impl ThinkFilter {
             for known_id in [98u32] {
                 if let Some(text) = tokenizer.id_to_token(known_id) {
                     if text.contains("think") {
-                        tracing::info!(
+                        tracing::debug!(
                             "ThinkFilter: found thinking token via fallback: '{}' = ID {}",
                             text,
                             known_id,
@@ -383,13 +383,13 @@ impl ThinkFilter {
         close_ids.dedup();
 
         if !open_ids.is_empty() {
-            tracing::info!(
+            tracing::debug!(
                 "ThinkFilter enabled: open_ids={:?} close_ids={:?}",
                 open_ids,
                 close_ids
             );
         } else {
-            tracing::info!("ThinkFilter: no thinking tokens found, filter disabled");
+            tracing::debug!("ThinkFilter: no thinking tokens found, filter disabled");
         }
         Self {
             think_token_ids: open_ids, // reused as open_ids
@@ -669,18 +669,24 @@ impl ActiveSequence {
         let output_text = if self.content_tokens.is_empty() {
             if self.reasoning_tokens.is_empty() {
                 // No classification happened (e.g. no thinking model) — decode all.
-                tokenizer.decode(&self.output_tokens, true).unwrap_or_default()
+                tokenizer
+                    .decode(&self.output_tokens, true)
+                    .unwrap_or_default()
             } else {
                 // All output was reasoning tokens (model never closed the thinking block).
                 String::new()
             }
         } else {
-            tokenizer.decode(&self.content_tokens, true).unwrap_or_default()
+            tokenizer
+                .decode(&self.content_tokens, true)
+                .unwrap_or_default()
         };
         let reasoning_content = if self.reasoning_tokens.is_empty() {
             String::new()
         } else {
-            tokenizer.decode(&self.reasoning_tokens, true).unwrap_or_default()
+            tokenizer
+                .decode(&self.reasoning_tokens, true)
+                .unwrap_or_default()
         };
         self.sink.send_result(GenerationResult {
             output_token_ids: self.output_tokens.clone(),
