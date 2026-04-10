@@ -415,6 +415,10 @@ pub struct OllamaGenerateRequest {
     pub raw: Option<bool>,
     #[serde(default)]
     pub options: Option<OllamaOptions>,
+    /// When `true`, enable thinking/reasoning mode. The model's internal
+    /// chain-of-thought will be returned in the `thinking` field.
+    #[serde(default)]
+    pub think: Option<bool>,
 }
 
 /// Ollama `POST /api/chat` request.
@@ -426,6 +430,10 @@ pub struct OllamaChatRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub options: Option<OllamaOptions>,
+    /// When `true`, enable thinking/reasoning mode. The model's internal
+    /// chain-of-thought will be returned in the `thinking` field.
+    #[serde(default)]
+    pub think: Option<bool>,
 }
 
 /// A single message in an Ollama chat request.
@@ -433,6 +441,9 @@ pub struct OllamaChatRequest {
 pub struct OllamaChatMessage {
     pub role: String,
     pub content: String,
+    /// Text from inside `<think>…</think>` tags when thinking is enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
 }
 
 /// Sampling options passed inside an Ollama request.
@@ -463,6 +474,13 @@ pub struct OllamaOptions {
     pub turbo_quant: Option<String>,
     /// GGUF quantization format, e.g. "Q4K"
     pub quantize: Option<String>,
+
+    // ── Extended sampling fields (not yet wired to sampler) ──────────────────
+    pub seed: Option<i64>,
+    pub min_p: Option<f64>,
+    pub stop: Option<Vec<String>>,
+    pub presence_penalty: Option<f64>,
+    pub frequency_penalty: Option<f64>,
 }
 
 /// Non-streaming `POST /api/generate` response.
@@ -476,6 +494,16 @@ pub struct OllamaGenerateResponse {
     pub done_reason: Option<String>,
     pub prompt_eval_count: usize,
     pub eval_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    /// Wall time from request start to done, in nanoseconds.
+    pub total_duration: u128,
+    /// Time to load / prepare the model (always 0 for pre-loaded models).
+    pub load_duration: u128,
+    /// Prompt prefill time in nanoseconds.
+    pub prompt_eval_duration: u128,
+    /// Decode time for output tokens, in nanoseconds.
+    pub eval_duration: u128,
 }
 
 /// Streaming chunk for `POST /api/generate`.
@@ -491,6 +519,17 @@ pub struct OllamaGenerateChunk {
     pub prompt_eval_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eval_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+    // Duration fields — only populated on the final (done=true) chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_duration: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_duration: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_eval_duration: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eval_duration: Option<u128>,
 }
 
 /// Non-streaming `POST /api/chat` response.
@@ -504,6 +543,10 @@ pub struct OllamaChatResponse {
     pub done_reason: Option<String>,
     pub prompt_eval_count: usize,
     pub eval_count: usize,
+    pub total_duration: u128,
+    pub load_duration: u128,
+    pub prompt_eval_duration: u128,
+    pub eval_duration: u128,
 }
 
 /// Streaming chunk for `POST /api/chat`.
@@ -519,6 +562,15 @@ pub struct OllamaChatChunk {
     pub prompt_eval_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub eval_count: Option<usize>,
+    // Duration fields — only populated on the final (done=true) chunk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_duration: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_duration: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_eval_duration: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eval_duration: Option<u128>,
 }
 
 /// `GET /api/tags` response.
@@ -2639,7 +2691,14 @@ fn secs_to_ymd_hms(mut secs: u64) -> (u64, u64, u64, u64, u64, u64) {
 fn ollama_options_to_params(
     opts: Option<&OllamaOptions>,
     defaults: &SamplingParams,
-) -> (Option<f64>, Option<f64>, Option<usize>, Option<f64>, usize) {
+) -> (
+    Option<f64>,
+    Option<f64>,
+    Option<usize>,
+    Option<f64>,
+    usize,
+    Vec<String>,
+) {
     let temperature = opts.and_then(|o| o.temperature);
     let top_p = opts.and_then(|o| o.top_p);
     let top_k = opts.and_then(|o| o.top_k);
@@ -2647,7 +2706,17 @@ fn ollama_options_to_params(
     let num_predict = opts
         .and_then(|o| o.num_predict)
         .unwrap_or(defaults.max_tokens);
-    (temperature, top_p, top_k, repetition_penalty, num_predict)
+    let stop = opts.and_then(|o| o.stop.clone()).unwrap_or_default();
+    // TODO(phase-3): wire seed / min_p / presence_penalty / frequency_penalty
+    // into the sampler (requires RNG refactor + new penalty stages).
+    (
+        temperature,
+        top_p,
+        top_k,
+        repetition_penalty,
+        num_predict,
+        stop,
+    )
 }
 
 /// Shared Ollama model/tokenizer validation.  Returns the tokenizer when the
@@ -2950,10 +3019,10 @@ async fn ollama_generate(
 
     ollama_check_prompt(&prompt_tokens, max_seq_len)?;
 
-    let (temperature, top_p, top_k, repetition_penalty, max_tokens) =
+    let (temperature, top_p, top_k, repetition_penalty, max_tokens, stop) =
         ollama_options_to_params(req.options.as_ref(), &state.default_params);
     let max_tokens = clamp_max_tokens(max_tokens, prompt_tokens.len(), max_seq_len);
-    let params = build_sampling_params(
+    let mut params = build_sampling_params(
         temperature,
         top_p,
         top_k,
@@ -2961,15 +3030,20 @@ async fn ollama_generate(
         max_tokens,
         &state.default_params,
     );
+    params.extra_stop_token_ids = resolve_stop_token_ids(stop, tokenizer);
 
     let is_stream = req.stream.unwrap_or(true); // Ollama streams by default
+
+    // Determine if thinking mode is active
+    let think_enabled = req.think.unwrap_or(false);
 
     if is_stream {
         let token_rx =
             ollama_dispatch_stream(&lm.backend, &request_id, prompt_tokens, params).await?;
 
         let model_name = req.model.clone();
-        let stream = make_ollama_generate_stream(token_rx, model_name, created_at);
+        let stream =
+            make_ollama_generate_stream(token_rx, model_name, created_at, think_enabled);
         Ok((
             [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
             axum::body::Body::from_stream(stream),
@@ -2979,14 +3053,33 @@ async fn ollama_generate(
         let result =
             ollama_dispatch_blocking(&lm.backend, request_id, prompt_tokens, params).await?;
 
+        // The engine's ThinkFilter has already separated reasoning and content
+        // at the token level.  Surface reasoning only when the client opted in.
+        let (thinking, content) = if think_enabled && !result.reasoning_content.is_empty() {
+            (Some(result.reasoning_content), result.output_text)
+        } else if !result.reasoning_content.is_empty() {
+            // Client didn't opt in — fold reasoning back into content.
+            (
+                None,
+                format!("{}{}", result.reasoning_content, result.output_text),
+            )
+        } else {
+            (None, result.output_text)
+        };
+
         Ok(Json(OllamaGenerateResponse {
             model: req.model,
             created_at,
-            response: result.output_text,
+            response: content,
             done: true,
             done_reason: Some(ollama_done_reason(&result.finish_reason)),
             prompt_eval_count: result.prompt_tokens,
             eval_count: result.completion_tokens,
+            thinking,
+            total_duration: result.total_duration_ns,
+            load_duration: 0,
+            prompt_eval_duration: result.prompt_eval_duration_ns,
+            eval_duration: result.eval_duration_ns,
         })
         .into_response())
     }
@@ -2996,37 +3089,71 @@ fn make_ollama_generate_stream(
     mut token_rx: mpsc::Receiver<StreamToken>,
     model_name: String,
     created_at: String,
+    think_enabled: bool,
 ) -> impl Stream<Item = Result<axum::body::Bytes, Infallible>> {
     async_stream::stream! {
         let mut eval_count: usize = 0;
+
         while let Some(token) = token_rx.recv().await {
             let is_final = token.finish_reason.is_some();
-            let text = if token.finish_reason.as_deref() == Some("stop") {
+            let content_text = if token.finish_reason.as_deref() == Some("stop") {
                 String::new()
             } else {
                 eval_count += 1;
                 token.text
             };
 
+            // The engine's ThinkFilter has already split content and reasoning
+            // for us at the token level (see engine.rs ThinkFilter + TokenKind).
+            // When the client opted into thinking mode, surface the reasoning
+            // chunk on Ollama's `thinking` field; otherwise fold it back into
+            // the main content so nothing is silently dropped.
+            let (thinking, content_text) = if think_enabled {
+                let thinking = if token.reasoning_content.is_empty() {
+                    None
+                } else {
+                    Some(token.reasoning_content.clone())
+                };
+                (thinking, content_text)
+            } else if !token.reasoning_content.is_empty() {
+                (None, format!("{}{}", token.reasoning_content, content_text))
+            } else {
+                (None, content_text)
+            };
+
             let chunk = if is_final {
+                // On the final chunk, Ollama always includes all four duration
+                // fields — keep `load_duration` pinned at 0 whenever any of the
+                // other timings are available.
+                let load_duration = token.total_duration_ns.map(|_| 0u128);
                 OllamaGenerateChunk {
                     model: model_name.clone(),
                     created_at: created_at.clone(),
-                    response: text,
+                    response: content_text,
                     done: true,
                     done_reason: token.finish_reason.as_deref().map(ollama_done_reason),
                     prompt_eval_count: None,
                     eval_count: Some(eval_count),
+                    thinking,
+                    total_duration: token.total_duration_ns,
+                    load_duration,
+                    prompt_eval_duration: token.prompt_eval_duration_ns,
+                    eval_duration: token.eval_duration_ns,
                 }
             } else {
                 OllamaGenerateChunk {
                     model: model_name.clone(),
                     created_at: created_at.clone(),
-                    response: text,
+                    response: content_text,
                     done: false,
                     done_reason: None,
                     prompt_eval_count: None,
                     eval_count: None,
+                    thinking,
+                    total_duration: None,
+                    load_duration: None,
+                    prompt_eval_duration: None,
+                    eval_duration: None,
                 }
             };
 
@@ -3089,10 +3216,10 @@ async fn ollama_chat(
 
     ollama_check_prompt(&prompt_tokens, max_seq_len)?;
 
-    let (temperature, top_p, top_k, repetition_penalty, max_tokens) =
+    let (temperature, top_p, top_k, repetition_penalty, max_tokens, stop) =
         ollama_options_to_params(req.options.as_ref(), &state.default_params);
     let max_tokens = clamp_max_tokens(max_tokens, prompt_tokens.len(), max_seq_len);
-    let params = build_sampling_params(
+    let mut params = build_sampling_params(
         temperature,
         top_p,
         top_k,
@@ -3100,6 +3227,10 @@ async fn ollama_chat(
         max_tokens,
         &state.default_params,
     );
+    params.extra_stop_token_ids = resolve_stop_token_ids(stop, tokenizer);
+
+    // Determine if thinking mode is active: explicit think=true from request
+    let think_enabled = req.think.unwrap_or(false);
 
     let is_stream = req.stream.unwrap_or(true); // Ollama streams by default
 
@@ -3108,7 +3239,7 @@ async fn ollama_chat(
             ollama_dispatch_stream(&lm.backend, &request_id, prompt_tokens, params).await?;
 
         let model_name = req.model.clone();
-        let stream = make_ollama_chat_stream(token_rx, model_name, created_at);
+        let stream = make_ollama_chat_stream(token_rx, model_name, created_at, think_enabled);
         Ok((
             [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
             axum::body::Body::from_stream(stream),
@@ -3118,17 +3249,34 @@ async fn ollama_chat(
         let result =
             ollama_dispatch_blocking(&lm.backend, request_id, prompt_tokens, params).await?;
 
+        // The engine's ThinkFilter has already separated reasoning and content.
+        let (thinking, content) = if think_enabled && !result.reasoning_content.is_empty() {
+            (Some(result.reasoning_content), result.output_text)
+        } else if !result.reasoning_content.is_empty() {
+            (
+                None,
+                format!("{}{}", result.reasoning_content, result.output_text),
+            )
+        } else {
+            (None, result.output_text)
+        };
+
         Ok(Json(OllamaChatResponse {
             model: req.model,
             created_at,
             message: OllamaChatMessage {
                 role: "assistant".to_string(),
-                content: result.output_text,
+                content,
+                thinking,
             },
             done: true,
             done_reason: Some(ollama_done_reason(&result.finish_reason)),
             prompt_eval_count: result.prompt_tokens,
             eval_count: result.completion_tokens,
+            total_duration: result.total_duration_ns,
+            load_duration: 0,
+            prompt_eval_duration: result.prompt_eval_duration_ns,
+            eval_duration: result.eval_duration_ns,
         })
         .into_response())
     }
@@ -3138,16 +3286,35 @@ fn make_ollama_chat_stream(
     mut token_rx: mpsc::Receiver<StreamToken>,
     model_name: String,
     created_at: String,
+    think_enabled: bool,
 ) -> impl Stream<Item = Result<axum::body::Bytes, Infallible>> {
     async_stream::stream! {
         let mut eval_count: usize = 0;
+
         while let Some(token) = token_rx.recv().await {
             let is_final = token.finish_reason.is_some();
-            let text = if token.finish_reason.as_deref() == Some("stop") {
+            let content_text = if token.finish_reason.as_deref() == Some("stop") {
                 String::new()
             } else {
                 eval_count += 1;
                 token.text
+            };
+
+            // The engine's ThinkFilter has already split content and reasoning
+            // at the token level.  Surface reasoning on Ollama's `thinking`
+            // field only when the client opted in; otherwise fold it back into
+            // content so nothing is silently dropped.
+            let (thinking, content_text) = if think_enabled {
+                let thinking = if token.reasoning_content.is_empty() {
+                    None
+                } else {
+                    Some(token.reasoning_content.clone())
+                };
+                (thinking, content_text)
+            } else if !token.reasoning_content.is_empty() {
+                (None, format!("{}{}", token.reasoning_content, content_text))
+            } else {
+                (None, content_text)
             };
 
             let chunk = if is_final {
@@ -3156,12 +3323,17 @@ fn make_ollama_chat_stream(
                     created_at: created_at.clone(),
                     message: OllamaChatMessage {
                         role: "assistant".to_string(),
-                        content: text,
+                        content: content_text,
+                        thinking,
                     },
                     done: true,
                     done_reason: token.finish_reason.as_deref().map(ollama_done_reason),
                     prompt_eval_count: None,
                     eval_count: Some(eval_count),
+                    total_duration: token.total_duration_ns,
+                    load_duration: token.total_duration_ns.map(|_| 0u128),
+                    prompt_eval_duration: token.prompt_eval_duration_ns,
+                    eval_duration: token.eval_duration_ns,
                 }
             } else {
                 OllamaChatChunk {
@@ -3169,12 +3341,17 @@ fn make_ollama_chat_stream(
                     created_at: created_at.clone(),
                     message: OllamaChatMessage {
                         role: "assistant".to_string(),
-                        content: text,
+                        content: content_text,
+                        thinking,
                     },
                     done: false,
                     done_reason: None,
                     prompt_eval_count: None,
                     eval_count: None,
+                    total_duration: None,
+                    load_duration: None,
+                    prompt_eval_duration: None,
+                    eval_duration: None,
                 }
             };
 
