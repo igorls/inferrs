@@ -356,16 +356,40 @@ impl ThinkFilter {
                 close_ids.push(id);
             }
         }
+
+        // Fallback: some tokenizers (e.g. Gemma4 GGUF-loaded) don't expose
+        // added tokens via `token_to_id`.  Try looking up the token string
+        // from the vocab by ID for known positions.
+        if open_ids.is_empty() {
+            // Try well-known IDs for common thinking model families.
+            // Gemma4: <|think|> = 98
+            for known_id in [98u32] {
+                if let Some(text) = tokenizer.id_to_token(known_id) {
+                    if text.contains("think") {
+                        tracing::info!(
+                            "ThinkFilter: found thinking token via fallback: '{}' = ID {}",
+                            text,
+                            known_id,
+                        );
+                        open_ids.push(known_id);
+                        close_ids.push(known_id); // toggle style
+                    }
+                }
+            }
+        }
+
         // Deduplicate
         open_ids.dedup();
         close_ids.dedup();
 
         if !open_ids.is_empty() {
-            tracing::debug!(
-                "ThinkFilter: open_ids={:?} close_ids={:?}",
+            tracing::info!(
+                "ThinkFilter enabled: open_ids={:?} close_ids={:?}",
                 open_ids,
                 close_ids
             );
+        } else {
+            tracing::info!("ThinkFilter: no thinking tokens found, filter disabled");
         }
         Self {
             think_token_ids: open_ids, // reused as open_ids
@@ -391,6 +415,17 @@ impl ThinkFilter {
         } else {
             TokenKind::Content
         }
+    }
+
+    /// Check if a token ID is a thinking-block opening delimiter.
+    pub fn is_open_delimiter(&self, token_id: u32) -> bool {
+        self.think_token_ids.contains(&token_id)
+    }
+
+    /// Pre-set the thinking state (e.g. when the prompt already ends with
+    /// a `<|think|>` token, the model starts "inside" the thinking block).
+    pub fn set_in_think(&mut self, value: bool) {
+        self.in_think = value;
     }
 }
 
@@ -632,8 +667,13 @@ impl ActiveSequence {
         // path gets the same structured separation that streaming gets via
         // the per-token ThinkFilter classification.
         let output_text = if self.content_tokens.is_empty() {
-            // No classification happened (e.g. no thinking model) — decode all.
-            tokenizer.decode(&self.output_tokens, true).unwrap_or_default()
+            if self.reasoning_tokens.is_empty() {
+                // No classification happened (e.g. no thinking model) — decode all.
+                tokenizer.decode(&self.output_tokens, true).unwrap_or_default()
+            } else {
+                // All output was reasoning tokens (model never closed the thinking block).
+                String::new()
+            }
         } else {
             tokenizer.decode(&self.content_tokens, true).unwrap_or_default()
         };
@@ -1304,6 +1344,15 @@ impl Engine {
                     Ok(req) => {
                         let mut seq = ActiveSequence::from_engine_request(req, block_size);
                         seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
+                        // If the prompt ends with a thinking delimiter (e.g. the
+                        // server injected <|think|> for think=true), the model
+                        // is already "inside" thinking and the first output token
+                        // will be reasoning content, not a delimiter.
+                        if let Some(&last) = seq.prompt_tokens.last() {
+                            if seq.think_filter.is_open_delimiter(last) {
+                                seq.think_filter.set_in_think(true);
+                            }
+                        }
                         tracing::debug!(
                             "Accepted request {} ({} prompt tokens, batch_size={})",
                             seq.request_id,
@@ -1322,6 +1371,11 @@ impl Engine {
                     Some(req) => {
                         let mut seq = ActiveSequence::from_engine_request(req, block_size);
                         seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
+                        if let Some(&last) = seq.prompt_tokens.last() {
+                            if seq.think_filter.is_open_delimiter(last) {
+                                seq.think_filter.set_in_think(true);
+                            }
+                        }
                         tracing::debug!(
                             "Accepted request {} ({} prompt tokens)",
                             seq.request_id,

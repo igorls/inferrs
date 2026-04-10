@@ -377,6 +377,11 @@ impl Tokenizer {
         self.inner.token_to_id(token)
     }
 
+    /// Look up a token ID and return its string representation.
+    pub fn id_to_token(&self, id: u32) -> Option<String> {
+        self.inner.id_to_token(id)
+    }
+
     /// Encode text to token IDs.
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
         let encoding = self

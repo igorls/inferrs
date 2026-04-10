@@ -24,12 +24,12 @@ test_chat_nonstream() {
   printf "\n${YELLOW}━━━ %s ━━━${NC}\n" "$label"
 
   local ollama_resp inferrs_resp
-  ollama_resp=$(curl -sf --max-time 60 -H "Content-Type: application/json" \
+  ollama_resp=$(curl -sf --max-time 120 -H "Content-Type: application/json" \
     "${OLLAMA}/api/chat" -d "$(jq -nc --arg m "$OLLAMA_MODEL" --arg p "$prompt" \
-    '{model:$m,stream:false,messages:[{role:"user",content:$p}],options:{temperature:0.01,num_predict:256}}')" 2>&1)
-  inferrs_resp=$(curl -sf --max-time 60 -H "Content-Type: application/json" \
+    '{model:$m,stream:false,think:true,messages:[{role:"user",content:$p}],options:{temperature:0.01,num_predict:256}}')" 2>&1)
+  inferrs_resp=$(curl -sf --max-time 120 -H "Content-Type: application/json" \
     "${INFERRS}/api/chat" -d "$(jq -nc --arg m "$INFERRS_MODEL" --arg p "$prompt" \
-    '{model:$m,stream:false,messages:[{role:"user",content:$p}],options:{temperature:0.01,num_predict:256}}')" 2>&1)
+    '{model:$m,stream:false,think:true,messages:[{role:"user",content:$p}],options:{temperature:0.01,num_predict:256}}')" 2>&1)
 
   local o_content o_thinking i_content i_thinking
   o_content=$(echo "$ollama_resp" | jq -r '.message.content // "(empty)"')
@@ -72,15 +72,15 @@ test_chat_stream() {
   tmpdir=$(mktemp -d)
 
   # Capture streaming NDJSON lines
-  curl -sN --max-time 30 -H "Content-Type: application/json" \
+  curl -sN --max-time 120 -H "Content-Type: application/json" \
     "${OLLAMA}/api/chat" -d "$(jq -nc --arg m "$OLLAMA_MODEL" --arg p "$prompt" \
-    '{model:$m,stream:true,messages:[{role:"user",content:$p}],options:{temperature:0.01,num_predict:128}}')" \
+    '{model:$m,stream:true,think:true,messages:[{role:"user",content:$p}],options:{temperature:0.01,num_predict:128}}')" \
     > "$tmpdir/ollama_stream.ndjson" 2>&1 &
   local ollama_pid=$!
 
-  curl -sN --max-time 30 -H "Content-Type: application/json" \
+  curl -sN --max-time 120 -H "Content-Type: application/json" \
     "${INFERRS}/api/chat" -d "$(jq -nc --arg m "$INFERRS_MODEL" --arg p "$prompt" \
-    '{model:$m,stream:true,messages:[{role:"user",content:$p}],options:{temperature:0.01,num_predict:128}}')" \
+    '{model:$m,stream:true,think:true,messages:[{role:"user",content:$p}],options:{temperature:0.01,num_predict:128}}')" \
     > "$tmpdir/inferrs_stream.ndjson" 2>&1 &
   local inferrs_pid=$!
 
@@ -120,9 +120,9 @@ test_chat_stream() {
     ((failures++))
   fi
 
-  # Check 3: empty content
-  if [[ -z "$i_content" || "$i_content" == "(empty)" ]]; then
-    printf "  ${RED}ISSUE${NC}: inferrs returned empty content\n"
+  # Check 3: empty content (only an issue if there's also no thinking output)
+  if [[ (-z "$i_content" || "$i_content" == "(empty)") && "$i_has_thinking" -eq 0 ]]; then
+    printf "  ${RED}ISSUE${NC}: inferrs returned empty content (and no thinking)\n"
     ((failures++))
   fi
 

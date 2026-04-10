@@ -3037,6 +3037,23 @@ async fn ollama_generate(
     // Determine if thinking mode is active
     let think_enabled = req.think.unwrap_or(false);
 
+    // When thinking is enabled, append the thinking token to prompt.
+    let mut prompt_tokens = prompt_tokens;
+    if think_enabled {
+        let think_id = tokenizer
+            .token_to_id("<|think|>")
+            .or_else(|| tokenizer.token_to_id("<think>"))
+            .or_else(|| {
+                tokenizer
+                    .id_to_token(98)
+                    .filter(|t| t.contains("think"))
+                    .map(|_| 98u32)
+            });
+        if let Some(id) = think_id {
+            prompt_tokens.push(id);
+        }
+    }
+
     if is_stream {
         let token_rx =
             ollama_dispatch_stream(&lm.backend, &request_id, prompt_tokens, params).await?;
@@ -3231,6 +3248,30 @@ async fn ollama_chat(
 
     // Determine if thinking mode is active: explicit think=true from request
     let think_enabled = req.think.unwrap_or(false);
+
+    // When thinking is enabled, append the <|think|> token to the prompt so the
+    // model enters thinking mode — matching Ollama's behavior where the think
+    // token is injected at the start of the assistant turn.
+    let mut prompt_tokens = prompt_tokens;
+    if think_enabled {
+        let think_id = tokenizer
+            .token_to_id("<|think|>")
+            .or_else(|| tokenizer.token_to_id("<think>"))
+            .or_else(|| {
+                // Fallback: check well-known ID 98 (Gemma4 <|think|>).
+                // Some tokenizers don't expose added tokens via token_to_id.
+                tokenizer
+                    .id_to_token(98)
+                    .filter(|t| t.contains("think"))
+                    .map(|_| 98u32)
+            });
+        if let Some(id) = think_id {
+            prompt_tokens.push(id);
+            tracing::info!("Think mode: injected token ID {} into prompt", id);
+        } else {
+            tracing::warn!("Think mode requested but no thinking token found in vocabulary");
+        }
+    }
 
     let is_stream = req.stream.unwrap_or(true); // Ollama streams by default
 
