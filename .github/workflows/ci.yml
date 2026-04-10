@@ -96,9 +96,6 @@ jobs:
           sudo ln -sfn /usr/local/cuda/lib64/stubs/libcuda.so \
                        /usr/local/cuda/lib64/stubs/libcuda.so.1
           echo "LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
-          # candle-kernels/build.rs emits `cargo:rustc-link-lib=dylib=cudart`.
-          # The linker needs to find libcudart.so which lives in lib64 (not stubs).
-          echo "LIBRARY_PATH=/usr/local/cuda/lib64:${LIBRARY_PATH}" >> "$GITHUB_ENV"
 
       # Install CUDA toolkit and set up MSVC environment on Windows x86_64.
       # Jimver/cuda-toolkit installs nvcc and adds it to PATH; ilammy/msvc-dev-cmd
@@ -114,16 +111,6 @@ jobs:
       - name: Set up MSVC environment (Windows x86_64 — nvcc needs cl.exe)
         if: matrix.target == 'x86_64-pc-windows-msvc'
         uses: ilammy/msvc-dev-cmd@v1
-
-      # candle-kernels/build.rs emits `cargo:rustc-link-lib=dylib=cudart`.
-      # The MSVC linker resolves .lib files via the LIB env var; expose the
-      # CUDA lib/x64 directory so cudart.lib can be found at link time.
-      - name: Add CUDA lib to MSVC linker search path (Windows x86_64)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
-        run: |
-          $cudaLib = "$env:CUDA_PATH\lib\x64"
-          echo "LIB=$cudaLib;$env:LIB" >> $env:GITHUB_ENV
 
       # Git ships its own link.exe in usr/bin which shadows MSVC's link.exe
       # when bash shells are used. Rename it so the MSVC linker is found first.
