@@ -45,18 +45,18 @@ fn grad_clip(xs: &Tensor, clip: f32) -> Result<Tensor> {
 /// Applies QAT clipping bounds (input_min/max, output_min/max) from the checkpoint.
 /// The model was trained with quantization-aware training and stores per-layer
 /// saturation bounds that must be applied at inference time to match the reference.
-struct ClipLinear {
+pub(crate) struct ClipLinear {
     inner: Linear,
     /// Clamp input to [input_min, input_max] before the linear (if stored).
-    input_min: Option<f32>,
-    input_max: Option<f32>,
+    pub(crate) input_min: Option<f32>,
+    pub(crate) input_max: Option<f32>,
     /// Clamp output to [output_min, output_max] after the linear (if stored).
-    output_min: Option<f32>,
-    output_max: Option<f32>,
+    pub(crate) output_min: Option<f32>,
+    pub(crate) output_max: Option<f32>,
 }
 
 impl ClipLinear {
-    fn load(vb: VarBuilder, in_dim: usize, out_dim: usize) -> Result<Self> {
+    pub(crate) fn load(vb: VarBuilder, in_dim: usize, out_dim: usize) -> Result<Self> {
         let inner = linear_no_bias(in_dim, out_dim, vb.pp("linear"))?;
         // Load optional QAT clipping bounds.  These are 0-dim scalar tensors (shape []).
         // If absent (e.g. non-QAT checkpoint) the clamping step is skipped.
@@ -78,7 +78,7 @@ impl ClipLinear {
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
+    pub(crate) fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         // Pre-linear input clamp
         let xs = match (self.input_min, self.input_max) {
             (Some(lo), Some(hi)) => xs.clamp(lo as f64, hi as f64)?,

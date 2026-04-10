@@ -8,6 +8,7 @@ pub mod audio_encoder;
 pub mod gemma4;
 pub mod qwen3;
 pub mod qwen3_5;
+pub mod vision_encoder;
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Tensor};
@@ -85,6 +86,36 @@ pub trait CausalLM: Send {
     /// `embeds`:    `[N, lm_hidden_size]` — output of `encode_audio`
     /// `positions`: indices in the upcoming `input_ids` that hold audio soft tokens
     fn set_pending_audio(&mut self, _embeds: Tensor, _positions: Vec<usize>) {}
+
+    // ── Vision ───────────────────────────────────────────────────────────────
+
+    /// Returns `true` if this model has a vision encoder.
+    #[allow(dead_code)]
+    fn has_vision_tower(&self) -> bool {
+        false
+    }
+
+    /// Encode pre-patchified pixel values to LM-space embeddings.
+    ///
+    /// `pixel_values`:  `[N_patches, patch_pixels]` f32 in [0, 1].
+    /// `position_ids`:  `[N_patches, 2]`           i64 (x, y) coordinates.
+    /// `n_soft_tokens`: requested output soft-token count.
+    ///
+    /// Returns `[n_soft_tokens, lm_hidden_size]`.
+    fn encode_image(
+        &mut self,
+        _pixel_values: &Tensor,
+        _position_ids: &Tensor,
+        _n_soft_tokens: usize,
+    ) -> Result<Tensor> {
+        anyhow::bail!("this model does not have a vision encoder")
+    }
+
+    /// Store image embeddings to be injected during the next `forward()` call.
+    ///
+    /// `embeds`:    `[N_soft, lm_hidden_size]` — output of `encode_image`
+    /// `positions`: indices in `input_ids` that hold image soft tokens
+    fn set_pending_image(&mut self, _embeds: Tensor, _positions: Vec<usize>) {}
 
     /// Populate the paged KV store from the model's internal KV cache after a
     /// non-paged prefill.
@@ -175,12 +206,15 @@ impl CausalLM for Qwen3ModelWrapper {
     }
 }
 
-/// A Gemma4 model wrapper (with optional audio encoder).
+/// A Gemma4 model wrapper (with optional audio and vision encoders).
 struct Gemma4ModelWrapper {
     inner: gemma4::Gemma4Model,
     audio_encoder: Option<crate::models::audio_encoder::AudioEncoder>,
     /// Pending audio: embeddings + positions of audio soft tokens in input_ids.
     pending_audio: Option<(Tensor, Vec<usize>)>,
+    vision_encoder: Option<crate::models::vision_encoder::VisionEncoder>,
+    /// Pending image: embeddings + positions of image soft tokens in input_ids.
+    pending_image: Option<(Tensor, Vec<usize>)>,
 }
 
 impl CausalLM for Gemma4ModelWrapper {
@@ -189,6 +223,10 @@ impl CausalLM for Gemma4ModelWrapper {
             Ok(self
                 .inner
                 .forward_with_audio(input_ids, seqlen_offset, audio_embeds, positions)?)
+        } else if let Some((image_embeds, positions)) = self.pending_image.take() {
+            Ok(self
+                .inner
+                .forward_with_image(input_ids, seqlen_offset, image_embeds, positions)?)
         } else {
             Ok(self.inner.forward(input_ids, seqlen_offset)?)
         }
@@ -212,6 +250,15 @@ impl CausalLM for Gemma4ModelWrapper {
                 block_table,
                 kv_store,
                 audio_embeds,
+                positions,
+            )?)
+        } else if let Some((image_embeds, positions)) = self.pending_image.take() {
+            Ok(self.inner.forward_paged_with_image(
+                input_ids,
+                seqlen_offset,
+                block_table,
+                kv_store,
+                image_embeds,
                 positions,
             )?)
         } else {
@@ -247,6 +294,27 @@ impl CausalLM for Gemma4ModelWrapper {
 
     fn set_pending_audio(&mut self, embeds: Tensor, positions: Vec<usize>) {
         self.pending_audio = Some((embeds, positions));
+    }
+
+    fn has_vision_tower(&self) -> bool {
+        self.vision_encoder.is_some()
+    }
+
+    fn encode_image(
+        &mut self,
+        pixel_values: &Tensor,
+        position_ids: &Tensor,
+        n_soft_tokens: usize,
+    ) -> Result<Tensor> {
+        let enc = self
+            .vision_encoder
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Gemma4 model was loaded without a vision tower"))?;
+        enc.encode(pixel_values, position_ids, Some(n_soft_tokens))
+    }
+
+    fn set_pending_image(&mut self, embeds: Tensor, positions: Vec<usize>) {
+        self.pending_image = Some((embeds, positions));
     }
 
     fn populate_paged_from_cache(
@@ -451,7 +519,7 @@ pub fn load_model(
     // TurboQuant is on by default; warn if this architecture doesn't support it.
     if turbo_quant_bits.is_some() {
         match arch {
-            ModelArchitecture::Qwen3 | ModelArchitecture::Gemma4 | ModelArchitecture::Qwen35 => {} // supported
+            ModelArchitecture::Qwen3 | ModelArchitecture::Gemma4 => {} // supported
             other => {
                 tracing::warn!(
                     "--turbo-quant is not supported for {:?} and will be ignored. \
@@ -518,7 +586,7 @@ pub fn load_model(
             })
         }
         ModelArchitecture::Qwen35 => {
-            let config = raw_config.to_qwen35_config(dtype, device.clone(), turbo_quant_bits);
+            let config = raw_config.to_qwen35_config(dtype, device.clone());
             tracing::info!(
                 "Qwen3.5 config: {} layers, {} attn heads, {} hidden, {} kv_heads",
                 config.num_hidden_layers,
@@ -564,10 +632,35 @@ pub fn load_model(
                 None
             };
 
+            // Load vision encoder if vision_config is present in the model config.
+            let vision_encoder = if let Some(vision_cfg) = &raw_config.vision_config {
+                tracing::info!(
+                    "Gemma4 vision encoder: {} layers, hidden={}, patch_size={}, output_length={}",
+                    vision_cfg.num_hidden_layers,
+                    vision_cfg.hidden_size,
+                    vision_cfg.patch_size,
+                    vision_cfg.default_output_length,
+                );
+                let enc = vision_encoder::VisionEncoder::load(
+                    vb.pp("model"),
+                    vision_cfg,
+                    config.hidden_size,
+                    device,
+                    dtype,
+                )
+                .context("Failed to load Gemma4 vision encoder")?;
+                tracing::info!("Vision encoder loaded successfully");
+                Some(enc)
+            } else {
+                None
+            };
+
             Box::new(Gemma4ModelWrapper {
                 inner,
                 audio_encoder,
                 pending_audio: None,
+                vision_encoder,
+                pending_image: None,
             })
         }
     };

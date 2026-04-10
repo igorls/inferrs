@@ -15,7 +15,7 @@ use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm,
 
 use crate::kv_cache::{BlockTable, PagedKvStore};
 use crate::models::attention_utils::{
-    append_kv_tq, apply_rms_norm_heads, apply_rope, causal_mask, compute_logits,
+    apply_rms_norm_heads, apply_rope, causal_mask, compute_logits, concat_kv_cache,
     paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx, PagedPassCache,
 };
 use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
@@ -134,15 +134,31 @@ impl Attention {
         let q = apply_rope(&q, &cos_slice, &sin_slice)?;
         let k = apply_rope(&k, &cos_slice, &sin_slice)?;
 
-        // Append to KV cache (with optional TurboQuant compression).
-        let (k, v) = append_kv_tq(
-            k,
-            v,
-            seqlen_offset,
-            t,
-            &mut self.kv_cache,
-            &mut self.tq_cache,
-        )?;
+        // Append to KV cache.
+        //
+        // During prefill (seqlen_offset == 0, t > 1) bypass TurboQuant entirely:
+        // use the plain concat cache to avoid the extra contiguous() + slice_set
+        // overhead per layer (35 × 2 GPU copies vs 0 for the plain path).
+        // On the first decode step (seqlen_offset == prompt_len, t == 1), adopt
+        // the plain cache tensors directly into TQ's warmup buffer (zero-copy)
+        // so that subsequent decode steps benefit from KV compression.
+        let (k, v) = if seqlen_offset == 0 && t > 1 {
+            // Prefill: always use plain concat, even when TQ is enabled.
+            concat_kv_cache(k, v, &mut self.kv_cache)?
+        } else if let Some(tq) = &mut self.tq_cache {
+            // First decode step: adopt the plain cache into TQ's warmup buffer.
+            // Zero-copy: TQ takes ownership of the prefill tensors without any
+            // GPU allocation or data movement.
+            if tq.is_empty() {
+                if let Some((k_cache, v_cache)) = self.kv_cache.take() {
+                    tq.adopt_warmup_buffer(k_cache, v_cache)?;
+                }
+            }
+            tq.append(&k, &v)?;
+            tq.dequantize()?
+        } else {
+            concat_kv_cache(k, v, &mut self.kv_cache)?
+        };
 
         let kv_len = k.dim(2)?;
 

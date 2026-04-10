@@ -434,3 +434,97 @@ fn gemma4_e2b_paged_long_context_and_second_request() {
         std::panic::resume_unwind(e);
     }
 }
+
+/// Verifies that `inferrs run google/gemma-4-E2B-it --quantize --image <path>`
+/// processes an image without error and returns an intelligible response.
+///
+/// Downloads a public-domain cat JPEG via `curl`, then runs `inferrs run` in
+/// non-interactive mode and checks that:
+///   1. The process exits cleanly (no panic / error path hit).
+///   2. Standard output contains at least one alphabetic character.
+///
+/// Run with:
+/// ```
+/// cargo test --test server_integration gemma4_e2b_run_image -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires model download, network access, and significant compute; run with --ignored"]
+fn gemma4_e2b_run_image() {
+    let model_id = "google/gemma-4-E2B-it";
+    let bin = env!("CARGO_BIN_EXE_inferrs");
+
+    // Full-size public-domain cat photo (~2.8 MB).  The 320 px thumbnails are
+    // served as HTML error pages without the right request headers; the original
+    // file is always available unconditionally.
+    let img_url = "https://upload.wikimedia.org/wikipedia/commons/4/4d/Cat_November_2010-1a.jpg";
+
+    let tmp_dir = std::env::temp_dir();
+    let img_path = tmp_dir.join("inferrs_test_image.jpg");
+
+    // --fail makes curl exit non-zero on HTTP errors instead of silently
+    // saving the error page as the output file.
+    let dl_status = std::process::Command::new("curl")
+        .args([
+            "--silent",
+            "--location",
+            "--fail",
+            "--output",
+            img_path.to_str().expect("non-UTF8 temp path"),
+            img_url,
+        ])
+        .status()
+        .expect("failed to run curl — is it installed?");
+    assert!(
+        dl_status.success(),
+        "curl failed to download test image from {img_url}"
+    );
+    assert!(
+        img_path.exists() && img_path.metadata().map(|m| m.len()).unwrap_or(0) > 10_000,
+        "downloaded image file is empty or too small (likely an error page): {}",
+        img_path.display()
+    );
+
+    // Run `inferrs run` in non-interactive mode.
+    // Flags must come before the positional <MODEL> [PROMPT] arguments.
+    let output = std::process::Command::new(bin)
+        .args([
+            "run",
+            "--quantize",
+            "--device",
+            "auto",
+            "--dtype",
+            "bf16",
+            "--max-tokens",
+            "32",
+            "--temperature=0.0",
+            "--image",
+            img_path.to_str().expect("non-UTF8 temp path"),
+            model_id,
+            "What animal is in this image? Answer in one word.",
+        ])
+        .output()
+        .expect("failed to spawn inferrs run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    eprintln!("inferrs run stdout: {stdout:?}");
+    eprintln!(
+        "inferrs run stderr (tail): {:?}",
+        &stderr[stderr.len().saturating_sub(500)..]
+    );
+
+    assert!(
+        output.status.success(),
+        "inferrs run exited with non-zero status: {}\nstderr: {}",
+        output.status,
+        stderr
+    );
+
+    assert!(
+        looks_intelligible(&stdout),
+        "inferrs run --image response is not intelligible (no ASCII alphabetic chars).\nGot: {stdout:?}"
+    );
+
+    eprintln!("gemma4 run --image response: {stdout:?}");
+}

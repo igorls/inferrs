@@ -39,6 +39,7 @@ cuda = [
     "cudarc",
     "dep:candle-kernels",
     "candle-ug?/cuda",
+    "float8/cuda",
 ]
 cudnn = [
     "cuda",
@@ -174,7 +175,7 @@ optional = true
 default-features = false
 
 [dependencies.float8]
-version = "0.7.0"
+version = "0.6.0"
 features = [
     "num-traits",
     "rand_distr",

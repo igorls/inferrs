@@ -13,10 +13,14 @@ use crossterm::{
 use std::io::{self, Write};
 use std::sync::mpsc as stdmpsc;
 
-use crate::engine::{load_engine, AudioEmbedContext, StreamToken, SyncEngineRequest};
+use crate::engine::{
+    load_engine, AudioEmbedContext, ImageEmbedContext, StreamToken, SyncEngineRequest,
+};
 use crate::sampler::SamplingParams;
+use crate::server::patchify_image_bytes;
 use crate::tokenizer::{
-    apply_gemma4_with_audio, AudioInput, ChatMessage, MessageContent, Role, Tokenizer,
+    apply_gemma4_with_audio, apply_gemma4_with_images, AudioInput, ChatMessage, ImageInput,
+    MessageContent, Role, Tokenizer,
 };
 use crate::ServeArgs;
 
@@ -58,6 +62,11 @@ pub struct RunArgs {
     #[arg(long, default_value_t = 2048)]
     pub max_tokens: usize,
 
+    /// Repetition penalty (1.0 = disabled, >1.0 discourages repeated tokens).
+    /// Defaults to 1.1 to prevent the model from getting stuck in repetition loops.
+    #[arg(long, default_value_t = 1.1)]
+    pub repetition_penalty: f64,
+
     /// System prompt
     #[arg(long)]
     pub system: Option<String>,
@@ -95,9 +104,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub audio: Option<std::path::PathBuf>,
 
-    /// Maximum sequence length (0 = model default)
-    #[arg(long, default_value_t = 0)]
-    pub max_seq_len: usize,
+    /// Path to an image file to attach to the prompt (Gemma 4 vision models).
+    /// Accepts JPEG, PNG, GIF, WebP, and other formats supported by the `image` crate.
+    #[arg(long)]
+    pub image: Option<std::path::PathBuf>,
 }
 
 impl RunArgs {
@@ -106,7 +116,7 @@ impl RunArgs {
             model: Some(self.model.clone()),
             revision: self.revision.clone(),
             dtype: self.dtype.clone(),
-            max_seq_len: self.max_seq_len,
+            max_seq_len: 0,
             device: self.device.clone(),
             host: "0.0.0.0".to_string(),
             port: Some(8080),
@@ -154,6 +164,18 @@ fn run_blocking(args: RunArgs) -> Result<()> {
 
     // Extract fields needed before ctx is partially moved.
     let audio_token_id = ctx.raw_config.audio_token_id;
+    let image_token_id = ctx.raw_config.image_token_id;
+    let vision_patch_size = ctx.raw_config.vision_config.as_ref().map(|v| v.patch_size);
+    let vision_pooling_kernel = ctx
+        .raw_config
+        .vision_config
+        .as_ref()
+        .map(|v| v.pooling_kernel_size);
+    let vision_output_length = ctx
+        .raw_config
+        .vision_config
+        .as_ref()
+        .map(|v| v.default_output_length);
     let max_seq_len = ctx.max_seq_len;
 
     // REPL needs its own tokenizer for chat-template encoding.
@@ -174,6 +196,7 @@ fn run_blocking(args: RunArgs) -> Result<()> {
         temperature: args.temperature,
         top_p: args.top_p,
         top_k: args.top_k,
+        repetition_penalty: args.repetition_penalty,
         max_tokens: args
             .max_tokens
             .min(max_seq_len.saturating_sub(4096).max(256)),
@@ -195,7 +218,7 @@ fn run_blocking(args: RunArgs) -> Result<()> {
     // Non-interactive: single prompt then exit
     if let Some(prompt) = args.prompt {
         // Build audio context if --audio was given.
-        let audio_ctx = if let Some(audio_path) = &args.audio {
+        if let Some(audio_path) = &args.audio {
             let token_id = audio_token_id.ok_or_else(|| {
                 anyhow::anyhow!("This model does not support audio (no audio_token_id in config)")
             })?;
@@ -223,16 +246,75 @@ fn run_blocking(args: RunArgs) -> Result<()> {
             });
             let prompt_str = apply_gemma4_with_audio(&messages, &[n_audio_tokens]);
             let prompt_tokens = tokenizer.encode(&prompt_str, false)?;
-            let ctx = AudioEmbedContext {
+            let audio_ctx = AudioEmbedContext {
                 mel: mel_tensor,
                 audio_token_id: token_id,
             };
-            stream_response_collect(&engine_tx, prompt_tokens, Some(ctx), &sampling_params)?;
+            stream_response_collect(
+                &engine_tx,
+                prompt_tokens,
+                Some(audio_ctx),
+                None,
+                &sampling_params,
+            )?;
             println!();
             return Ok(());
-        } else {
-            None
-        };
+        }
+
+        // Build image context if --image was given.
+        if let Some(image_path) = &args.image {
+            let token_id = image_token_id.ok_or_else(|| {
+                anyhow::anyhow!("This model does not support vision (no image_token_id in config)")
+            })?;
+            let patch_size = vision_patch_size.unwrap_or(16);
+            let pooling_kernel = vision_pooling_kernel.unwrap_or(3);
+            let output_length = vision_output_length.unwrap_or(280);
+
+            let raw_bytes = std::fs::read(image_path)?;
+            let (pixel_values, position_ids, n_patches, n_soft_tokens) =
+                patchify_image_bytes(&raw_bytes, patch_size, pooling_kernel, output_length)?;
+
+            let pixel_tensor = candle_core::Tensor::from_vec(
+                pixel_values,
+                (n_patches, patch_size * patch_size * 3),
+                &candle_core::Device::Cpu,
+            )?;
+            let pos_tensor = candle_core::Tensor::from_vec(
+                position_ids,
+                (n_patches, 2),
+                &candle_core::Device::Cpu,
+            )?;
+
+            messages.push(ChatMessage {
+                role: Role::User,
+                audio: None,
+                content: MessageContent {
+                    text: prompt.clone(),
+                    // A single placeholder entry signals to apply_gemma4_with_images
+                    // that this message carries one image.
+                    images: vec![ImageInput { url: String::new() }],
+                },
+                tool_calls: None,
+                tool_call_id: None,
+            });
+            let prompt_str = apply_gemma4_with_images(&messages, &[n_soft_tokens]);
+            let prompt_tokens = tokenizer.encode(&prompt_str, false)?;
+            let image_ctx = ImageEmbedContext {
+                pixel_values: pixel_tensor,
+                position_ids: pos_tensor,
+                n_soft_tokens,
+                image_token_id: token_id,
+            };
+            stream_response_collect(
+                &engine_tx,
+                prompt_tokens,
+                None,
+                Some(image_ctx),
+                &sampling_params,
+            )?;
+            println!();
+            return Ok(());
+        }
 
         messages.push(ChatMessage {
             role: Role::User,
@@ -242,7 +324,7 @@ fn run_blocking(args: RunArgs) -> Result<()> {
             tool_call_id: None,
         });
         let prompt_tokens = tokenizer.apply_chat_template_and_encode(&messages)?;
-        stream_response_collect(&engine_tx, prompt_tokens, audio_ctx, &sampling_params)?;
+        stream_response_collect(&engine_tx, prompt_tokens, None, None, &sampling_params)?;
         println!();
         return Ok(());
     }
@@ -365,15 +447,20 @@ fn repl(
         };
 
         // Stream the response and collect the full text for history
-        let assistant_text =
-            match stream_response_collect(&engine_tx, prompt_tokens, None, &sampling_params) {
-                Ok(t) => t,
-                Err(e) => {
-                    eprintln!("Generation error: {e}");
-                    messages.pop();
-                    continue;
-                }
-            };
+        let assistant_text = match stream_response_collect(
+            &engine_tx,
+            prompt_tokens,
+            None,
+            None,
+            &sampling_params,
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Generation error: {e}");
+                messages.pop();
+                continue;
+            }
+        };
 
         println!();
 
@@ -469,6 +556,7 @@ fn stream_response_collect(
     engine_tx: &stdmpsc::SyncSender<SyncEngineRequest>,
     prompt_tokens: Vec<u32>,
     audio: Option<AudioEmbedContext>,
+    image: Option<ImageEmbedContext>,
     sampling_params: &SamplingParams,
 ) -> Result<String> {
     let (token_tx, token_rx) = stdmpsc::sync_channel::<StreamToken>(256);
@@ -478,6 +566,7 @@ fn stream_response_collect(
         request_id,
         prompt_tokens,
         audio,
+        image,
         sampling_params: sampling_params.clone(),
         token_tx,
     })?;

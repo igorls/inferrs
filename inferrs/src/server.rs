@@ -21,11 +21,13 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tower_http::cors::CorsLayer;
 
 use crate::engine::{
-    load_engine, AudioEmbedContext, EngineRequest, GenerationResult, OutputBuffer, StreamToken,
+    load_engine, AudioEmbedContext, EngineRequest, GenerationResult, ImageEmbedContext,
+    OutputBuffer, StreamToken,
 };
 use crate::sampler::SamplingParams;
 use crate::tokenizer::{
-    apply_gemma4_with_audio, AudioInput, ChatMessage, MessageContent, Role, Tokenizer,
+    apply_gemma4_with_audio, apply_gemma4_with_images, AudioInput, ChatMessage, ImageInput,
+    MessageContent, Role, Tokenizer,
 };
 use crate::ServeArgs;
 
@@ -712,6 +714,7 @@ fn anthropic_messages_to_chat(
 
 // ─── Server state ───────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 struct AppState {
     /// The model ID as known to the server.  `None` when running in
     /// Ollama-compatible mode with no model pre-loaded.
@@ -728,9 +731,31 @@ struct AppState {
     stream_registry: StreamRegistry,
     /// Token ID for `<|audio|>` soft tokens, present when model supports audio.
     audio_token_id: Option<u32>,
+    /// Token ID for `<|image|>` soft tokens, present when model supports vision.
+    image_token_id: Option<u32>,
+    /// Token ID for `<|image>` (begin-of-image).
+    boi_token_id: Option<u32>,
+    /// Token ID for `<image|>` (end-of-image).
+    eoi_token_id: Option<u32>,
+    /// Vision config: patch_size and pooling_kernel_size, when available.
+    vision_patch_size: Option<usize>,
+    vision_pooling_kernel: Option<usize>,
+    vision_default_output_length: Option<usize>,
 }
 
 fn audio_error(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(ErrorResponse {
+            error: ErrorDetail {
+                message: message.into(),
+                r#type: "invalid_request_error".to_string(),
+            },
+        }),
+    )
+}
+
+fn image_error(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::BAD_REQUEST,
         Json(ErrorResponse {
@@ -752,59 +777,94 @@ const DEFAULT_PORT_OLLAMA: u16 = 11434;
 pub async fn run(args: ServeArgs) -> Result<()> {
     // When a model is specified, load it; otherwise run in Ollama-compatible
     // mode where each request carries its own `model` field.
-    let (model_id, tokenizer, max_seq_len, audio_token_id, engine_tx, output_buf, stream_registry) =
-        if let Some(ref model) = args.model {
-            // ── Model-loaded path ─────────────────────────────────────────────
-            let ctx = load_engine(&args)?;
+    let (
+        model_id,
+        tokenizer,
+        max_seq_len,
+        audio_token_id,
+        image_token_id,
+        boi_token_id,
+        eoi_token_id,
+        vision_patch_size,
+        vision_pooling_kernel,
+        vision_default_output_length,
+        engine_tx,
+        output_buf,
+        stream_registry,
+    ) = if let Some(ref model) = args.model {
+        // ── Model-loaded path ─────────────────────────────────────────────
+        let ctx = load_engine(&args)?;
 
-            let tok = Arc::new(Tokenizer::from_file_with_arch(
-                &ctx.model_files.tokenizer_path,
-                ctx.model_files.tokenizer_config_path.as_deref(),
-                Some(&ctx.arch),
-            )?);
+        let tok = Arc::new(Tokenizer::from_file_with_arch(
+            &ctx.model_files.tokenizer_path,
+            ctx.model_files.tokenizer_config_path.as_deref(),
+            Some(&ctx.arch),
+        )?);
 
-            let max_seq_len = ctx.max_seq_len;
-            let audio_token_id = ctx.raw_config.audio_token_id;
+        let max_seq_len = ctx.max_seq_len;
+        let audio_token_id = ctx.raw_config.audio_token_id;
+        let image_token_id = ctx.raw_config.image_token_id;
+        let boi_token_id = ctx.raw_config.boi_token_id;
+        let eoi_token_id = ctx.raw_config.eoi_token_id;
+        let (vision_patch_size, vision_pooling_kernel, vision_default_output_length) =
+            if let Some(vc) = &ctx.raw_config.vision_config {
+                (
+                    Some(vc.patch_size),
+                    Some(vc.pooling_kernel_size),
+                    Some(vc.default_output_length),
+                )
+            } else {
+                (None, None, None)
+            };
 
-            let output_buf = OutputBuffer::new();
-            let stream_registry: StreamRegistry = Arc::new(Mutex::new(HashMap::new()));
-            spawn_drain_task(output_buf.clone(), stream_registry.clone());
+        let output_buf = OutputBuffer::new();
+        let stream_registry: StreamRegistry = Arc::new(Mutex::new(HashMap::new()));
+        spawn_drain_task(output_buf.clone(), stream_registry.clone());
 
-            let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(64);
-            std::thread::Builder::new()
-                .name("engine".to_string())
-                .spawn(move || ctx.engine.run(engine_rx))
-                .expect("Failed to spawn engine thread");
+        let (engine_tx, engine_rx) = mpsc::channel::<EngineRequest>(64);
+        std::thread::Builder::new()
+            .name("engine".to_string())
+            .spawn(move || ctx.engine.run(engine_rx))
+            .expect("Failed to spawn engine thread");
 
-            (
-                Some(model.clone()),
-                Some(tok),
-                max_seq_len,
-                audio_token_id,
-                engine_tx,
-                output_buf,
-                stream_registry,
-            )
-        } else {
-            // ── Ollama-compatible mode — no model pre-loaded ──────────────────
-            // No tokenizer and no running engine.  The channel is created with
-            // the receiver immediately dropped so any `send()` will fail with
-            // a "engine unavailable" error returned to the client.
-            let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
+        (
+            Some(model.clone()),
+            Some(tok),
+            max_seq_len,
+            audio_token_id,
+            image_token_id,
+            boi_token_id,
+            eoi_token_id,
+            vision_patch_size,
+            vision_pooling_kernel,
+            vision_default_output_length,
+            engine_tx,
+            output_buf,
+            stream_registry,
+        )
+    } else {
+        // ── Ollama-compatible mode — no model pre-loaded ──────────────────
+        let (engine_tx, _engine_rx) = mpsc::channel::<EngineRequest>(1);
 
-            let output_buf = OutputBuffer::new();
-            let stream_registry: StreamRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let output_buf = OutputBuffer::new();
+        let stream_registry: StreamRegistry = Arc::new(Mutex::new(HashMap::new()));
 
-            (
-                None,
-                None,
-                usize::MAX,
-                None,
-                engine_tx,
-                output_buf,
-                stream_registry,
-            )
-        };
+        (
+            None,
+            None,
+            usize::MAX,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            engine_tx,
+            output_buf,
+            stream_registry,
+        )
+    };
 
     // Default sampling params from CLI args
     let default_params = SamplingParams {
@@ -825,6 +885,12 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         output_buf,
         stream_registry,
         audio_token_id,
+        image_token_id,
+        boi_token_id,
+        eoi_token_id,
+        vision_patch_size,
+        vision_pooling_kernel,
+        vision_default_output_length,
     });
 
     // Build router — OpenAI/Anthropic routes always present; Ollama routes
@@ -914,7 +980,9 @@ async fn chat_completions(
         &req.messages[..]
     };
 
-    let (prompt_tokens, audio_ctx) = if has_audio {
+    let has_images = req.messages.iter().any(|m| !m.content.images.is_empty());
+
+    let (prompt_tokens, audio_ctx, image_ctx) = if has_audio {
         let audio_token_id = state.audio_token_id.ok_or_else(|| {
             audio_error("This model does not support audio input (no audio_token_id in config)")
         })?;
@@ -976,7 +1044,85 @@ async fn chat_completions(
             audio_token_id,
         };
 
-        (tokens, Some(audio_ctx))
+        (tokens, Some(audio_ctx), None)
+    } else if has_images {
+        // ── Vision preprocessing ──────────────────────────────────────────────
+        // For each image_url content part across all messages:
+        //   1. Decode base64 data URL or reject HTTP URLs
+        //   2. Decode JPEG/PNG → RGB DynamicImage
+        //   3. Aspect-ratio-preserving resize to patch grid dimensions
+        //   4. Rescale [0,255] → [0,1] and patchify
+        //   5. Build pixel_values [N_patches, patch_pixels] and position_ids [N_patches, 2]
+        //   6. Count soft tokens = N_patches / pooling_kernel²
+        //   7. Tokenize with image soft-token placeholders
+        let image_token_id = state.image_token_id.ok_or_else(|| {
+            image_error("This model does not support vision input (no image_token_id in config)")
+        })?;
+        let patch_size = state.vision_patch_size.unwrap_or(16);
+        let pooling_kernel = state.vision_pooling_kernel.unwrap_or(3);
+        let default_output_length = state.vision_default_output_length.unwrap_or(280);
+
+        // Collect all images in message order.
+        let mut all_images: Vec<&ImageInput> = Vec::new();
+        for msg in messages {
+            for img in &msg.content.images {
+                all_images.push(img);
+            }
+        }
+
+        // Preprocess each image.
+        let mut all_pixel_values: Vec<f32> = Vec::new();
+        let mut all_position_ids: Vec<i64> = Vec::new();
+        let mut image_token_counts: Vec<usize> = Vec::new();
+        let mut total_patches = 0usize;
+
+        for img_input in &all_images {
+            let (pv, pos, n_patches, n_soft) =
+                preprocess_image(img_input, patch_size, pooling_kernel, default_output_length)
+                    .map_err(|e| image_error(format!("Image preprocessing failed: {e}")))?;
+
+            all_pixel_values.extend_from_slice(&pv);
+            all_position_ids.extend_from_slice(&pos);
+            image_token_counts.push(n_soft);
+            total_patches += n_patches;
+        }
+
+        // Tokenize with image soft-token placeholders.
+        let prompt = apply_gemma4_with_images(messages, &image_token_counts);
+        let tokenizer = state
+            .tokenizer
+            .as_deref()
+            .ok_or_else(|| server_error("No model loaded"))?;
+        let tokens = tokenizer
+            .encode(&prompt, false)
+            .map_err(tokenization_error)?;
+
+        let patch_pixels = patch_size * patch_size * 3;
+        let pixel_tensor = candle_core::Tensor::from_vec(
+            all_pixel_values,
+            (total_patches, patch_pixels),
+            &candle_core::Device::Cpu,
+        )
+        .map_err(|e| server_error(format!("Pixel tensor creation failed: {e}")))?
+        .to_dtype(candle_core::DType::F32)
+        .map_err(|e| server_error(format!("Pixel dtype conversion failed: {e}")))?;
+
+        let pos_tensor = candle_core::Tensor::from_vec(
+            all_position_ids,
+            (total_patches, 2),
+            &candle_core::Device::Cpu,
+        )
+        .map_err(|e| server_error(format!("Position tensor creation failed: {e}")))?;
+
+        let n_soft_total = image_token_counts.iter().sum();
+        let image_ctx = ImageEmbedContext {
+            pixel_values: pixel_tensor,
+            position_ids: pos_tensor,
+            n_soft_tokens: n_soft_total,
+            image_token_id,
+        };
+
+        (tokens, None, Some(image_ctx))
     } else {
         let tokenizer = state
             .tokenizer
@@ -987,19 +1133,22 @@ async fn chat_completions(
             Ok(t) => t,
             Err(e) => return Err(tokenization_error(e)),
         };
-        (tokens, None)
+        (tokens, None, None)
     };
 
+    let modality_note = if audio_ctx.is_some() {
+        " (with audio)"
+    } else if image_ctx.is_some() {
+        " (with image)"
+    } else {
+        ""
+    };
     tracing::info!(
         "Request {}: {} messages, {} prompt tokens{}",
         request_id,
         req.messages.len(),
         prompt_tokens.len(),
-        if audio_ctx.is_some() {
-            " (with audio)"
-        } else {
-            ""
-        }
+        modality_note
     );
 
     check_prompt_length(prompt_tokens.len(), state.max_seq_len)?;
@@ -1042,6 +1191,7 @@ async fn chat_completions(
             request_id: request_id.clone(),
             prompt_tokens: prompt_tokens.clone(),
             audio: audio_ctx,
+            image: image_ctx,
             sampling_params: params,
             output_buf: state.output_buf.clone(),
         };
@@ -1061,6 +1211,7 @@ async fn chat_completions(
             request_id: request_id.clone(),
             prompt_tokens: prompt_tokens.clone(),
             audio: audio_ctx,
+            image: image_ctx,
             sampling_params: params,
             response_tx,
         };
@@ -1283,6 +1434,7 @@ async fn completions(
             request_id: request_id.clone(),
             prompt_tokens,
             audio: None,
+            image: None,
             sampling_params: params,
             output_buf: state.output_buf.clone(),
         };
@@ -1302,6 +1454,7 @@ async fn completions(
             request_id: request_id.clone(),
             prompt_tokens,
             audio: None,
+            image: None,
             sampling_params: params,
             response_tx,
         };
@@ -1456,6 +1609,7 @@ async fn anthropic_messages(
             request_id: request_id.clone(),
             prompt_tokens: prompt_tokens.clone(),
             audio: None,
+            image: None,
             sampling_params: params,
             output_buf: state.output_buf.clone(),
         };
@@ -1478,6 +1632,7 @@ async fn anthropic_messages(
             request_id: request_id.clone(),
             prompt_tokens: prompt_tokens.clone(),
             audio: None,
+            image: None,
             sampling_params: params,
             response_tx,
         };
@@ -1772,6 +1927,132 @@ fn clamp_max_tokens(requested: usize, prompt_len: usize, max_seq_len: usize) -> 
 /// This function converts the tool array into a readable description that can
 /// be prepended to the system prompt, letting the model understand what tools
 /// are available without needing native schema support.
+/// Preprocess a single image for the Gemma4 vision encoder.
+///
+/// Accepts a data URL (`data:image/...;base64,...`) or, as a fallback,
+/// interprets the `url` field as raw base64 JPEG/PNG bytes.
+///
+/// Returns:
+///   - `pixel_values`: flat `[N_patches * patch_size² * 3]` f32 values in [0, 1].
+///   - `position_ids`: flat `[N_patches * 2]` i64 (x, y) coordinates.
+///   - `n_soft_tokens`: number of image soft tokens = N_patches / pooling_kernel².
+fn preprocess_image(
+    img_input: &ImageInput,
+    patch_size: usize,
+    pooling_kernel: usize,
+    default_output_length: usize,
+) -> anyhow::Result<(Vec<f32>, Vec<i64>, usize, usize)> {
+    // Decode base64 payload from data URL or raw base64.
+    let raw_bytes = if img_input.url.starts_with("data:") {
+        // data:image/jpeg;base64,<data>
+        let comma_pos = img_input
+            .url
+            .find(',')
+            .ok_or_else(|| anyhow::anyhow!("Invalid data URL: no comma found"))?;
+        let b64 = &img_input.url[comma_pos + 1..];
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+            .map_err(|e| anyhow::anyhow!("Base64 decode failed: {e}"))?
+    } else {
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &img_input.url)
+            .map_err(|e| anyhow::anyhow!("Base64 decode of raw url failed: {e}"))?
+    };
+
+    patchify_image_bytes(
+        &raw_bytes,
+        patch_size,
+        pooling_kernel,
+        default_output_length,
+    )
+}
+
+/// Decode image bytes and patchify into (pixel_values, position_ids, n_patches, n_soft_tokens).
+///
+/// - `raw_bytes`: raw JPEG/PNG/etc. bytes.
+/// - Returns:
+///   - `pixel_values`: flat `[N_patches * patch_pixels]` f32 in [0, 1].
+///   - `position_ids`: flat `[N_patches * 2]` i64 (x, y) grid coordinates.
+///   - `n_patches`: total number of patches.
+///   - `n_soft_tokens`: N_patches / pooling_kernel².
+pub(crate) fn patchify_image_bytes(
+    raw_bytes: &[u8],
+    patch_size: usize,
+    pooling_kernel: usize,
+    default_output_length: usize,
+) -> anyhow::Result<(Vec<f32>, Vec<i64>, usize, usize)> {
+    use image::{imageops::FilterType, DynamicImage};
+
+    // Decode JPEG / PNG.
+    let img = image::load_from_memory(raw_bytes)
+        .map_err(|e| anyhow::anyhow!("Image decode failed: {e}"))?
+        .to_rgb8();
+
+    let (orig_w, orig_h) = img.dimensions();
+
+    // Compute aspect-ratio-preserving target size.
+    // Target must be divisible by (pooling_kernel * patch_size).
+    // Max patches = default_output_length * pooling_kernel².
+    let max_patches = default_output_length * pooling_kernel * pooling_kernel;
+    let side_mult = pooling_kernel * patch_size;
+
+    let total_px = (orig_h as f64) * (orig_w as f64);
+    let target_px = max_patches as f64 * (patch_size * patch_size) as f64;
+    let factor = (target_px / total_px).sqrt();
+
+    let ideal_h = factor * orig_h as f64;
+    let ideal_w = factor * orig_w as f64;
+
+    let target_h = ((ideal_h / side_mult as f64).floor() as usize * side_mult).max(side_mult);
+    let target_w = ((ideal_w / side_mult as f64).floor() as usize * side_mult).max(side_mult);
+
+    // Resize.
+    let resized = DynamicImage::ImageRgb8(img).resize_exact(
+        target_w as u32,
+        target_h as u32,
+        FilterType::Lanczos3,
+    );
+    let resized = resized.to_rgb8();
+
+    let patch_h = target_h / patch_size;
+    let patch_w = target_w / patch_size;
+    let n_patches = patch_h * patch_w;
+    let patch_pixels = patch_size * patch_size * 3;
+
+    // Patchify: row-major, channels last per patch.
+    // Output shape: [n_patches, patch_pixels] in f32 [0,1].
+    let mut pixel_values = vec![0.0f32; n_patches * patch_pixels];
+    for py in 0..patch_h {
+        for px in 0..patch_w {
+            let patch_idx = py * patch_w + px;
+            let dst_base = patch_idx * patch_pixels;
+            for ky in 0..patch_size {
+                for kx in 0..patch_size {
+                    let img_y = (py * patch_size + ky) as u32;
+                    let img_x = (px * patch_size + kx) as u32;
+                    let pixel = resized.get_pixel(img_x, img_y);
+                    let local = ky * patch_size + kx;
+                    pixel_values[dst_base + local * 3] = pixel[0] as f32 / 255.0;
+                    pixel_values[dst_base + local * 3 + 1] = pixel[1] as f32 / 255.0;
+                    pixel_values[dst_base + local * 3 + 2] = pixel[2] as f32 / 255.0;
+                }
+            }
+        }
+    }
+
+    // Position IDs: (x, y) patch grid coordinates.
+    let mut position_ids = vec![0i64; n_patches * 2];
+    for py in 0..patch_h {
+        for px in 0..patch_w {
+            let idx = py * patch_w + px;
+            position_ids[idx * 2] = px as i64; // x
+            position_ids[idx * 2 + 1] = py as i64; // y
+        }
+    }
+
+    let n_soft_tokens = n_patches / (pooling_kernel * pooling_kernel);
+
+    Ok((pixel_values, position_ids, n_patches, n_soft_tokens))
+}
+
 fn format_tools_as_system_context(tools: &serde_json::Value) -> String {
     let Some(arr) = tools.as_array() else {
         return String::new();
@@ -1848,10 +2129,10 @@ fn inject_tools_into_messages(messages: &[ChatMessage], tool_summary: &str) -> V
     if let Some(first) = messages.first() {
         if matches!(first.role, Role::System) {
             // Merge into the existing system message.
-            let merged = if first.content.0.is_empty() {
+            let merged = if first.content.text.is_empty() {
                 tool_summary.to_string()
             } else {
-                format!("{}\n\n{}", first.content.0, tool_summary)
+                format!("{}\n\n{}", first.content.text, tool_summary)
             };
             out.push(ChatMessage {
                 role: Role::System,
@@ -2102,6 +2383,7 @@ async fn ollama_dispatch_stream(
         request_id: request_id.to_string(),
         prompt_tokens,
         audio: None,
+        image: None,
         sampling_params: params,
         output_buf: state.output_buf.clone(),
     };
@@ -2136,6 +2418,7 @@ async fn ollama_dispatch_blocking(
         request_id,
         prompt_tokens,
         audio: None,
+        image: None,
         sampling_params: params,
         response_tx,
     };
@@ -2560,7 +2843,7 @@ mod tests {
         let msgs = vec![make_msg(Role::User, "Hello")];
         let result = inject_tools_into_messages(&msgs, "");
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].content.0, "Hello");
+        assert_eq!(result[0].content.text, "Hello");
     }
 
     #[test]
@@ -2569,8 +2852,8 @@ mod tests {
         let result = inject_tools_into_messages(&msgs, "Available tools:\n- noop");
         assert_eq!(result.len(), 2);
         assert!(matches!(result[0].role, Role::System));
-        assert!(result[0].content.0.contains("Available tools"));
-        assert_eq!(result[1].content.0, "Hello");
+        assert!(result[0].content.text.contains("Available tools"));
+        assert_eq!(result[1].content.text, "Hello");
     }
 
     #[test]
@@ -2583,9 +2866,9 @@ mod tests {
         // Should still be two messages — tool summary merged into system.
         assert_eq!(result.len(), 2);
         assert!(matches!(result[0].role, Role::System));
-        assert!(result[0].content.0.contains("You are helpful."));
-        assert!(result[0].content.0.contains("Available tools"));
-        assert_eq!(result[1].content.0, "Hello");
+        assert!(result[0].content.text.contains("You are helpful."));
+        assert!(result[0].content.text.contains("Available tools"));
+        assert_eq!(result[1].content.text, "Hello");
     }
 
     #[test]
@@ -2593,7 +2876,7 @@ mod tests {
         let msgs = vec![make_msg(Role::System, ""), make_msg(Role::User, "Hi")];
         let result = inject_tools_into_messages(&msgs, "Available tools:\n- noop");
         assert_eq!(result.len(), 2);
-        assert_eq!(result[0].content.0, "Available tools:\n- noop");
+        assert_eq!(result[0].content.text, "Available tools:\n- noop");
     }
 
     #[test]
@@ -2660,8 +2943,8 @@ mod tests {
             "message count must not change"
         );
         assert!(matches!(result[0].role, Role::System));
-        assert!(result[0].content.0.contains("You are helpful."));
-        assert!(result[0].content.0.contains("Available tools:"));
+        assert!(result[0].content.text.contains("You are helpful."));
+        assert!(result[0].content.text.contains("Available tools:"));
         // Remaining messages are unchanged.
         assert!(matches!(result[1].role, Role::User));
         assert!(matches!(result[2].role, Role::Assistant));

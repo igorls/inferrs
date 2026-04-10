@@ -1,0 +1,1197 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gemma 4 E2B — Live Demo</title>
+  <style>
+    /* ── Design tokens ── */
+    :root {
+      --bg:      #0d0f18;
+      --bg2:     #151824;
+      --bg3:     #1e2235;
+      --bg4:     #252940;
+      --border:  #2a2f4a;
+      --accent:  #7c6af7;
+      --acc2:    #5b4fcf;
+      --text:    #e8eaf6;
+      --text2:   #8892b0;
+      --red:     #f7706a;
+      --green:   #56cf8a;
+      --yellow:  #f0b429;
+      --blue:    #5bc0eb;
+      --r:       10px;
+      --font:    system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    [data-theme="light"] {
+      --bg:      #f0f2fa;
+      --bg2:     #ffffff;
+      --bg3:     #e8ebf5;
+      --bg4:     #dde1f0;
+      --border:  #c8cde4;
+      --accent:  #5b4fcf;
+      --acc2:    #4039a8;
+      --text:    #1a1d2e;
+      --text2:   #565e80;
+      --red:     #c0392b;
+      --green:   #1e8449;
+      --yellow:  #b7770d;
+      --blue:    #1a6e9e;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; overflow: hidden; }
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ── */
+    header {
+      flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 18px;
+      background: var(--bg2);
+      border-bottom: 1px solid var(--border);
+      gap: 10px;
+      z-index: 20;
+    }
+    .logo { display: flex; align-items: center; gap: 9px; font-weight: 700; font-size: .95rem; }
+    .logo-gem {
+      width: 28px; height: 28px;
+      background: linear-gradient(135deg, var(--accent), #a78bfa);
+      border-radius: 7px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 14px; color: #fff;
+    }
+    .logo-sub { font-size: .78rem; font-weight: 400; color: var(--text2); }
+    .badge {
+      font-size: .65rem; padding: 2px 7px; border-radius: 100px; font-weight: 700;
+      background: color-mix(in srgb, var(--accent) 18%, transparent);
+      color: var(--accent);
+      border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+    }
+    .hdr-right { display: flex; align-items: center; gap: 10px; }
+    .status { display: flex; align-items: center; gap: 5px; font-size: .76rem; color: var(--text2); }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--red); transition: background .3s; }
+    .dot.ok { background: var(--green); }
+    .hbtn {
+      background: var(--bg3); border: 1px solid var(--border);
+      border-radius: 7px; color: var(--text);
+      padding: 5px 10px; cursor: pointer; font-size: .8rem; line-height: 1;
+      transition: background .15s; font-family: var(--font);
+    }
+    .hbtn:hover { background: var(--bg4); }
+
+    /* ── Body split ── */
+    .body {
+      flex: 1;
+      display: flex;
+      overflow: hidden;
+    }
+
+    /* ── LEFT: Live panel ── */
+    .live-panel {
+      width: 340px;
+      min-width: 260px;
+      flex-shrink: 0;
+      background: var(--bg2);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+      overflow: hidden;
+    }
+
+    .panel-section {
+      border-bottom: 1px solid var(--border);
+      padding: 12px 14px;
+    }
+    .panel-section:last-child { border-bottom: none; flex: 1; display: flex; flex-direction: column; }
+
+    .sec-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 10px;
+    }
+    .sec-title {
+      font-size: .72rem;
+      font-weight: 700;
+      color: var(--text2);
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .live-dot {
+      width: 6px; height: 6px; border-radius: 50%;
+      background: var(--red);
+      transition: background .3s;
+    }
+    .live-dot.on { background: var(--red); animation: livepulse 1.2s infinite; }
+    @keyframes livepulse {
+      0%,100% { opacity: 1; }
+      50% { opacity: .4; }
+    }
+
+    /* Webcam */
+    .cam-wrap {
+      position: relative;
+      background: #000;
+      border-radius: var(--r);
+      overflow: hidden;
+      aspect-ratio: 4/3;
+      width: 100%;
+    }
+    #webcam {
+      width: 100%; height: 100%;
+      object-fit: cover;
+      display: block;
+      transform: scaleX(-1); /* mirror */
+    }
+    .cam-off {
+      position: absolute; inset: 0;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 8px; color: var(--text2); font-size: .85rem;
+      background: var(--bg3);
+    }
+    .cam-off-icon { font-size: 2rem; opacity: .4; }
+    #canvas-snap { display: none; } /* offscreen canvas for frame capture */
+
+    /* Flash overlay for snapshot feedback */
+    .cam-flash {
+      position: absolute; inset: 0;
+      background: #fff;
+      opacity: 0;
+      pointer-events: none;
+      border-radius: var(--r);
+      transition: opacity .05s;
+    }
+    .cam-flash.snap { opacity: .7; transition: opacity .05s; }
+
+    .cam-controls {
+      display: flex; gap: 6px; margin-top: 8px;
+    }
+
+    /* Mic / audio */
+    .mic-bar-wrap {
+      display: flex; align-items: center; gap: 8px;
+      margin-top: 2px;
+    }
+    .mic-icon { font-size: 1.1rem; }
+    .mic-bars {
+      display: flex; gap: 2px; align-items: flex-end; height: 20px; flex: 1;
+    }
+    .mic-bar {
+      width: 4px; border-radius: 2px;
+      background: var(--accent);
+      height: 4px;
+      transition: height .05s;
+      opacity: .7;
+    }
+    .mic-level-label { font-size: .72rem; color: var(--text2); min-width: 32px; text-align: right; }
+
+    /* Settings in left panel */
+    .setting-row { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+    .setting-row:last-child { margin-bottom: 0; }
+    .setting-row label {
+      font-size: .75rem; color: var(--text2);
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .setting-row label span { color: var(--accent); font-weight: 600; }
+    .setting-row input[type=range] { width: 100%; accent-color: var(--accent); cursor: pointer; }
+    .setting-row input[type=number] {
+      width: 100%; background: var(--bg3); border: 1px solid var(--border);
+      border-radius: 6px; color: var(--text); padding: 5px 8px; font-size: .82rem;
+      font-family: var(--font);
+    }
+    .setting-row select {
+      width: 100%; background: var(--bg3); border: 1px solid var(--border);
+      border-radius: 6px; color: var(--text); padding: 5px 8px; font-size: .82rem;
+      cursor: pointer; font-family: var(--font);
+    }
+
+    /* ── Shared button styles ── */
+    .btn {
+      background: var(--accent); color: #fff; border: none;
+      border-radius: 8px; padding: 7px 14px; cursor: pointer;
+      font-size: .82rem; font-weight: 600; font-family: var(--font);
+      transition: background .15s; white-space: nowrap;
+      display: flex; align-items: center; gap: 5px;
+    }
+    .btn:hover { background: var(--acc2); }
+    .btn:disabled { opacity: .4; cursor: not-allowed; }
+    .btn.sm { padding: 5px 10px; font-size: .76rem; }
+    .btn.danger { background: var(--red); }
+    .btn.danger:hover { background: #d94f4a; }
+    .btn.ghost {
+      background: var(--bg3); color: var(--text2);
+      border: 1px solid var(--border); font-weight: 500;
+    }
+    .btn.ghost:hover { background: var(--bg4); color: var(--text); }
+    .btn.active-red  { background: color-mix(in srgb, var(--red) 20%, transparent); color: var(--red); border: 1px solid color-mix(in srgb, var(--red) 40%, transparent); }
+    .btn.active-blue { background: color-mix(in srgb, var(--blue) 20%, transparent); color: var(--blue); border: 1px solid color-mix(in srgb, var(--blue) 40%, transparent); }
+    .btn.active-acc  { background: color-mix(in srgb, var(--accent) 20%, transparent); color: var(--accent); border: 1px solid color-mix(in srgb, var(--accent) 40%, transparent); }
+
+    /* ── RIGHT: Chat ── */
+    .chat-col {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      max-width: 760px;
+      margin: 0 auto;
+      width: 100%;
+    }
+
+    .messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px 16px 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    /* Empty state */
+    .empty-state {
+      flex: 1; display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 10px; color: var(--text2);
+      padding: 20px;
+    }
+    .empty-icon { font-size: 2.8rem; opacity: .3; }
+    .empty-title { font-size: .95rem; font-weight: 700; color: var(--text); opacity: .7; }
+    .empty-sub { font-size: .82rem; text-align: center; max-width: 320px; line-height: 1.5; }
+    .pills { display: flex; gap: 7px; flex-wrap: wrap; justify-content: center; margin-top: 4px; }
+    .pill { font-size: .74rem; padding: 3px 10px; border-radius: 100px; border: 1px solid var(--border); color: var(--text2); background: var(--bg2); }
+
+    /* Message rows */
+    .msg-row { display: flex; flex-direction: column; gap: 3px; }
+    .msg-row.user  { align-items: flex-end; }
+    .msg-row.model { align-items: flex-start; }
+
+    .msg-meta {
+      font-size: .68rem; color: var(--text2);
+      display: flex; align-items: center; gap: 5px; padding: 0 3px;
+    }
+    .msg-row.user .msg-meta { flex-direction: row-reverse; }
+    .mod-pills { display: flex; gap: 3px; }
+    .mpill {
+      font-size: .62rem; padding: 1px 5px; border-radius: 100px; font-weight: 700; line-height: 1.7;
+    }
+    .mpill.v { background: color-mix(in srgb,var(--blue) 18%,transparent); color: var(--blue); }
+    .mpill.a { background: color-mix(in srgb,var(--yellow) 18%,transparent); color: var(--yellow); }
+    .mpill.t { background: color-mix(in srgb,var(--green) 18%,transparent); color: var(--green); }
+
+    .msg-bubble {
+      max-width: min(68ch, 88%);
+      padding: 9px 13px;
+      border-radius: var(--r);
+      font-size: .9rem; line-height: 1.6;
+      white-space: pre-wrap; word-break: break-word;
+    }
+    .msg-row.user  .msg-bubble { background: var(--bg3); border-bottom-right-radius: 2px; }
+    .msg-row.model .msg-bubble { background: var(--bg2); border: 1px solid var(--border); border-bottom-left-radius: 2px; }
+
+    .bubble-img {
+      max-width: 200px; max-height: 140px;
+      border-radius: 6px; display: block;
+      margin-bottom: 7px;
+      border: 1px solid var(--border);
+    }
+    .bubble-audio {
+      width: 100%; max-width: 260px;
+      display: block; margin-bottom: 6px;
+    }
+
+    .think-row { align-items: flex-start; }
+    .think-bubble {
+      max-width: min(68ch, 88%);
+      padding: 7px 11px;
+      border-radius: var(--r);
+      font-size: .8rem; color: var(--text2); font-style: italic;
+      background: var(--bg3);
+      border: 1px dashed var(--border);
+      white-space: pre-wrap; word-break: break-word;
+    }
+
+    .typing { padding: 8px 13px; display: flex; gap: 4px; }
+    .typing span {
+      width: 5px; height: 5px; background: var(--text2);
+      border-radius: 50%; animation: bounce .8s infinite;
+    }
+    .typing span:nth-child(2) { animation-delay: .15s; }
+    .typing span:nth-child(3) { animation-delay: .3s; }
+    @keyframes bounce {
+      0%,80%,100% { transform: translateY(0); }
+      40% { transform: translateY(-5px); }
+    }
+
+    /* ── Composer ── */
+    .composer {
+      flex-shrink: 0;
+      background: var(--bg2);
+      border-top: 1px solid var(--border);
+      padding: 8px 14px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+    }
+
+    /* Pending attachments preview row */
+    .pending-row {
+      display: flex; gap: 7px; flex-wrap: wrap;
+    }
+    .pending-chip {
+      display: flex; align-items: center; gap: 5px;
+      background: var(--bg3); border: 1px solid var(--border);
+      border-radius: 8px; padding: 4px 8px;
+      font-size: .76rem; color: var(--text);
+    }
+    .pending-chip img { width: 28px; height: 28px; object-fit: cover; border-radius: 4px; }
+    .pchip-remove { background: none; border: none; color: var(--text2); cursor: pointer; font-size: 13px; padding: 0 1px; line-height: 1; }
+    .pchip-remove:hover { color: var(--red); }
+
+    .input-row { display: flex; align-items: flex-end; gap: 5px; }
+
+    textarea#msg-input {
+      flex: 1;
+      background: var(--bg3); border: 1px solid var(--border);
+      border-radius: 9px; color: var(--text);
+      font-family: var(--font); font-size: .9rem;
+      padding: 8px 12px; resize: none;
+      min-height: 40px; max-height: 140px; line-height: 1.45;
+      transition: border-color .15s;
+    }
+    textarea#msg-input:focus { outline: none; border-color: var(--accent); }
+    textarea#msg-input::placeholder { color: var(--text2); }
+
+    .tb {
+      flex-shrink: 0; width: 36px; height: 36px;
+      border-radius: 8px; border: 1px solid var(--border);
+      background: var(--bg3); color: var(--text2);
+      cursor: pointer; font-size: 16px;
+      display: flex; align-items: center; justify-content: center;
+      transition: background .12s, color .12s, border-color .12s;
+      position: relative;
+    }
+    .tb:hover { background: var(--bg4); color: var(--text); }
+    .tb.on-cam   { background: color-mix(in srgb,var(--blue)   18%,transparent); color: var(--blue);   border-color: var(--blue); }
+    .tb.on-mic   { background: color-mix(in srgb,var(--yellow) 18%,transparent); color: var(--yellow); border-color: var(--yellow); }
+    .tb.rec-mic  { background: color-mix(in srgb,var(--red)    18%,transparent); color: var(--red);    border-color: var(--red); animation: pulse-btn 1.2s infinite; }
+    .tb.has-img  { background: color-mix(in srgb,var(--blue)   18%,transparent); color: var(--blue);   border-color: var(--blue); }
+    .tb.has-aud  { background: color-mix(in srgb,var(--yellow) 18%,transparent); color: var(--yellow); border-color: var(--yellow); }
+    @keyframes pulse-btn {
+      0%,100% { box-shadow: 0 0 0 0 color-mix(in srgb,var(--red) 45%,transparent); }
+      50%      { box-shadow: 0 0 0 5px color-mix(in srgb,var(--red) 0%,transparent); }
+    }
+
+    .send-tb {
+      flex-shrink: 0; width: 36px; height: 36px;
+      border-radius: 8px; border: none;
+      background: var(--accent); color: #fff;
+      cursor: pointer; font-size: 15px;
+      display: flex; align-items: center; justify-content: center;
+      transition: background .12s;
+    }
+    .send-tb:hover { background: var(--acc2); }
+    .send-tb:disabled { opacity: .35; cursor: not-allowed; }
+
+    /* auto-send countdown ring */
+    .countdown-ring {
+      position: absolute; inset: -3px;
+      border-radius: 50%;
+      pointer-events: none;
+    }
+
+    /* ── Toast ── */
+    .toast {
+      position: fixed; bottom: 20px; left: 50%;
+      transform: translateX(-50%) translateY(70px);
+      background: var(--red); color: #fff;
+      padding: 8px 16px; border-radius: 7px;
+      font-size: .84rem; font-weight: 600;
+      transition: transform .3s; z-index: 999;
+      pointer-events: none;
+    }
+    .toast.show { transform: translateX(-50%) translateY(0); }
+
+    /* ── Responsive: stack on narrow screens ── */
+    @media (max-width: 620px) {
+      .body { flex-direction: column; }
+      .live-panel { width: 100%; min-width: unset; border-right: none; border-bottom: 1px solid var(--border); max-height: 280px; overflow-y: auto; }
+    }
+  </style>
+</head>
+<body>
+
+<!-- ── Header ── -->
+<header>
+  <div class="logo">
+    <div class="logo-gem">✦</div>
+    <div>
+      Gemma 4 <strong>E2B</strong>
+      <span class="badge">ANY-TO-ANY</span>
+      <span class="logo-sub" style="display:block;margin-top:1px">Live · Text · Vision · Audio</span>
+    </div>
+  </div>
+  <div class="hdr-right">
+    <div class="status">
+      <div class="dot" id="status-dot"></div>
+      <span id="status-text">Connecting…</span>
+    </div>
+    <button class="hbtn" onclick="clearChat()">🗑 Clear</button>
+    <button class="hbtn" onclick="toggleTheme()">◑</button>
+  </div>
+</header>
+
+<!-- ── Body ── -->
+<div class="body">
+
+  <!-- ════ LEFT: Live panel ════ -->
+  <div class="live-panel">
+
+    <!-- Webcam section -->
+    <div class="panel-section">
+      <div class="sec-header">
+        <div class="sec-title">
+          <div class="live-dot" id="cam-live-dot"></div>
+          Camera
+        </div>
+        <button class="btn sm ghost" id="cam-toggle-btn" onclick="toggleCam()">Start Camera</button>
+      </div>
+      <div class="cam-wrap" id="cam-wrap">
+        <video id="webcam" autoplay playsinline muted></video>
+        <canvas id="canvas-snap"></canvas>
+        <div class="cam-flash" id="cam-flash"></div>
+        <div class="cam-off" id="cam-off">
+          <div class="cam-off-icon">📷</div>
+          <div>Camera off</div>
+        </div>
+      </div>
+      <!-- Snapshot button -->
+      <div class="cam-controls">
+        <button class="btn sm ghost" id="snap-btn" onclick="snapFrame()" disabled
+          title="Capture current frame and attach to next message" style="flex:1">
+          📸 Snap frame
+        </button>
+        <button class="btn sm ghost" id="auto-snap-btn" onclick="toggleAutoSnap()"
+          title="Auto-capture a frame every few seconds while composing"
+          style="flex:1">
+          ⏱ Auto-snap: off
+        </button>
+      </div>
+    </div>
+
+    <!-- Microphone section -->
+    <div class="panel-section">
+      <div class="sec-header">
+        <div class="sec-title">
+          <div class="live-dot" id="mic-live-dot"></div>
+          Microphone
+        </div>
+        <button class="btn sm ghost" id="mic-toggle-btn" onclick="toggleMic()">Start Mic</button>
+      </div>
+      <div class="mic-bar-wrap">
+        <span class="mic-icon">🎙</span>
+        <div class="mic-bars" id="mic-bars">
+          <!-- 16 bars, driven by analyser -->
+          <div class="mic-bar"></div><div class="mic-bar"></div>
+          <div class="mic-bar"></div><div class="mic-bar"></div>
+          <div class="mic-bar"></div><div class="mic-bar"></div>
+          <div class="mic-bar"></div><div class="mic-bar"></div>
+          <div class="mic-bar"></div><div class="mic-bar"></div>
+          <div class="mic-bar"></div><div class="mic-bar"></div>
+          <div class="mic-bar"></div><div class="mic-bar"></div>
+          <div class="mic-bar"></div><div class="mic-bar"></div>
+        </div>
+        <span class="mic-level-label" id="mic-db">— dB</span>
+      </div>
+      <!-- Push-to-talk / record controls -->
+      <div style="display:flex;gap:6px;margin-top:10px">
+        <button class="btn sm ghost" id="rec-btn" onclick="toggleRecord()" disabled style="flex:1">
+          ● Record
+        </button>
+        <button class="btn sm ghost" id="ptt-btn"
+          onmousedown="pttStart()" onmouseup="pttStop()" ontouchstart="pttStart()" ontouchend="pttStop()"
+          disabled title="Hold to talk" style="flex:1">
+          🎤 Hold to talk
+        </button>
+      </div>
+      <div style="font-size:.7rem;color:var(--text2);margin-top:5px" id="rec-status">Mic off</div>
+    </div>
+
+    <!-- Settings section -->
+    <div class="panel-section">
+      <div class="sec-title" style="margin-bottom:10px">Settings</div>
+      <div class="setting-row">
+        <label>Temperature <span id="s-temp-val">0.7</span></label>
+        <input type="range" id="s-temp" min="0" max="2" step="0.05" value="0.7"
+          oninput="document.getElementById('s-temp-val').textContent=parseFloat(this.value).toFixed(2)">
+      </div>
+      <div class="setting-row">
+        <label>Max tokens</label>
+        <input type="number" id="s-max-tokens" value="512" min="1" max="4096">
+      </div>
+      <div class="setting-row">
+        <label>Auto-snap interval</label>
+        <select id="s-snap-interval">
+          <option value="3">Every 3 s</option>
+          <option value="5" selected>Every 5 s</option>
+          <option value="10">Every 10 s</option>
+          <option value="15">Every 15 s</option>
+        </select>
+      </div>
+    </div>
+
+  </div><!-- /live-panel -->
+
+  <!-- ════ RIGHT: Chat ════ -->
+  <div class="chat-col">
+    <div class="messages" id="messages">
+      <div class="empty-state" id="empty-state">
+        <div class="empty-icon">✦</div>
+        <div class="empty-title">Gemma 4 E2B — Live</div>
+        <div class="empty-sub">
+          Start your camera and mic, then send a message.<br>
+          Gemma sees your webcam and hears your voice in real time.
+        </div>
+        <div class="pills">
+          <span class="pill">📸 Live snapshots</span>
+          <span class="pill">🎙 Voice recording</span>
+          <span class="pill">💬 Text chat</span>
+          <span class="pill">🧠 Multi-turn</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Composer ── -->
+    <div class="composer">
+      <!-- Pending attachments -->
+      <div class="pending-row" id="pending-row" style="display:none"></div>
+
+      <div class="input-row">
+        <!-- Snap-to-attach button -->
+        <button class="tb" id="tb-cam" title="Snap current webcam frame and attach" onclick="snapAndAttach()">📸</button>
+        <!-- Record toggle -->
+        <button class="tb" id="tb-mic" title="Click to start/stop recording audio for this message" onclick="toggleRecord()">🎙</button>
+
+        <!-- Text input -->
+        <textarea id="msg-input" rows="1"
+          placeholder="Ask Gemma… snap 📸 or record 🎙 to add live context"
+          onkeydown="keyDown(event)"
+          oninput="autoResize(this)"></textarea>
+
+        <!-- Send -->
+        <button class="send-tb" id="send-btn" onclick="sendMessage()" title="Send (Enter)">▶</button>
+      </div>
+
+      <!-- Hint chips -->
+      <div style="display:flex;gap:5px;flex-wrap:wrap">
+        <span style="font-size:.7rem;color:var(--text2);padding-top:3px">Try:</span>
+        <span class="pill" style="cursor:pointer" onclick="hint('What do you see?')">What do you see?</span>
+        <span class="pill" style="cursor:pointer" onclick="hint('Transcribe what I said.')">Transcribe</span>
+        <span class="pill" style="cursor:pointer" onclick="hint('Describe the scene and what I said.')">Describe scene + speech</span>
+        <span class="pill" style="cursor:pointer" onclick="hint('What objects are visible?')">Objects</span>
+        <span class="pill" style="cursor:pointer" onclick="hint('Translate what I just said into French.')">Translate</span>
+      </div>
+    </div>
+  </div><!-- /chat-col -->
+
+</div><!-- /body -->
+
+<div class="toast" id="toast"></div>
+
+<script>
+'use strict';
+
+// ── Config ───────────────────────────────────────────────────────────────────
+const API   = 'http://localhost:8080';
+const MODEL = 'google/gemma-4-E2B-it';
+
+// ── Theme ────────────────────────────────────────────────────────────────────
+function toggleTheme() {
+  const t = document.documentElement.dataset.theme === 'light' ? '' : 'light';
+  document.documentElement.dataset.theme = t;
+  localStorage.setItem('theme', t);
+}
+document.documentElement.dataset.theme = localStorage.getItem('theme') || '';
+
+// ── Server status ─────────────────────────────────────────────────────────────
+async function checkStatus() {
+  try {
+    const r = await fetch(`${API}/health`, { signal: AbortSignal.timeout(3000) });
+    ok(r.ok);
+  } catch { ok(false); }
+}
+function ok(v) {
+  document.getElementById('status-dot').className = 'dot' + (v ? ' ok' : '');
+  document.getElementById('status-text').textContent = v ? 'Connected' : 'Not connected';
+}
+checkStatus(); setInterval(checkStatus, 8000);
+
+// ── Toast ─────────────────────────────────────────────────────────────────────
+let _tt = null;
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg; el.classList.add('show');
+  clearTimeout(_tt); _tt = setTimeout(() => el.classList.remove('show'), 4000);
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 140) + 'px';
+}
+function scrollBottom() {
+  const m = document.getElementById('messages');
+  requestAnimationFrame(() => { m.scrollTop = m.scrollHeight; });
+}
+function hint(t) {
+  const ta = document.getElementById('msg-input');
+  ta.value = t; autoResize(ta); ta.focus();
+}
+
+// ── WEBCAM ────────────────────────────────────────────────────────────────────
+let camStream = null;
+let autoSnapTimer = null;
+let autoSnapOn = false;
+
+async function toggleCam() {
+  if (camStream) { stopCam(); return; }
+  try {
+    camStream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' }
+    });
+    const vid = document.getElementById('webcam');
+    vid.srcObject = camStream;
+    await vid.play();
+    document.getElementById('cam-off').style.display = 'none';
+    document.getElementById('cam-live-dot').classList.add('on');
+    document.getElementById('cam-toggle-btn').textContent = 'Stop Camera';
+    document.getElementById('snap-btn').disabled = false;
+    document.getElementById('tb-cam').classList.add('on-cam');
+  } catch (e) { toast('Camera access denied: ' + e.message); }
+}
+
+function stopCam() {
+  camStream?.getTracks().forEach(t => t.stop());
+  camStream = null;
+  document.getElementById('webcam').srcObject = null;
+  document.getElementById('cam-off').style.display = '';
+  document.getElementById('cam-live-dot').classList.remove('on');
+  document.getElementById('cam-toggle-btn').textContent = 'Start Camera';
+  document.getElementById('snap-btn').disabled = true;
+  document.getElementById('tb-cam').classList.remove('on-cam');
+  if (autoSnapOn) toggleAutoSnap();
+}
+
+// Capture current frame → data URL (JPEG)
+function captureFrame() {
+  const vid = document.getElementById('webcam');
+  if (!camStream || vid.videoWidth === 0) return null;
+  const canvas = document.getElementById('canvas-snap');
+  canvas.width  = vid.videoWidth;
+  canvas.height = vid.videoHeight;
+  const ctx = canvas.getContext('2d');
+  // mirror to match the CSS transform
+  ctx.translate(canvas.width, 0);
+  ctx.scale(-1, 1);
+  ctx.drawImage(vid, 0, 0);
+  return canvas.toDataURL('image/jpeg', 0.85);
+}
+
+// Flash feedback
+function flashCam() {
+  const f = document.getElementById('cam-flash');
+  f.classList.add('snap');
+  setTimeout(() => f.classList.remove('snap'), 180);
+}
+
+// Snap frame and return it (for attaching to a message)
+function snapFrame() {
+  const url = captureFrame();
+  if (!url) { toast('Camera not active.'); return null; }
+  flashCam();
+  return url;
+}
+
+// Snap into the composer pending image
+function snapAndAttach() {
+  const url = captureFrame();
+  if (!url) { toast('Start the camera first (left panel).'); return; }
+  flashCam();
+  pendingImg = { dataUrl: url, name: 'webcam.jpg' };
+  refreshPending();
+}
+
+// Auto-snap: periodically replace pendingImg with a fresh frame
+function toggleAutoSnap() {
+  if (!camStream) { toast('Start the camera first.'); return; }
+  autoSnapOn = !autoSnapOn;
+  const btn = document.getElementById('auto-snap-btn');
+  if (autoSnapOn) {
+    const interval = parseInt(document.getElementById('s-snap-interval').value) * 1000;
+    autoSnapTimer = setInterval(() => {
+      const url = captureFrame();
+      if (url) {
+        pendingImg = { dataUrl: url, name: 'webcam-auto.jpg' };
+        refreshPending();
+        flashCam();
+      }
+    }, interval);
+    btn.textContent = '⏱ Auto-snap: on';
+    btn.classList.remove('ghost'); btn.style.color = 'var(--blue)';
+  } else {
+    clearInterval(autoSnapTimer); autoSnapTimer = null;
+    btn.textContent = '⏱ Auto-snap: off';
+    btn.classList.add('ghost'); btn.style.color = '';
+  }
+}
+
+// ── MICROPHONE ────────────────────────────────────────────────────────────────
+let micStream     = null;
+let micAudioCtx   = null;
+let micAnalyser   = null;
+let micVizRaf     = null;
+let micSource     = null;
+
+let recAudioCtx   = null; // separate context for PCM capture
+let recProcessor  = null;
+let recSource2    = null;
+let recChunks     = [];
+let isRecording   = false;
+let recSeconds    = 0;
+let recTimer      = null;
+let isPtt         = false; // push-to-talk mode
+
+async function toggleMic() {
+  if (micStream) { stopMic(); return; }
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // Visualiser
+    micAudioCtx = new AudioContext();
+    micSource   = micAudioCtx.createMediaStreamSource(micStream);
+    micAnalyser = micAudioCtx.createAnalyser();
+    micAnalyser.fftSize = 64;
+    micSource.connect(micAnalyser);
+    startViz();
+
+    document.getElementById('mic-live-dot').classList.add('on');
+    document.getElementById('mic-toggle-btn').textContent = 'Stop Mic';
+    document.getElementById('rec-btn').disabled = false;
+    document.getElementById('ptt-btn').disabled = false;
+    document.getElementById('tb-mic').classList.add('on-mic');
+    document.getElementById('rec-status').textContent = 'Mic on — ready';
+  } catch (e) { toast('Mic access denied: ' + e.message); }
+}
+
+function stopMic() {
+  if (isRecording) stopRecord();
+  micVizRaf && cancelAnimationFrame(micVizRaf); micVizRaf = null;
+  micAnalyser = null;
+  micSource?.disconnect();
+  micAudioCtx?.close(); micAudioCtx = null;
+  micStream?.getTracks().forEach(t => t.stop()); micStream = null;
+  document.getElementById('mic-live-dot').classList.remove('on');
+  document.getElementById('mic-toggle-btn').textContent = 'Start Mic';
+  document.getElementById('rec-btn').disabled = true;
+  document.getElementById('ptt-btn').disabled = true;
+  document.getElementById('tb-mic').classList.remove('on-mic');
+  document.getElementById('rec-status').textContent = 'Mic off';
+  // Reset bar heights
+  document.querySelectorAll('.mic-bar').forEach(b => b.style.height = '4px');
+  document.getElementById('mic-db').textContent = '— dB';
+}
+
+function startViz() {
+  const bars = document.querySelectorAll('.mic-bar');
+  const data = new Uint8Array(micAnalyser.frequencyBinCount);
+  function frame() {
+    if (!micAnalyser) return;
+    micAnalyser.getByteFrequencyData(data);
+    const step = Math.floor(data.length / bars.length);
+    for (let i = 0; i < bars.length; i++) {
+      const v = data[i * step] / 255;
+      bars[i].style.height = (3 + v * 17) + 'px';
+      bars[i].style.opacity = 0.4 + v * 0.6;
+    }
+    // dB estimate
+    const rms = Math.sqrt(data.reduce((s,v)=>s+v*v,0)/data.length);
+    const db  = rms > 0 ? (20 * Math.log10(rms / 255)).toFixed(0) : '—';
+    document.getElementById('mic-db').textContent = db + ' dB';
+    micVizRaf = requestAnimationFrame(frame);
+  }
+  frame();
+}
+
+function toggleRecord() {
+  if (!micStream) { toast('Start the mic first (left panel).'); return; }
+  if (isRecording) stopRecord(); else startRecord();
+}
+
+function startRecord() {
+  if (isRecording) return;
+  // Use a fresh AudioContext to capture PCM from the mic stream
+  recAudioCtx  = new AudioContext({ sampleRate: 16000 });
+  recSource2   = recAudioCtx.createMediaStreamSource(micStream);
+  recProcessor = recAudioCtx.createScriptProcessor(4096, 1, 1);
+  recChunks    = [];
+  recProcessor.onaudioprocess = e => {
+    recChunks.push(new Float32Array(e.inputBuffer.getChannelData(0)));
+  };
+  recSource2.connect(recProcessor);
+  recProcessor.connect(recAudioCtx.destination);
+
+  isRecording = true; recSeconds = 0;
+  document.getElementById('rec-btn').textContent    = '■ Stop';
+  document.getElementById('tb-mic').className       = 'tb rec-mic';
+  document.getElementById('tb-mic').textContent     = '⏹';
+  recTimer = setInterval(() => {
+    recSeconds++;
+    document.getElementById('rec-status').textContent =
+      `Recording ${String(Math.floor(recSeconds/60)).padStart(2,'0')}:${String(recSeconds%60).padStart(2,'0')} — click to stop`;
+    if (recSeconds >= 30) stopRecord();
+  }, 1000);
+  document.getElementById('rec-status').textContent = 'Recording… click to stop';
+}
+
+function stopRecord() {
+  if (!isRecording) return;
+  clearInterval(recTimer);
+  recProcessor?.disconnect(); recSource2?.disconnect();
+  isRecording = false;
+
+  const totalLen = recChunks.reduce((s,c)=>s+c.length,0);
+  const pcm = new Float32Array(totalLen);
+  let off = 0;
+  for (const c of recChunks) { pcm.set(c,off); off+=c.length; }
+  recAudioCtx?.close(); recAudioCtx = null;
+
+  const blob = encodeWav(pcm, 16000);
+  const objUrl = URL.createObjectURL(blob);
+  pendingAud = { blob, durationSec: recSeconds, objUrl };
+
+  document.getElementById('rec-btn').textContent    = '● Record';
+  document.getElementById('tb-mic').className       = 'tb has-aud';
+  document.getElementById('tb-mic').textContent     = '🎙';
+  document.getElementById('rec-status').textContent =
+    `Recorded ${recSeconds}s — attached to next message`;
+  refreshPending();
+}
+
+// Push-to-talk
+async function pttStart() {
+  if (!micStream) { toast('Start the mic first.'); return; }
+  isPtt = true;
+  startRecord();
+  document.getElementById('ptt-btn').style.background =
+    'color-mix(in srgb,var(--yellow) 25%,transparent)';
+}
+function pttStop() {
+  if (!isPtt) return;
+  isPtt = false;
+  stopRecord();
+  document.getElementById('ptt-btn').style.background = '';
+}
+
+function encodeWav(pcm, sr) {
+  const n=pcm.length, buf=new ArrayBuffer(44+n*2), v=new DataView(buf);
+  const w=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));};
+  w(0,'RIFF'); v.setUint32(4,36+n*2,true);
+  w(8,'WAVEfmt '); v.setUint32(16,16,true);
+  v.setUint16(20,1,true); v.setUint16(22,1,true);
+  v.setUint32(24,sr,true); v.setUint32(28,sr*2,true);
+  v.setUint16(32,2,true); v.setUint16(34,16,true);
+  w(36,'data'); v.setUint32(40,n*2,true);
+  for(let i=0;i<n;i++) v.setInt16(44+i*2,Math.max(-1,Math.min(1,pcm[i]))*0x7FFF,true);
+  return new Blob([buf],{type:'audio/wav'});
+}
+
+// ── Pending attachments ───────────────────────────────────────────────────────
+let pendingImg = null; // { dataUrl, name }
+let pendingAud = null; // { blob, durationSec, objUrl }
+
+function refreshPending() {
+  const row = document.getElementById('pending-row');
+  row.innerHTML = '';
+
+  if (pendingImg) {
+    const chip = document.createElement('div');
+    chip.className = 'pending-chip';
+    chip.innerHTML = `
+      <img src="${pendingImg.dataUrl}" alt="">
+      <span>${pendingImg.name}</span>
+      <button class="pchip-remove" onclick="removePendingImg()">✕</button>`;
+    row.appendChild(chip);
+  }
+
+  if (pendingAud) {
+    const chip = document.createElement('div');
+    chip.className = 'pending-chip';
+    chip.innerHTML = `
+      <span>🎙 ${pendingAud.durationSec}s audio</span>
+      <audio src="${pendingAud.objUrl}" controls style="height:22px;width:130px"></audio>
+      <button class="pchip-remove" onclick="removePendingAud()">✕</button>`;
+    row.appendChild(chip);
+  }
+
+  row.style.display = (pendingImg || pendingAud) ? 'flex' : 'none';
+
+  // Update toolbar button states
+  const tbCam = document.getElementById('tb-cam');
+  tbCam.className = 'tb' + (pendingImg ? ' has-img' : (camStream ? ' on-cam' : ''));
+  tbCam.title = pendingImg ? 'Frame attached — click to replace' : 'Snap current webcam frame';
+
+  const tbMic = document.getElementById('tb-mic');
+  if (!isRecording) {
+    tbMic.className = 'tb' + (pendingAud ? ' has-aud' : (micStream ? ' on-mic' : ''));
+    tbMic.textContent = '🎙';
+  }
+}
+
+function removePendingImg() { pendingImg = null; refreshPending(); }
+function removePendingAud() {
+  if (pendingAud) URL.revokeObjectURL(pendingAud.objUrl);
+  pendingAud = null;
+  document.getElementById('tb-mic').className = 'tb' + (micStream ? ' on-mic' : '');
+  refreshPending();
+}
+
+// ── Chat ──────────────────────────────────────────────────────────────────────
+let history   = []; // [{role, content}] text-only for multi-turn
+let streaming = false;
+
+function clearChat() {
+  history = [];
+  document.getElementById('messages').innerHTML =
+    `<div class="empty-state" id="empty-state">
+      <div class="empty-icon">✦</div>
+      <div class="empty-title">Gemma 4 E2B — Live</div>
+      <div class="empty-sub">Start your camera and mic, then send a message.<br>Gemma sees your webcam and hears your voice in real time.</div>
+      <div class="pills">
+        <span class="pill">📸 Live snapshots</span>
+        <span class="pill">🎙 Voice recording</span>
+        <span class="pill">💬 Text chat</span>
+        <span class="pill">🧠 Multi-turn</span>
+      </div>
+    </div>`;
+}
+
+function renderUserMsg(text, imgDataUrl, audDur, audObjUrl) {
+  document.getElementById('empty-state')?.remove();
+  const msgs = document.getElementById('messages');
+  const row  = document.createElement('div');
+  row.className = 'msg-row user';
+
+  const tags = [];
+  if (imgDataUrl) tags.push('<span class="mpill v">📸 Vision</span>');
+  if (audObjUrl)  tags.push('<span class="mpill a">🎙 Audio</span>');
+  if (text)       tags.push('<span class="mpill t">💬 Text</span>');
+
+  row.innerHTML = `
+    <div class="msg-meta" style="justify-content:flex-end">
+      <div class="mod-pills">${tags.join('')}</div>
+      <span>You</span>
+    </div>
+    <div class="msg-bubble" id="ub-${Date.now()}"></div>`;
+
+  const bubble = row.querySelector('.msg-bubble');
+  if (imgDataUrl) {
+    const img = document.createElement('img');
+    img.src = imgDataUrl; img.className = 'bubble-img';
+    bubble.appendChild(img);
+  }
+  if (audObjUrl) {
+    const aud = document.createElement('audio');
+    aud.src = audObjUrl; aud.controls = true; aud.className = 'bubble-audio';
+    bubble.appendChild(aud);
+  }
+  if (text) {
+    const s = document.createElement('span');
+    s.textContent = text;
+    bubble.appendChild(s);
+  }
+  msgs.appendChild(row);
+  scrollBottom();
+}
+
+function addTyping() {
+  document.getElementById('empty-state')?.remove();
+  const msgs = document.getElementById('messages');
+  const row  = document.createElement('div');
+  row.className = 'msg-row model'; row.id = 'typing';
+  row.innerHTML = `<div class="msg-meta">Gemma 4</div><div class="msg-bubble"><div class="typing"><span></span><span></span><span></span></div></div>`;
+  msgs.appendChild(row);
+  scrollBottom();
+}
+function removeTyping() { document.getElementById('typing')?.remove(); }
+
+function newModelBubble() {
+  document.getElementById('empty-state')?.remove();
+  const msgs = document.getElementById('messages');
+  const row  = document.createElement('div');
+  row.className = 'msg-row model';
+  row.innerHTML = `<div class="msg-meta">Gemma 4</div><div class="msg-bubble"></div>`;
+  msgs.appendChild(row);
+  scrollBottom();
+  return row.querySelector('.msg-bubble');
+}
+
+function newThinkBubble() {
+  const msgs = document.getElementById('messages');
+  const row  = document.createElement('div');
+  row.className = 'msg-row think-row';
+  row.innerHTML = `<div class="msg-meta" style="font-style:italic;opacity:.7">Gemma 4 · thinking</div><div class="think-bubble"></div>`;
+  msgs.appendChild(row);
+  scrollBottom();
+  return row.querySelector('.think-bubble');
+}
+
+// ── SSE streaming ──────────────────────────────────────────────────────────────
+async function* stream(messages) {
+  const temp = parseFloat(document.getElementById('s-temp').value);
+  const maxt = parseInt(document.getElementById('s-max-tokens').value);
+  const resp = await fetch(`${API}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: MODEL, messages, temperature: temp, max_tokens: maxt, stream: true })
+  });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}: ${await resp.text()}`);
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const lines = buf.split('\n'); buf = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith('data:')) continue;
+      const d = line.slice(5).trim();
+      if (d === '[DONE]') return;
+      try { const delta = JSON.parse(d).choices?.[0]?.delta; if (delta) yield delta; } catch {}
+    }
+  }
+}
+
+// ── Build API message ─────────────────────────────────────────────────────────
+async function buildApiMsg(text, imgDataUrl, audBlob) {
+  const msg = { role: 'user' };
+  if (imgDataUrl && !audBlob) {
+    const parts = [{ type: 'image_url', image_url: { url: imgDataUrl } }];
+    if (text) parts.push({ type: 'text', text });
+    msg.content = parts;
+  } else if (audBlob && !imgDataUrl) {
+    msg.content = text || '';
+    msg.audio   = { data: await blobB64(audBlob), format: 'wav' };
+  } else if (imgDataUrl && audBlob) {
+    // Both: image in content array, audio at top-level
+    const parts = [{ type: 'image_url', image_url: { url: imgDataUrl } }];
+    if (text) parts.push({ type: 'text', text });
+    msg.content = parts;
+    msg.audio   = { data: await blobB64(audBlob), format: 'wav' };
+  } else {
+    msg.content = text;
+  }
+  return msg;
+}
+
+async function blobB64(blob) {
+  const arr = new Uint8Array(await blob.arrayBuffer());
+  let s = '';
+  for (let i = 0; i < arr.length; i += 32768)
+    s += String.fromCharCode(...arr.subarray(i, i + 32768));
+  return btoa(s);
+}
+
+// ── Send ───────────────────────────────────────────────────────────────────────
+function keyDown(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+}
+
+async function sendMessage() {
+  if (streaming) return;
+
+  const ta   = document.getElementById('msg-input');
+  const text = ta.value.trim();
+  if (!text && !pendingImg && !pendingAud) {
+    toast('Add a message, snap a frame 📸, or record audio 🎙');
+    return;
+  }
+
+  // If auto-snap is on and cam is live, grab latest frame right before sending
+  if (autoSnapOn && camStream && !pendingImg) {
+    const url = captureFrame();
+    if (url) { pendingImg = { dataUrl: url, name: 'webcam-auto.jpg' }; flashCam(); }
+  }
+
+  // Snapshot pending state
+  const img  = pendingImg;
+  const aud  = pendingAud;
+
+  // Clear composer
+  ta.value = ''; ta.style.height = 'auto';
+  pendingImg = null; pendingAud = null;
+  refreshPending();
+
+  // Render user bubble
+  renderUserMsg(text, img?.dataUrl, aud?.durationSec, aud?.objUrl);
+
+  // Build API message (may do async base64 encoding)
+  const apiMsg = await buildApiMsg(text, img?.dataUrl, aud?.blob);
+
+  // Text-only history entry (no base64 resending)
+  const hEntry = {
+    role: 'user',
+    content: text || (img ? '[image]' : '') + (aud ? '[audio]' : '')
+  };
+  history.push(hEntry);
+
+  // Full API messages: prior history (text-only) + current rich message
+  const apiMessages = [...history.slice(0, -1), apiMsg];
+
+  // Stream response
+  streaming = true;
+  document.getElementById('send-btn').disabled = true;
+  addTyping();
+
+  let contentBubble = null, thinkBubble = null;
+  let contentText = '', thinkText = '';
+  try {
+    for await (const delta of stream(apiMessages)) {
+      if (delta.reasoning_content) {
+        if (!thinkBubble) { removeTyping(); thinkBubble = newThinkBubble(); }
+        thinkText += delta.reasoning_content;
+        thinkBubble.textContent = thinkText;
+        scrollBottom();
+      }
+      if (delta.content) {
+        if (!contentBubble) { removeTyping(); contentBubble = newModelBubble(); }
+        contentText += delta.content;
+        contentBubble.textContent = contentText;
+        scrollBottom();
+      }
+    }
+    history.push({ role: 'assistant', content: contentText });
+  } catch (e) {
+    removeTyping();
+    toast('Request failed: ' + e.message);
+    history.pop();
+  } finally {
+    streaming = false;
+    document.getElementById('send-btn').disabled = false;
+  }
+}
+</script>
+</body>
+</html>

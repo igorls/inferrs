@@ -9,20 +9,14 @@
 
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, Module, Tensor};
-use candle_nn::{embedding, linear_no_bias, Embedding, Init, Linear, RmsNorm, VarBuilder};
+use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder};
 
 use crate::kv_cache::{BlockTable, PagedKvStore};
 use crate::models::attention_utils::{
-    append_kv_tq, apply_output_gate, apply_rms_norm_heads, apply_rope, causal_mask, compute_logits,
-    paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx, PagedPassCache,
+    apply_output_gate, apply_rms_norm_heads, apply_rope, causal_mask, compute_logits,
+    concat_kv_cache, paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx,
+    PagedPassCache,
 };
-use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
-
-fn rms_norm_with_offset(size: usize, eps: f64, vb: VarBuilder, offset: f64) -> Result<RmsNorm> {
-    let weight = vb.get_with_hints(size, "weight", Init::Const(0.0))?;
-    let adjusted = weight.affine(1.0, offset)?;
-    Ok(RmsNorm::new(adjusted, eps))
-}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -58,7 +52,6 @@ pub struct Qwen35Config {
     pub tie_word_embeddings: bool,
     pub dtype: DType,
     pub device: Device,
-    pub turbo_quant_bits: Option<u8>,
 }
 
 // ---------------------------------------------------------------------------
@@ -81,11 +74,10 @@ struct FullAttention {
     head_dim: usize,
     // KV cache: Option<(k_cache, v_cache)> accumulated across calls
     kv_cache: Option<(Tensor, Tensor)>,
-    tq_cache: Option<TurboQuantKvCache>,
 }
 
 impl FullAttention {
-    fn new(cfg: &Qwen35Config, vb: VarBuilder, tq_cfg: Option<&TurboQuantConfig>) -> Result<Self> {
+    fn new(cfg: &Qwen35Config, vb: VarBuilder) -> Result<Self> {
         // q_proj outputs num_heads * head_dim * 2: first half is query, second half is the
         // output gate (attn_output_gate). The o_proj then takes num_heads * head_dim.
         let q_proj_out = cfg.num_attention_heads * cfg.head_dim * 2;
@@ -96,12 +88,8 @@ impl FullAttention {
         let k_proj = linear_no_bias(cfg.hidden_size, kv_out, vb.pp("k_proj"))?;
         let v_proj = linear_no_bias(cfg.hidden_size, kv_out, vb.pp("v_proj"))?;
         let o_proj = linear_no_bias(attn_out, cfg.hidden_size, vb.pp("o_proj"))?;
-        let q_norm = rms_norm_with_offset(cfg.head_dim, cfg.rms_norm_eps, vb.pp("q_norm"), 1.0)?;
-        let k_norm = rms_norm_with_offset(cfg.head_dim, cfg.rms_norm_eps, vb.pp("k_norm"), 1.0)?;
-
-        let tq_cache = tq_cfg.map(|c| {
-            TurboQuantKvCache::new(c, cfg.num_key_value_heads, cfg.dtype, cfg.device.clone())
-        });
+        let q_norm = rms_norm(cfg.head_dim, cfg.rms_norm_eps, vb.pp("q_norm"))?;
+        let k_norm = rms_norm(cfg.head_dim, cfg.rms_norm_eps, vb.pp("k_norm"))?;
 
         Ok(Self {
             q_proj,
@@ -114,7 +102,6 @@ impl FullAttention {
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
             kv_cache: None,
-            tq_cache,
         })
     }
 
@@ -163,15 +150,8 @@ impl FullAttention {
         let q = apply_rope(&q, &cos_slice, &sin_slice)?;
         let k = apply_rope(&k, &cos_slice, &sin_slice)?;
 
-        // Append to KV cache (with optional TurboQuant compression).
-        let (k, v) = append_kv_tq(
-            k,
-            v,
-            seqlen_offset,
-            t,
-            &mut self.kv_cache,
-            &mut self.tq_cache,
-        )?;
+        // Append to KV cache
+        let (k, v) = concat_kv_cache(k, v, &mut self.kv_cache)?;
 
         let kv_len = k.dim(2)?;
 
@@ -213,9 +193,6 @@ impl FullAttention {
 
     fn clear_kv_cache(&mut self) {
         self.kv_cache = None;
-        if let Some(tq) = &mut self.tq_cache {
-            tq.clear();
-        }
     }
 
     /// Paged-attention forward pass.
@@ -657,7 +634,7 @@ fn rms_norm_tensor(x: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
 // ---------------------------------------------------------------------------
 
 enum LayerAttn {
-    Full(Box<FullAttention>),
+    Full(FullAttention),
     Linear(LinearAttn),
 }
 
@@ -669,35 +646,20 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(
-        cfg: &Qwen35Config,
-        vb: VarBuilder,
-        is_full_attention: bool,
-        tq_cfg: Option<&TurboQuantConfig>,
-    ) -> Result<Self> {
+    fn new(cfg: &Qwen35Config, vb: VarBuilder, is_full_attention: bool) -> Result<Self> {
         let attn = if is_full_attention {
-            LayerAttn::Full(Box::new(FullAttention::new(
-                cfg,
-                vb.pp("self_attn"),
-                tq_cfg,
-            )?))
+            LayerAttn::Full(FullAttention::new(cfg, vb.pp("self_attn"))?)
         } else {
             LayerAttn::Linear(LinearAttn::new(cfg, vb.pp("linear_attn"))?)
         };
         Ok(Self {
             attn,
             mlp: Mlp::new(cfg.hidden_size, cfg.intermediate_size, vb.pp("mlp"))?,
-            input_layernorm: rms_norm_with_offset(
-                cfg.hidden_size,
-                cfg.rms_norm_eps,
-                vb.pp("input_layernorm"),
-                1.0,
-            )?,
-            post_attention_layernorm: rms_norm_with_offset(
+            input_layernorm: rms_norm(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?,
+            post_attention_layernorm: rms_norm(
                 cfg.hidden_size,
                 cfg.rms_norm_eps,
                 vb.pp("post_attention_layernorm"),
-                1.0,
             )?,
         })
     }
@@ -784,24 +746,15 @@ impl Qwen35Model {
 
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, lm_vb.pp("embed_tokens"))?;
 
-        let tq_cfg: Option<TurboQuantConfig> = cfg.turbo_quant_bits.map(|bits| {
-            tracing::info!("TurboQuant KV cache enabled: {bits} bits/coord, absmax quantization");
-            TurboQuantConfig {
-                bits,
-                head_dim: cfg.head_dim,
-            }
-        });
-
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for (i, layer_type) in cfg.layer_types.iter().enumerate() {
             let layer_vb = lm_vb.pp("layers").pp(i.to_string());
-            let layer =
-                DecoderLayer::new(cfg, layer_vb, layer_type.is_full_attention, tq_cfg.as_ref())
-                    .with_context(|| format!("loading layer {i}"))?;
+            let layer = DecoderLayer::new(cfg, layer_vb, layer_type.is_full_attention)
+                .with_context(|| format!("loading layer {i}"))?;
             layers.push(layer);
         }
 
-        let norm = rms_norm_with_offset(cfg.hidden_size, cfg.rms_norm_eps, lm_vb.pp("norm"), 1.0)?;
+        let norm = rms_norm(cfg.hidden_size, cfg.rms_norm_eps, lm_vb.pp("norm"))?;
 
         // Tied weights: lm_head = embed_tokens.weight transposed
         let lm_head_weight = embed_tokens.embeddings().clone();

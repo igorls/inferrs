@@ -55,12 +55,25 @@ fn default_audio_format() -> String {
     "wav".to_string()
 }
 
+/// Image attachment extracted from an OpenAI vision `image_url` content part.
+///
+/// `url` may be a `data:image/...;base64,...` data URL or an HTTP URL.
+#[derive(Debug, Clone, serde::Serialize, Deserialize)]
+pub struct ImageInput {
+    pub url: String,
+}
+
+/// Image URL sub-object inside an `image_url` content part.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ImageUrlDetail {
+    pub url: String,
+}
+
 /// A single content part inside an OpenAI structured content array.
 ///
 /// OpenAI clients may send `messages[].content` as either a plain string or an
-/// array of content-part objects.  This type covers the text-part case; other
-/// part types (image_url, etc.) are accepted and silently ignored so that
-/// clients do not receive a deserialization error.
+/// array of content-part objects.  This type covers the text-part and
+/// image_url-part cases; other part types are silently ignored.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContentPart {
     /// Content part type — `"text"`, `"image_url"`, etc.
@@ -69,6 +82,9 @@ pub struct ContentPart {
     /// Text payload, present only when `type == "text"`.
     #[serde(default)]
     pub text: Option<String>,
+    /// Image URL, present only when `type == "image_url"`.
+    #[serde(default)]
+    pub image_url: Option<ImageUrlDetail>,
 }
 
 /// The `content` field of a chat message.
@@ -79,11 +95,15 @@ pub struct ContentPart {
 /// - JSON `null` (assistant messages that carry only `tool_calls` have no text
 ///   content and set `content` to `null`).
 ///
-/// All forms are accepted and normalised to a plain `String`.  Null content
-/// becomes an empty string.  Only `"text"` parts contribute to the string;
-/// all other part types (e.g. `"image_url"`, `"tool_use"`) are ignored.
+/// All forms are accepted and normalised.  Null content becomes an empty string.
+/// `"text"` parts contribute to the text string; `"image_url"` parts are
+/// collected into the `images` vector; all other part types are silently ignored.
 #[derive(Debug, Clone, Default)]
-pub struct MessageContent(pub String);
+pub struct MessageContent {
+    pub text: String,
+    /// Image URLs extracted from `image_url` content parts.
+    pub images: Vec<ImageInput>,
+}
 
 impl<'de> Deserialize<'de> for MessageContent {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -101,11 +121,11 @@ impl<'de> Deserialize<'de> for MessageContent {
 
             /// `null` content — assistant messages with tool_calls carry no text.
             fn visit_unit<E: de::Error>(self) -> Result<MessageContent, E> {
-                Ok(MessageContent(String::new()))
+                Ok(MessageContent::default())
             }
 
             fn visit_none<E: de::Error>(self) -> Result<MessageContent, E> {
-                Ok(MessageContent(String::new()))
+                Ok(MessageContent::default())
             }
 
             fn visit_some<D2: serde::Deserializer<'de>>(
@@ -116,11 +136,17 @@ impl<'de> Deserialize<'de> for MessageContent {
             }
 
             fn visit_str<E: de::Error>(self, v: &str) -> Result<MessageContent, E> {
-                Ok(MessageContent(v.to_owned()))
+                Ok(MessageContent {
+                    text: v.to_owned(),
+                    images: Vec::new(),
+                })
             }
 
             fn visit_string<E: de::Error>(self, v: String) -> Result<MessageContent, E> {
-                Ok(MessageContent(v))
+                Ok(MessageContent {
+                    text: v,
+                    images: Vec::new(),
+                })
             }
 
             fn visit_seq<A: de::SeqAccess<'de>>(
@@ -128,15 +154,24 @@ impl<'de> Deserialize<'de> for MessageContent {
                 mut seq: A,
             ) -> Result<MessageContent, A::Error> {
                 let mut text = String::new();
+                let mut images: Vec<ImageInput> = Vec::new();
                 while let Some(part) = seq.next_element::<ContentPart>()? {
-                    if part.part_type == "text" {
-                        if let Some(t) = part.text {
-                            text.push_str(&t);
+                    match part.part_type.as_str() {
+                        "text" => {
+                            if let Some(t) = part.text {
+                                text.push_str(&t);
+                            }
                         }
+                        "image_url" => {
+                            if let Some(detail) = part.image_url {
+                                images.push(ImageInput { url: detail.url });
+                            }
+                        }
+                        // Non-text/image parts (tool_use, etc.) are silently ignored.
+                        _ => {}
                     }
-                    // Non-text parts (image_url, tool_use, etc.) are silently ignored.
                 }
-                Ok(MessageContent(text))
+                Ok(MessageContent { text, images })
             }
         }
 
@@ -146,13 +181,13 @@ impl<'de> Deserialize<'de> for MessageContent {
 
 impl serde::Serialize for MessageContent {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.0)
+        serializer.serialize_str(&self.text)
     }
 }
 
 impl std::fmt::Display for MessageContent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.text)
     }
 }
 
@@ -160,30 +195,34 @@ impl std::ops::Deref for MessageContent {
     type Target = str;
 
     fn deref(&self) -> &str {
-        &self.0
+        &self.text
     }
 }
 
 impl MessageContent {
-    /// Return the inner string content.
+    /// Return the text content.
     #[allow(dead_code)]
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.text
     }
 
     /// Construct from a plain string (for tests and internal use).
     pub fn from_string(s: impl Into<String>) -> Self {
-        MessageContent(s.into())
+        MessageContent {
+            text: s.into(),
+            images: Vec::new(),
+        }
     }
 }
 
-/// A chat message (text + optional audio attachment).
+/// A chat message (text + optional audio or image attachments).
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
     /// Message content — accepts a plain string, an OpenAI structured
     /// content-part array (`[{"type":"text","text":"…"},…]`), or JSON `null`
     /// (which arises in assistant messages that carry only `tool_calls`).
+    /// Image URLs from `image_url` content parts are captured in `content.images`.
     #[serde(default)]
     pub content: MessageContent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -445,7 +484,7 @@ fn normalize_messages<'a>(
             // invocation turns that contain only a `tool_calls` JSON payload.
             // They add no useful text context for a local inference backend.
             if (role == "model" || role == "assistant")
-                && msg.content.0.is_empty()
+                && msg.content.text.is_empty()
                 && msg.tool_calls.is_some()
             {
                 return None;
@@ -457,7 +496,7 @@ fn normalize_messages<'a>(
     // Step 2: merge consecutive turns that share the same rendered role.
     let mut result: Vec<(&'static str, String)> = Vec::new();
     for (role, msg) in mapped {
-        let content = msg.content.0.clone();
+        let content = msg.content.text.clone();
         if let Some(last) = result.last_mut() {
             if last.0 == role {
                 // Append to the previous turn rather than emitting a new one.
@@ -542,7 +581,7 @@ fn apply_gemma3(messages: &[ChatMessage]) -> String {
 /// Format: `<bos>\n<|turn>role\ncontent<turn|>\n`
 /// The assistant turn uses "model" as the role label.
 fn apply_gemma4(messages: &[ChatMessage]) -> String {
-    apply_gemma4_inner(messages, &[])
+    apply_gemma4_inner(messages, &[], &[])
 }
 
 /// Gemma4 template with audio soft-token placeholders.
@@ -552,23 +591,41 @@ fn apply_gemma4(messages: &[ChatMessage]) -> String {
 /// `audio_token_counts[i]` is the number of soft tokens for the i-th audio
 /// message (in encounter order across all messages).
 pub fn apply_gemma4_with_audio(messages: &[ChatMessage], audio_token_counts: &[usize]) -> String {
-    apply_gemma4_inner(messages, audio_token_counts)
+    apply_gemma4_inner(messages, audio_token_counts, &[])
 }
 
-fn apply_gemma4_inner(messages: &[ChatMessage], audio_token_counts: &[usize]) -> String {
+/// Gemma4 template with image soft-token placeholders.
+///
+/// For each image in each message's `content.images`, one entry in
+/// `image_token_counts` gives the number of soft tokens to insert.
+/// Images are processed in encounter order across all messages.
+///
+/// Token strings from the Gemma4 tokenizer:
+///   `<|image>`   = begin-of-image (id 255999)
+///   `<|image|>`  = image soft token (id 258880), repeated N times
+///   `<image|>`   = end-of-image   (id 258882)
+pub fn apply_gemma4_with_images(messages: &[ChatMessage], image_token_counts: &[usize]) -> String {
+    apply_gemma4_inner(messages, &[], image_token_counts)
+}
+
+fn apply_gemma4_inner(
+    messages: &[ChatMessage],
+    audio_token_counts: &[usize],
+    image_token_counts: &[usize],
+) -> String {
     // Reference format (from AutoProcessor.apply_chat_template):
     //   <bos><|turn>user\n<|audio><|audio|>×N<audio|>text<turn|>\n<|turn>model\n
-    // No \n after <bos>, no \n between <audio|> and text.
+    //   <bos><|turn>user\n<|image><|image|>×N<image|>text<turn|>\n<|turn>model\n
+    // No \n after <bos>, no \n between </audio|>/<image|> and text.
     //
-    // Audio-bearing messages cannot be merged into their neighbours (the audio
+    // Multimodal messages cannot be merged into their neighbours (the
     // tensor injection depends on per-message identity), so normalization is
-    // applied only to the non-audio subset here: empty tool-call assistant turns
-    // are dropped, and consecutive same-role non-audio turns are merged.
+    // applied only to the non-multimodal subset here.
     let mut prompt = String::from("<bos>");
     let mut audio_idx = 0usize;
+    let mut image_idx = 0usize;
 
-    // Collect (role_str, content_str, has_audio) before merging so that audio
-    // messages retain their per-message audio_idx assignment.
+    // Collect (role_str, content_str, has_modal) before merging.
     let mut turns: Vec<(&'static str, String, bool)> = Vec::new();
     for msg in messages {
         let role = match msg.role {
@@ -577,28 +634,51 @@ fn apply_gemma4_inner(messages: &[ChatMessage], audio_token_counts: &[usize]) ->
             Role::Assistant => "model",
         };
         let has_audio = msg.audio.is_some();
+        let has_images = !msg.content.images.is_empty();
+        let has_modal = has_audio || has_images;
 
-        // Build content, inserting audio tokens if this message has audio.
-        // Token strings from the Gemma4 tokenizer:
-        //   <|audio>   = begin-of-audio  (id 256000)
-        //   <|audio|>  = audio soft token (id 258881), repeated N times
-        //   <audio|>   = end-of-audio    (id 258883)
-        let content = if has_audio {
-            let n = audio_token_counts.get(audio_idx).copied().unwrap_or(0);
-            audio_idx += 1;
-            let soft_tokens = "<|audio|>".repeat(n);
-            // No newline between <audio|> and text — matches reference template.
-            format!("<|audio>{soft_tokens}<audio|>{}", msg.content.trim())
+        // Build content with any multimodal token sequences prepended.
+        let text_content = msg.content.trim().to_string();
+
+        let content = if has_modal {
+            // Build any multimodal prefix (images then audio, both can appear in
+            // the same message for any-to-any models).
+            let mut prefix = String::new();
+
+            // Image token strings from the Gemma4 tokenizer:
+            //   <|image>   = begin-of-image  (id 255999)
+            //   <|image|>  = image soft token (id 258880), repeated N times
+            //   <image|>   = end-of-image    (id 258882)
+            // Multiple images: each image gets its own BOI/EOI wrapper.
+            for _ in &msg.content.images {
+                let n = image_token_counts.get(image_idx).copied().unwrap_or(0);
+                image_idx += 1;
+                let soft_tokens = "<|image|>".repeat(n);
+                prefix.push_str(&format!("<|image>{soft_tokens}<image|>"));
+            }
+
+            // Audio token strings from the Gemma4 tokenizer:
+            //   <|audio>   = begin-of-audio  (id 256000)
+            //   <|audio|>  = audio soft token (id 258881), repeated N times
+            //   <audio|>   = end-of-audio    (id 258883)
+            if has_audio {
+                let n = audio_token_counts.get(audio_idx).copied().unwrap_or(0);
+                audio_idx += 1;
+                let soft_tokens = "<|audio|>".repeat(n);
+                prefix.push_str(&format!("<|audio>{soft_tokens}<audio|>"));
+            }
+
+            format!("{}{}", prefix, text_content)
         } else {
             // Drop empty assistant (tool-call-only) turns.
-            if role == "model" && msg.content.0.is_empty() && msg.tool_calls.is_some() {
+            if role == "model" && msg.content.text.is_empty() && msg.tool_calls.is_some() {
                 continue;
             }
-            msg.content.trim().to_string()
+            text_content
         };
 
-        // Merge consecutive non-audio same-role turns.
-        if !has_audio {
+        // Merge consecutive non-modal same-role turns.
+        if !has_modal {
             if let Some(last) = turns.last_mut() {
                 if last.0 == role && !last.2 {
                     if !last.1.is_empty() && !content.is_empty() {
@@ -609,7 +689,7 @@ fn apply_gemma4_inner(messages: &[ChatMessage], audio_token_counts: &[usize]) ->
                 }
             }
         }
-        turns.push((role, content, has_audio));
+        turns.push((role, content, has_modal));
     }
 
     for (role, content, _) in &turns {
@@ -800,35 +880,37 @@ mod tests {
     fn message_content_deserializes_plain_string() {
         let json = r#""Hello, world!""#;
         let mc: MessageContent = serde_json::from_str(json).unwrap();
-        assert_eq!(mc.0, "Hello, world!");
+        assert_eq!(mc.text, "Hello, world!");
     }
 
     #[test]
     fn message_content_deserializes_content_part_array() {
         let json = r#"[{"type":"text","text":"Hello"},{"type":"text","text":" world"}]"#;
         let mc: MessageContent = serde_json::from_str(json).unwrap();
-        assert_eq!(mc.0, "Hello world");
+        assert_eq!(mc.text, "Hello world");
     }
 
     #[test]
-    fn message_content_ignores_non_text_parts() {
-        let json = r#"[{"type":"image_url","url":"http://example.com/img.png"},{"type":"text","text":"What is this?"}]"#;
+    fn message_content_captures_image_url_parts() {
+        let json = r#"[{"type":"image_url","image_url":{"url":"http://example.com/img.png"}},{"type":"text","text":"What is this?"}]"#;
         let mc: MessageContent = serde_json::from_str(json).unwrap();
-        assert_eq!(mc.0, "What is this?");
+        assert_eq!(mc.text, "What is this?");
+        assert_eq!(mc.images.len(), 1);
+        assert_eq!(mc.images[0].url, "http://example.com/img.png");
     }
 
     #[test]
     fn chat_message_accepts_string_content() {
         let json = r#"{"role":"user","content":"Hello!"}"#;
         let msg: ChatMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.content.0, "Hello!");
+        assert_eq!(msg.content.text, "Hello!");
     }
 
     #[test]
     fn chat_message_accepts_content_part_array() {
         let json = r#"{"role":"user","content":[{"type":"text","text":"Hello!"}]}"#;
         let msg: ChatMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.content.0, "Hello!");
+        assert_eq!(msg.content.text, "Hello!");
     }
 
     #[test]
@@ -850,7 +932,7 @@ mod tests {
     fn message_content_deserializes_null_as_empty_string() {
         // Assistant messages that carry only tool_calls have `content: null`.
         let mc: MessageContent = serde_json::from_str("null").unwrap();
-        assert_eq!(mc.0, "");
+        assert_eq!(mc.text, "");
     }
 
     #[test]
@@ -858,7 +940,7 @@ mod tests {
         // OpenAI agent runtimes send `{"role":"assistant","content":null,"tool_calls":[…]}`.
         let json = r#"{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"get_weather","arguments":"{}"}}]}"#;
         let msg: ChatMessage = serde_json::from_str(json).unwrap();
-        assert_eq!(msg.content.0, "");
+        assert_eq!(msg.content.text, "");
         assert!(msg.tool_calls.is_some());
     }
 
@@ -868,7 +950,7 @@ mod tests {
         let json = r#"{"role":"tool","tool_call_id":"call_1","content":"72°F and sunny"}"#;
         let msg: ChatMessage = serde_json::from_str(json).unwrap();
         assert!(matches!(msg.role, Role::Tool));
-        assert_eq!(msg.content.0, "72°F and sunny");
+        assert_eq!(msg.content.text, "72°F and sunny");
         assert_eq!(msg.tool_call_id.as_deref(), Some("call_1"));
     }
 

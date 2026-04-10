@@ -2808,6 +2808,62 @@ impl Gemma4Model {
         )
     }
 
+    /// Forward pass with vision (image) soft-token injection.
+    ///
+    /// Identical in structure to `forward_with_audio`: zero image soft-token positions,
+    /// embed remaining tokens, inject vision embeddings at those positions, then run
+    /// the transformer.
+    pub fn forward_with_image(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        image_embeds: Tensor,
+        image_positions: Vec<usize>,
+    ) -> Result<Tensor> {
+        let (b_size, seq_len) = input_ids.dims2()?;
+
+        // Replace image soft token IDs with 0 (pad) to avoid OOB embedding lookup.
+        let safe_ids = {
+            let ids_data = input_ids.to_vec2::<u32>()?;
+            let mut safe: Vec<u32> = ids_data.into_iter().flatten().collect();
+            for &pos in &image_positions {
+                if pos < safe.len() {
+                    safe[pos] = 0;
+                }
+            }
+            Tensor::from_vec(safe, (b_size, seq_len), input_ids.device())?
+        };
+
+        let xs = self.embed_tokens.forward(&safe_ids)?;
+        let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
+
+        // Save text-only embedding for PLI (same rationale as forward_with_audio).
+        let xs_for_pli = xs.clone();
+        let image_embeds = image_embeds.to_device(xs.device())?.to_dtype(xs.dtype())?;
+        let h = self.hidden_size;
+        tracing::info!(
+            "forward_with_image: injecting {} image embeddings at {} positions",
+            image_embeds.dim(0).unwrap_or(0),
+            image_positions.len()
+        );
+        for (img_idx, &pos) in image_positions.iter().enumerate() {
+            if img_idx >= image_embeds.dim(0)? {
+                break;
+            }
+            let emb = image_embeds.narrow(0, img_idx, 1)?.unsqueeze(0)?; // [1, 1, H]
+            xs = xs.slice_assign(&[0..b_size, pos..pos + 1, 0..h], &emb)?;
+        }
+
+        self.forward_transformer(
+            b_size,
+            seq_len,
+            seqlen_offset,
+            &safe_ids,
+            Some(&xs_for_pli),
+            xs,
+        )
+    }
+
     pub fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         let (b_size, seq_len) = input_ids.dims2()?;
 
@@ -3147,6 +3203,62 @@ impl Gemma4Model {
                 break;
             }
             let emb = audio_embeds.narrow(0, audio_idx, 1)?.unsqueeze(0)?;
+            xs = xs.slice_assign(&[0..b_size, pos..pos + 1, 0..h], &emb)?;
+        }
+
+        self.forward_paged_inner(
+            b_size,
+            seq_len,
+            seqlen_offset,
+            &safe_ids,
+            Some(&xs_for_pli),
+            xs,
+            block_table,
+            kv_store,
+        )
+    }
+
+    /// Paged-attention forward pass with vision (image) soft-token injection.
+    pub fn forward_paged_with_image(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+        block_table: &crate::kv_cache::BlockTable,
+        kv_store: &mut crate::kv_cache::PagedKvStore,
+        image_embeds: Tensor,
+        image_positions: Vec<usize>,
+    ) -> candle_core::Result<Tensor> {
+        let (b_size, seq_len) = input_ids.dims2()?;
+
+        // Zero image soft-token IDs to avoid OOB embedding lookup.
+        let safe_ids = {
+            let ids_data = input_ids.to_vec2::<u32>()?;
+            let mut safe: Vec<u32> = ids_data.into_iter().flatten().collect();
+            for &pos in &image_positions {
+                if pos < safe.len() {
+                    safe[pos] = 0;
+                }
+            }
+            Tensor::from_vec(safe, (b_size, seq_len), input_ids.device())?
+        };
+
+        let xs = self.embed_tokens.forward(&safe_ids)?;
+        let mut xs = (xs * (self.hidden_size as f64).sqrt())?;
+
+        // Save text-only embed for PLI (same rationale as forward_with_audio).
+        let xs_for_pli = xs.clone();
+        let image_embeds = image_embeds.to_device(xs.device())?.to_dtype(xs.dtype())?;
+        let h = self.hidden_size;
+        tracing::info!(
+            "forward_paged_with_image: injecting {} image embeddings at {} positions",
+            image_embeds.dim(0).unwrap_or(0),
+            image_positions.len()
+        );
+        for (img_idx, &pos) in image_positions.iter().enumerate() {
+            if img_idx >= image_embeds.dim(0)? {
+                break;
+            }
+            let emb = image_embeds.narrow(0, img_idx, 1)?.unsqueeze(0)?;
             xs = xs.slice_assign(&[0..b_size, pos..pos + 1, 0..h], &emb)?;
         }
 
