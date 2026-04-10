@@ -178,6 +178,12 @@ impl RawConfig {
     pub fn detect_architecture(&self) -> Result<ModelArchitecture> {
         if let Some(archs) = &self.architectures {
             for arch in archs {
+                if arch.contains("Qwen3_5Moe") {
+                    anyhow::bail!(
+                        "Qwen3.5 MoE (detected architecture: {arch}) is not yet supported. \
+                         Only dense Qwen3.5 models are currently implemented."
+                    );
+                }
                 if arch.contains("Qwen3_5") {
                     return Ok(ModelArchitecture::Qwen35);
                 }
@@ -203,6 +209,10 @@ impl RawConfig {
             match model_type.as_str() {
                 "qwen2" | "qwen2_5" => return Ok(ModelArchitecture::Qwen2),
                 "qwen3" => return Ok(ModelArchitecture::Qwen3),
+                "qwen3_5_moe" => anyhow::bail!(
+                    "Qwen3.5 MoE (model_type: qwen3_5_moe) is not yet supported. \
+                     Only dense Qwen3.5 models are currently implemented."
+                ),
                 "qwen3_5" => return Ok(ModelArchitecture::Qwen35),
                 "gemma4" => return Ok(ModelArchitecture::Gemma4),
                 "gemma3" => return Ok(ModelArchitecture::Gemma3),
@@ -443,6 +453,7 @@ impl RawConfig {
         &self,
         dtype: DType,
         device: Device,
+        turbo_quant_bits: Option<u8>,
     ) -> crate::models::qwen3_5::Qwen35Config {
         use crate::models::qwen3_5::{LayerType, Qwen35Config};
 
@@ -513,6 +524,7 @@ impl RawConfig {
             tie_word_embeddings,
             dtype,
             device,
+            turbo_quant_bits,
         }
     }
 
