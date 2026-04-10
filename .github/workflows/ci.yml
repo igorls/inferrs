@@ -32,6 +32,18 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends cuda-nvcc-12-6
           echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
+      # Build libocipull so clippy can check the OCI code paths.
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version-file: oci-pull/go.mod
+          cache-dependency-path: oci-pull/go.sum
+      - name: Build libocipull (Clippy)
+        run: |
+          mkdir -p target/debug
+          cd oci-pull
+          CGO_ENABLED=1 go build -buildmode=c-shared -tags cshared \
+            -o ../target/debug/libocipull.so .
       # inferrs-backend-musa has no compile-time MUSA SDK dependency (it probes
       # libmusart.so via dlopen at runtime) so it can be checked here.
       - run: cargo fmt --check -p inferrs -p inferrs-benchmark -p inferrs-backend-musa -p inferrs-backend-vulkan
@@ -127,6 +139,61 @@ jobs:
         run: |
           $gitLink = "C:\Program Files\Git\usr\bin\link.exe"
           if (Test-Path $gitLink) { Rename-Item $gitLink "link.exe.bak" }
+
+      # ── Go OCI library (libocipull) ──────────────────────────────────────
+      # The inferrs crate links against a Go C shared library for pulling
+      # models from OCI registries.  build.rs tells rustc to link -locipull,
+      # so the library must be built before cargo build / cargo test.
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-version-file: oci-pull/go.mod
+          cache-dependency-path: oci-pull/go.sum
+
+      - name: Build libocipull (Go C shared library for OCI pulls)
+        shell: bash
+        run: |
+          mkdir -p target/debug
+          cd oci-pull
+          case "${{ runner.os }}" in
+            macOS)
+              CGO_ENABLED=1 go build -buildmode=c-shared -tags cshared \
+                -ldflags="-extldflags '-Wl,-install_name,@rpath/libocipull.dylib'" \
+                -o ../target/debug/libocipull.dylib .
+              ;;
+            Linux)
+              CGO_ENABLED=1 go build -buildmode=c-shared -tags cshared \
+                -o ../target/debug/libocipull.so .
+              ;;
+            Windows)
+              CGO_ENABLED=1 go build -buildmode=c-shared -tags cshared \
+                -o ../target/debug/ocipull.dll .
+              ;;
+          esac
+
+      # On Windows ARM64 we also need MSVC tools (lib.exe) for import lib
+      # generation.  x86_64 already has MSVC from the CUDA/nvcc setup above.
+      - name: Set up MSVC environment (Windows ARM64)
+        if: matrix.target == 'aarch64-pc-windows-msvc'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: arm64
+
+      # On Windows the MSVC linker needs a .lib import library.  Generate one
+      # from a hand-written .def listing the four exported Go symbols.
+      - name: Generate MSVC import library for libocipull (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          @"
+          EXPORTS
+              oci_pull
+              oci_bundle
+              oci_last_error
+              oci_free_string
+          "@ | Set-Content -Path target\debug\ocipull.def -Encoding ASCII
+          $arch = if ("${{ matrix.target }}" -eq "aarch64-pc-windows-msvc") { "ARM64" } else { "X64" }
+          lib /DEF:target\debug\ocipull.def /OUT:target\debug\ocipull.lib /MACHINE:$arch
 
       # On Windows x86_64 the test binary crashes at startup with
       # STATUS_DLL_NOT_FOUND because nvcuda.dll (the GPU driver DLL) is absent

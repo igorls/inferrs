@@ -1,10 +1,15 @@
-//! Build script: compress `ui/index.html` into `$OUT_DIR/ui.html.gz` using
-//! best-level gzip compression.  The server embeds the result via
-//! `include_bytes!(concat!(env!("OUT_DIR"), "/ui.html.gz"))` and serves it
-//! with `Content-Encoding: gzip` in daemon mode (no model argument).
+//! Build script for inferrs.
 //!
-//! The build fails loudly if the compressed output exceeds 1 MiB so that the
-//! size budget is enforced at compile time rather than discovered at runtime.
+//! 1. **Web UI compression** — compress `ui/index.html` into `$OUT_DIR/ui.html.gz`
+//!    using best-level gzip compression.  The server embeds the result via
+//!    `include_bytes!(concat!(env!("OUT_DIR"), "/ui.html.gz"))` and serves it
+//!    with `Content-Encoding: gzip` in daemon mode (no model argument).
+//!    The build fails loudly if the compressed output exceeds 1 MiB so that the
+//!    size budget is enforced at compile time rather than discovered at runtime.
+//!
+//! 2. **OCI shared library linking** — links the Go OCI shared library
+//!    (`libocipull`) built by `make oci-lib`.  This script tells rustc where to
+//!    find it and sets rpath so the binary can locate the library at runtime.
 
 use flate2::{write::GzEncoder, Compression};
 use std::{env, fs, io::Write, path::PathBuf};
@@ -12,6 +17,10 @@ use std::{env, fs, io::Write, path::PathBuf};
 const SIZE_LIMIT_BYTES: u64 = 1024 * 1024; // 1 MiB
 
 fn main() {
+    // -----------------------------------------------------------------------
+    // 1. Web UI compression
+    // -----------------------------------------------------------------------
+
     // Re-run this script if the UI source changes.
     println!("cargo:rerun-if-changed=ui/index.html");
 
@@ -42,5 +51,45 @@ fn main() {
     println!(
         "cargo:warning=inferrs web UI compressed to {:.1} KiB (budget: 1024 KiB)",
         compressed_size as f64 / 1024.0
+    );
+
+    // -----------------------------------------------------------------------
+    // 2. OCI shared library (libocipull) linking
+    // -----------------------------------------------------------------------
+
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
+    let workspace_root = PathBuf::from(&manifest_dir)
+        .parent()
+        .expect("inferrs crate must be inside a workspace")
+        .to_path_buf();
+
+    let profile = env::var("PROFILE").unwrap(); // "debug" or "release"
+    let target_dir = workspace_root.join("target").join(&profile);
+
+    // Tell rustc where to find libocipull.{dylib,so}.
+    println!("cargo:rustc-link-search=native={}", target_dir.display());
+    println!("cargo:rustc-link-lib=dylib=ocipull");
+
+    // Set rpath so the binary can find the library next to the executable
+    // at runtime without needing LD_LIBRARY_PATH / DYLD_LIBRARY_PATH.
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    match target_os.as_str() {
+        "macos" => {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,@executable_path");
+        }
+        "linux" => {
+            println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+        }
+        _ => {}
+    }
+
+    // Re-run if the library is rebuilt.
+    println!(
+        "cargo:rerun-if-changed={}",
+        target_dir.join("libocipull.dylib").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        target_dir.join("libocipull.so").display()
     );
 }
