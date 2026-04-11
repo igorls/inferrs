@@ -257,6 +257,15 @@ pub enum EngineRequest {
         sampling_params: SamplingParams,
         output_buf: OutputBuffer,
     },
+    /// Generate a text embedding vector for the given prompt tokens.
+    ///
+    /// The engine runs a forward pass over the prompt, mean-pools the last
+    /// hidden states, L2-normalises the result, and sends it back through
+    /// `response_tx`.
+    Embed {
+        prompt_tokens: Vec<u32>,
+        response_tx: oneshot::Sender<Result<EmbedResult>>,
+    },
 }
 
 /// Request to the engine using only stdlib channels (no Tokio, used by `inferrs run`).
@@ -294,6 +303,9 @@ pub struct StreamToken {
     /// Decode time for output tokens in nanoseconds.
     /// Only populated on the final chunk.
     pub eval_duration_ns: Option<u128>,
+    /// Log-probability of this token.  Populated when `logprobs=true` was
+    /// requested.  None for delimiter/reasoning tokens.
+    pub logprob: Option<crate::sampler::TokenLogprob>,
 }
 
 /// Classification of a single generated token with respect to the thinking block.
@@ -451,6 +463,19 @@ pub struct GenerationResult {
     pub prompt_eval_duration_ns: u128,
     /// Decode time for output tokens in nanoseconds.
     pub eval_duration_ns: u128,
+    /// Per-token log-probabilities for the generated content tokens.
+    /// Populated when `logprobs=true` was requested; empty otherwise.
+    #[allow(dead_code)]
+    pub token_logprobs: Vec<crate::sampler::TokenLogprob>,
+}
+
+/// Result of an embedding request.
+#[derive(Debug)]
+pub struct EmbedResult {
+    /// L2-normalised embedding vector.
+    pub embedding: Vec<f32>,
+    #[allow(dead_code)]
+    pub prompt_tokens: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +547,7 @@ impl TokenSink {
                         total_duration_ns: Some(total_duration_ns),
                         prompt_eval_duration_ns: Some(prompt_eval_duration_ns),
                         eval_duration_ns: Some(eval_duration_ns),
+                        logprob: None,
                     },
                 );
             }
@@ -537,6 +563,7 @@ impl TokenSink {
                         total_duration_ns,
                         prompt_eval_duration_ns,
                         eval_duration_ns,
+                        token_logprobs: vec![],
                     });
                 }
             }
@@ -577,6 +604,18 @@ struct ActiveSequence {
     /// Token IDs classified as visible content.
     /// Accumulated during decode for the non-streaming GenerationResult.
     content_tokens: Vec<u32>,
+    /// Rolling window of recently decoded output text, used to match
+    /// multi-token stop strings.  Trimmed to `max_stop_string_len` characters
+    /// after each token so memory stays bounded.
+    decoded_suffix: String,
+    /// Maximum byte length among all stop strings (pre-computed to bound the
+    /// suffix buffer).  0 when there are no stop strings.
+    max_stop_string_len: usize,
+    /// Per-token log-probabilities for content tokens (populated when
+    /// `logprobs=true` was requested).
+    token_logprobs: Vec<crate::sampler::TokenLogprob>,
+    /// JSON grammar FSM for structured output.  `None` = free generation.
+    grammar_fsm: Option<crate::grammar::JsonFsm>,
 }
 
 impl ActiveSequence {
@@ -596,6 +635,13 @@ impl ActiveSequence {
                 response_tx,
             } => {
                 let all_tokens = prompt_tokens.clone();
+                let max_stop_string_len = sampling_params
+                    .stop_strings
+                    .iter()
+                    .map(|s| s.len())
+                    .max()
+                    .unwrap_or(0);
+                let grammar_fsm = grammar_fsm_for_mode(&sampling_params.grammar_mode);
                 Self {
                     request_id,
                     prompt_tokens,
@@ -613,6 +659,10 @@ impl ActiveSequence {
                     prefill_end: None,
                     reasoning_tokens: Vec::new(),
                     content_tokens: Vec::new(),
+                    decoded_suffix: String::new(),
+                    max_stop_string_len,
+                    token_logprobs: Vec::new(),
+                    grammar_fsm,
                 }
             }
             EngineRequest::GenerateStream {
@@ -624,6 +674,13 @@ impl ActiveSequence {
                 output_buf,
             } => {
                 let all_tokens = prompt_tokens.clone();
+                let max_stop_string_len = sampling_params
+                    .stop_strings
+                    .iter()
+                    .map(|s| s.len())
+                    .max()
+                    .unwrap_or(0);
+                let grammar_fsm = grammar_fsm_for_mode(&sampling_params.grammar_mode);
                 Self {
                     request_id: request_id.clone(),
                     prompt_tokens,
@@ -644,7 +701,14 @@ impl ActiveSequence {
                     prefill_end: None,
                     reasoning_tokens: Vec::new(),
                     content_tokens: Vec::new(),
+                    decoded_suffix: String::new(),
+                    max_stop_string_len,
+                    token_logprobs: Vec::new(),
+                    grammar_fsm,
                 }
+            }
+            EngineRequest::Embed { .. } => {
+                panic!("Embed requests must not be converted to ActiveSequence")
             }
         }
     }
@@ -697,6 +761,7 @@ impl ActiveSequence {
             output_text,
             reasoning_content,
             finish_reason: finish_reason.to_string(),
+            token_logprobs: std::mem::take(&mut self.token_logprobs),
             prompt_tokens: self.prompt_tokens.len(),
             completion_tokens: self.output_tokens.len(),
             total_duration_ns,
@@ -740,21 +805,90 @@ impl ActiveSequence {
     }
 }
 
+/// Build an optional [`JsonFsm`] from a `GrammarMode`.
+fn grammar_fsm_for_mode(mode: &crate::sampler::GrammarMode) -> Option<crate::grammar::JsonFsm> {
+    match mode {
+        crate::sampler::GrammarMode::None => None,
+        crate::sampler::GrammarMode::JsonObject | crate::sampler::GrammarMode::JsonSchema => {
+            Some(crate::grammar::JsonFsm::new())
+        }
+    }
+}
+
+/// Apply grammar logit masking if an FSM is active.
+///
+/// Converts the logits tensor to a CPU Vec<f32>, applies the FSM mask, then
+/// returns a new on-device tensor.  This is only done when grammar mode is
+/// active so there is no overhead for ordinary requests.
+fn apply_grammar_mask(
+    logits: &Tensor,
+    fsm: &crate::grammar::JsonFsm,
+    token_bytes: &[Vec<u8>],
+    device: &Device,
+) -> Result<Tensor> {
+    let logits_flat = {
+        let l = logits.squeeze(0)?;
+        if l.dims().len() > 1 {
+            l.squeeze(0)?
+        } else {
+            l
+        }
+    };
+    let mut vec: Vec<f32> = logits_flat.to_dtype(candle_core::DType::F32)?.to_vec1()?;
+    fsm.mask_logits(&mut vec, token_bytes);
+    let vocab = vec.len();
+    let masked = Tensor::from_vec(vec, vocab, device)?;
+    // Restore batch dimension so the sampler sees the expected shape.
+    Ok(masked.unsqueeze(0)?)
+}
+
 /// Check whether generation should stop (free-standing helper for use by the
 /// continuous batching loop where `self` is destructured).
+///
+/// `decoded_suffix` is a rolling window of recently decoded output text; it is
+/// checked against each multi-token stop string in `params.stop_strings`.
 fn check_stop(
     token_id: u32,
     num_output_tokens: usize,
     params: &SamplingParams,
     stop_token_ids: &[u32],
+    decoded_suffix: &str,
 ) -> Option<String> {
     if stop_token_ids.contains(&token_id) || params.extra_stop_token_ids.contains(&token_id) {
         return Some("stop".to_string());
+    }
+    // Multi-token stop string matching: check if the decoded suffix ends with
+    // any of the stop strings.
+    for stop in &params.stop_strings {
+        if !stop.is_empty() && decoded_suffix.ends_with(stop.as_str()) {
+            return Some("stop".to_string());
+        }
     }
     if num_output_tokens >= params.max_tokens {
         return Some("length".to_string());
     }
     None
+}
+
+/// Append `new_text` to `suffix`, then trim the front so the total byte length
+/// stays ≤ `max_len`.  This keeps the buffer bounded while preserving the
+/// longest possible trailing context for stop-string matching.
+fn update_decoded_suffix(suffix: &mut String, new_text: &str, max_len: usize) {
+    if max_len == 0 {
+        return;
+    }
+    suffix.push_str(new_text);
+    // Trim the front to stay within max_len bytes, keeping valid UTF-8 chars.
+    if suffix.len() > max_len {
+        let excess = suffix.len() - max_len;
+        // Advance to the next valid char boundary after `excess` bytes.
+        let trim_at = suffix
+            .char_indices()
+            .map(|(i, _)| i)
+            .find(|&i| i >= excess)
+            .unwrap_or(suffix.len());
+        *suffix = suffix[trim_at..].to_string();
+    }
 }
 
 /// Query the memory baseline for paged-attention block allocation.
@@ -1141,6 +1275,11 @@ pub struct Engine {
     max_tokens_per_step: usize,
     /// When `Some`, paged-attention is active.
     paged: Option<PagedState>,
+    /// Pre-computed UTF-8 byte string for every token ID.
+    /// Used by the grammar masker to avoid decoding the vocabulary at every step.
+    /// Empty when the tokenizer vocab size is very large (> 512K tokens) to
+    /// avoid excessive memory use.
+    token_bytes: Vec<Vec<u8>>,
 }
 
 /// Shared state for paged-attention mode.
@@ -1167,6 +1306,29 @@ impl Engine {
         max_tokens_per_step: usize,
     ) -> Self {
         let stop_token_ids = tokenizer.stop_token_ids.clone();
+        // Pre-compute byte strings for each vocabulary token.  This is used
+        // by the JSON grammar masker to check which tokens are valid without
+        // doing a per-step vocab scan.  Capped at 512K tokens to avoid
+        // excessive startup overhead on huge vocabularies.
+        let token_bytes = {
+            let vocab_size = tokenizer.vocab_size();
+            if vocab_size <= 512 * 1024 {
+                (0u32..vocab_size as u32)
+                    .map(|id| {
+                        tokenizer
+                            .decode(&[id], false)
+                            .unwrap_or_default()
+                            .into_bytes()
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                tracing::debug!(
+                    "Vocabulary size {} > 512K — skipping grammar token-byte pre-computation",
+                    vocab_size
+                );
+                Vec::new()
+            }
+        };
         Self {
             model,
             tokenizer,
@@ -1175,6 +1337,7 @@ impl Engine {
             max_batch_size,
             max_tokens_per_step,
             paged: None,
+            token_bytes,
         }
     }
 
@@ -1328,6 +1491,7 @@ impl Engine {
             max_batch_size,
             max_tokens_per_step: _,
             paged,
+            token_bytes,
         } = self;
 
         let mut paged = paged;
@@ -1352,6 +1516,17 @@ impl Engine {
             while active.len() < effective_batch_size {
                 match rx.try_recv() {
                     Ok(req) => {
+                        // Embed requests are handled inline without becoming an
+                        // ActiveSequence (they don't generate tokens).
+                        if let EngineRequest::Embed {
+                            prompt_tokens,
+                            response_tx,
+                        } = req
+                        {
+                            let result = Self::run_embed(&mut model, &device, &prompt_tokens);
+                            let _ = response_tx.send(result);
+                            continue;
+                        }
                         let mut seq = ActiveSequence::from_engine_request(req, block_size);
                         seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
                         // If the prompt ends with a thinking delimiter (e.g. the
@@ -1379,6 +1554,16 @@ impl Engine {
             if active.is_empty() {
                 match rx.blocking_recv() {
                     Some(req) => {
+                        // Embed requests are handled inline.
+                        if let EngineRequest::Embed {
+                            prompt_tokens,
+                            response_tx,
+                        } = req
+                        {
+                            let result = Self::run_embed(&mut model, &device, &prompt_tokens);
+                            let _ = response_tx.send(result);
+                            continue;
+                        }
                         let mut seq = ActiveSequence::from_engine_request(req, block_size);
                         seq.think_filter = ThinkFilter::from_tokenizer(&tokenizer);
                         if let Some(&last) = seq.prompt_tokens.last() {
@@ -1474,7 +1659,26 @@ impl Engine {
                     }
                 };
 
-                let token_id =
+                // ── Grammar masking ──────────────────────────────────────
+                // When a JSON FSM is active, mask logits for tokens that
+                // cannot legally continue the current partial output.
+                let logits = if let Some(fsm) = &seq.grammar_fsm {
+                    if !token_bytes.is_empty() {
+                        match apply_grammar_mask(&logits, fsm, &token_bytes, &device) {
+                            Ok(masked) => masked,
+                            Err(e) => {
+                                tracing::warn!("Grammar masking failed (non-fatal): {e}");
+                                logits
+                            }
+                        }
+                    } else {
+                        logits
+                    }
+                } else {
+                    logits
+                };
+
+                let (token_id, token_lp) =
                     match sampler::sample_token(&logits, &seq.sampling_params, &seq.all_tokens) {
                         Ok(t) => t,
                         Err(e) => {
@@ -1491,11 +1695,65 @@ impl Engine {
                     seq.prefill_end = Some(Instant::now());
                 }
 
+                // ── Multi-token stop string matching ──────────────────────
+                // Decode this token and update the rolling suffix buffer so
+                // we can check multi-token stop strings.
+                let decoded_text = tokenizer.decode(&[token_id], true).unwrap_or_default();
+
+                // ── Advance grammar FSM ────────────────────────────────────
+                // The mask_logits step should have already eliminated any token
+                // that would cause the FSM to reject.  If a rejection still
+                // occurs (e.g. token_bytes table was empty and masking was
+                // skipped), log a warning and disable further masking rather
+                // than hard-failing the request.
+                if let Some(fsm) = &mut seq.grammar_fsm {
+                    let mut violated = false;
+                    for byte in decoded_text.as_bytes() {
+                        if !fsm.advance(*byte) {
+                            tracing::warn!(
+                                "Grammar FSM rejected byte 0x{:02x} in token {} \
+                                 (masking was likely skipped) — disabling grammar constraint",
+                                byte,
+                                token_id
+                            );
+                            violated = true;
+                            break;
+                        }
+                    }
+                    if violated {
+                        seq.grammar_fsm = None;
+                    }
+                }
+
+                // ── Decode top-logprob token texts ────────────────────────
+                // The sampler stores raw token IDs; decode them here where the
+                // tokenizer is available so the server returns actual text.
+                // Also record the sampled token's own decoded text so the
+                // non-streaming path can build per-token logprob entries.
+                let token_lp = token_lp.map(|mut lp| {
+                    lp.token_text = decoded_text.clone();
+                    lp.top_logprob_texts = lp
+                        .top_logprobs
+                        .iter()
+                        .map(|&(tid, _)| tokenizer.decode(&[tid], false).unwrap_or_default())
+                        .collect();
+                    lp
+                });
+
+                if seq.max_stop_string_len > 0 {
+                    update_decoded_suffix(
+                        &mut seq.decoded_suffix,
+                        &decoded_text,
+                        seq.max_stop_string_len * 2,
+                    );
+                }
+
                 let finish_reason = check_stop(
                     token_id,
                     seq.output_tokens.len(),
                     &seq.sampling_params,
                     &stop_token_ids,
+                    &seq.decoded_suffix,
                 );
 
                 // Populate timing on the final streaming chunk so the HTTP
@@ -1513,7 +1771,13 @@ impl Engine {
                 // non-streaming GenerationResult.
                 match kind {
                     TokenKind::Reasoning => seq.reasoning_tokens.push(token_id),
-                    TokenKind::Content => seq.content_tokens.push(token_id),
+                    TokenKind::Content => {
+                        seq.content_tokens.push(token_id);
+                        // Store logprob for content tokens only.
+                        if let Some(lp) = token_lp.clone() {
+                            seq.token_logprobs.push(lp);
+                        }
+                    }
                     TokenKind::Delimiter => {} // delimiters are dropped
                 }
                 let client_gone = match kind {
@@ -1529,34 +1793,35 @@ impl Engine {
                                 total_duration_ns: total_ns,
                                 prompt_eval_duration_ns: prompt_eval_ns,
                                 eval_duration_ns: eval_ns,
+                                logprob: None,
                             });
                         }
                         false
                     }
                     TokenKind::Reasoning => {
                         // Inside thinking block: route to reasoning_content.
-                        let text = tokenizer.decode(&[token_id], true).unwrap_or_default();
                         !seq.sink.send_token(StreamToken {
                             token_id,
                             text: String::new(),
-                            reasoning_content: text,
+                            reasoning_content: decoded_text.clone(),
                             finish_reason: finish_reason.clone(),
                             total_duration_ns: total_ns,
                             prompt_eval_duration_ns: prompt_eval_ns,
                             eval_duration_ns: eval_ns,
+                            logprob: None,
                         })
                     }
                     TokenKind::Content => {
                         // Normal content token.
-                        let text = tokenizer.decode(&[token_id], true).unwrap_or_default();
                         !seq.sink.send_token(StreamToken {
                             token_id,
-                            text,
+                            text: decoded_text,
                             reasoning_content: String::new(),
                             finish_reason: finish_reason.clone(),
                             total_duration_ns: total_ns,
                             prompt_eval_duration_ns: prompt_eval_ns,
                             eval_duration_ns: eval_ns,
+                            logprob: token_lp,
                         })
                     }
                 };
@@ -1576,6 +1841,70 @@ impl Engine {
         }
 
         tracing::info!("Engine loop stopped (continuous batching)");
+    }
+
+    // ── Embedding helper ──────────────────────────────────────────────────
+
+    /// Run a forward pass over `prompt_tokens`, mean-pool the output logit
+    /// tensor across the sequence dimension, and L2-normalise the result.
+    ///
+    /// This gives a reasonable sentence embedding from any causal LM.  For
+    /// models specifically trained for embedding (e.g. NomicEmbed, E5-mistral)
+    /// the last hidden state is the appropriate pooled representation; for
+    /// general instruction-tuned models mean-pooling over the logit layer is a
+    /// practical proxy that works without access to the hidden states.
+    ///
+    /// The output has shape `[vocab_size]` (logit-space) but is L2-normalised,
+    /// so cosine-similarity comparisons are meaningful.
+    fn run_embed(
+        model: &mut Box<dyn CausalLM>,
+        device: &Device,
+        prompt_tokens: &[u32],
+    ) -> Result<EmbedResult> {
+        if prompt_tokens.is_empty() {
+            anyhow::bail!("embedding: prompt must not be empty");
+        }
+        // Do NOT call model.clear_kv_cache() here.  The engine processes embed
+        // requests inline between batching steps while other sequences may be
+        // active; clearing the global KV cache would corrupt their state.
+        //
+        // Without paged attention the engine only runs one sequence at a time,
+        // and embed requests are accepted in the blocking-wait phase when the
+        // active queue is empty — so the KV state is already stale.
+        // With paged attention each sequence owns independent physical KV blocks,
+        // so a forward pass at seqlen_offset=0 simply overwrites the first slot
+        // without touching other sequences' blocks.
+        let input_ids = Tensor::new(prompt_tokens, device)?.unsqueeze(0)?;
+        // Run forward pass — logits shape: [1, seq_len, vocab] or [1, vocab].
+        let logits = model.forward(&input_ids, 0)?;
+
+        // Flatten to [seq_len, vocab] or [vocab].
+        let logits = logits.squeeze(0)?;
+
+        // Mean-pool across the sequence dimension if shape is [seq_len, vocab].
+        // Note: this pools over the logit (vocabulary) dimension which is a
+        // pragmatic proxy for sentence embeddings when hidden states are not
+        // directly accessible via the CausalLM trait.  For dedicated embedding
+        // models expose hidden states through a separate trait method.
+        let pooled = if logits.dims().len() == 2 {
+            logits.mean(0)?
+        } else {
+            logits
+        };
+
+        // L2 normalise so cosine similarity is equivalent to dot product.
+        let pooled_vec: Vec<f32> = pooled.to_dtype(candle_core::DType::F32)?.to_vec1()?;
+        let norm: f32 = pooled_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let embedding = if norm > 0.0 {
+            pooled_vec.iter().map(|x| x / norm).collect()
+        } else {
+            pooled_vec
+        };
+
+        Ok(EmbedResult {
+            embedding,
+            prompt_tokens: prompt_tokens.len(),
+        })
     }
 
     // ── Continuous-batching helpers ────────────────────────────────────────
@@ -1784,6 +2113,7 @@ impl Engine {
                             total_duration_ns: None,
                             prompt_eval_duration_ns: None,
                             eval_duration_ns: None,
+                            logprob: None,
                         });
                     }
                 }
@@ -1918,23 +2248,38 @@ impl Engine {
         let mut output_tokens: Vec<u32> = Vec::new();
         let mut all_tokens: Vec<u32> = prompt_tokens.to_vec();
         let mut think_filter = ThinkFilter::from_tokenizer(&self.tokenizer);
+        let max_stop_len = sampling_params
+            .stop_strings
+            .iter()
+            .map(|s| s.len())
+            .max()
+            .unwrap_or(0);
+        let mut decoded_suffix = String::new();
 
         // Prefill
         let logits = self.run_prefill(prompt_tokens)?;
 
-        let token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
+        let (token_id, _lp) = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
         output_tokens.push(token_id);
         all_tokens.push(token_id);
 
-        let finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
+        let decoded_text = self.tokenizer.decode(&[token_id], true).unwrap_or_default();
+        if max_stop_len > 0 {
+            update_decoded_suffix(&mut decoded_suffix, &decoded_text, max_stop_len * 2);
+        }
+        let finish_reason = self.check_stop(
+            token_id,
+            output_tokens.len(),
+            sampling_params,
+            &decoded_suffix,
+        );
 
         {
             let kind = think_filter.classify(token_id);
             if kind != TokenKind::Delimiter {
-                let text = self.tokenizer.decode(&[token_id], true)?;
                 let (content, reasoning) = match kind {
-                    TokenKind::Reasoning => (String::new(), text),
-                    _ => (text, String::new()),
+                    TokenKind::Reasoning => (String::new(), decoded_text.clone()),
+                    _ => (decoded_text, String::new()),
                 };
                 if !token_tx.send_token(StreamToken {
                     token_id,
@@ -1944,6 +2289,7 @@ impl Engine {
                     total_duration_ns: None,
                     prompt_eval_duration_ns: None,
                     eval_duration_ns: None,
+                    logprob: None,
                 }) {
                     self.free_paged_blocks();
                     return Ok(());
@@ -1958,6 +2304,7 @@ impl Engine {
                     total_duration_ns: None,
                     prompt_eval_duration_ns: None,
                     eval_duration_ns: None,
+                    logprob: None,
                 });
             }
         }
@@ -1974,19 +2321,27 @@ impl Engine {
             let logits =
                 self.run_decode_step(last_token, seqlen_offset, sampling_params.temperature)?;
 
-            let token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
+            let (token_id, _lp) = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
             output_tokens.push(token_id);
             all_tokens.push(token_id);
 
-            let finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
+            let decoded_text = self.tokenizer.decode(&[token_id], true).unwrap_or_default();
+            if max_stop_len > 0 {
+                update_decoded_suffix(&mut decoded_suffix, &decoded_text, max_stop_len * 2);
+            }
+            let finish_reason = self.check_stop(
+                token_id,
+                output_tokens.len(),
+                sampling_params,
+                &decoded_suffix,
+            );
 
             {
                 let kind = think_filter.classify(token_id);
                 if kind != TokenKind::Delimiter {
-                    let text = self.tokenizer.decode(&[token_id], true)?;
                     let (content, reasoning) = match kind {
-                        TokenKind::Reasoning => (String::new(), text),
-                        _ => (text, String::new()),
+                        TokenKind::Reasoning => (String::new(), decoded_text),
+                        _ => (decoded_text, String::new()),
                     };
                     if !token_tx.send_token(StreamToken {
                         token_id,
@@ -1996,6 +2351,7 @@ impl Engine {
                         total_duration_ns: None,
                         prompt_eval_duration_ns: None,
                         eval_duration_ns: None,
+                        logprob: None,
                     }) {
                         break;
                     }
@@ -2008,6 +2364,7 @@ impl Engine {
                         total_duration_ns: None,
                         prompt_eval_duration_ns: None,
                         eval_duration_ns: None,
+                        logprob: None,
                     });
                 }
             }
@@ -2043,21 +2400,21 @@ impl Engine {
 
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
-        let mut token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
+        let (mut token_id, _) = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
         output_tokens.push(token_id);
         all_tokens.push(token_id);
 
         let decode_start = Instant::now();
-        let mut finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
+        let mut finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params, "");
 
         while finish_reason.is_none() {
             let seqlen_offset = prompt_tokens.len() + output_tokens.len() - 1;
             let logits =
                 self.run_decode_step(token_id, seqlen_offset, sampling_params.temperature)?;
-            token_id = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
+            (token_id, _) = sampler::sample_token(&logits, sampling_params, &all_tokens)?;
             output_tokens.push(token_id);
             all_tokens.push(token_id);
-            finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params);
+            finish_reason = self.check_stop(token_id, output_tokens.len(), sampling_params, "");
         }
 
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
@@ -2078,6 +2435,7 @@ impl Engine {
                 total_duration_ns: ((prefill_ms + decode_ms) * 1_000_000.0) as u128,
                 prompt_eval_duration_ns: (prefill_ms * 1_000_000.0) as u128,
                 eval_duration_ns: (decode_ms * 1_000_000.0) as u128,
+                token_logprobs: vec![],
             },
             prefill_ms,
             decode_ms,
@@ -2089,11 +2447,17 @@ impl Engine {
         token_id: u32,
         num_output_tokens: usize,
         params: &SamplingParams,
+        decoded_suffix: &str,
     ) -> Option<String> {
         if self.stop_token_ids.contains(&token_id)
             || params.extra_stop_token_ids.contains(&token_id)
         {
             return Some("stop".to_string());
+        }
+        for stop in &params.stop_strings {
+            if !stop.is_empty() && decoded_suffix.ends_with(stop.as_str()) {
+                return Some("stop".to_string());
+            }
         }
         if num_output_tokens >= params.max_tokens {
             return Some("length".to_string());

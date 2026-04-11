@@ -3,6 +3,7 @@ mod backend;
 mod bench;
 mod config;
 mod engine;
+mod grammar;
 mod hub;
 mod kv_cache;
 mod list;

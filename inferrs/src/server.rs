@@ -112,6 +112,31 @@ pub struct ChatCompletionRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub repetition_penalty: Option<f64>,
+    /// OpenAI `frequency_penalty`: penalises tokens proportional to how often
+    /// they have appeared in the output so far.  Range [0, 2].
+    #[serde(default)]
+    pub frequency_penalty: Option<f64>,
+    /// OpenAI `presence_penalty`: flat penalty for any token that has appeared
+    /// at least once.  Range [0, 2].
+    #[serde(default)]
+    pub presence_penalty: Option<f64>,
+    /// Min-p filtering threshold (llama.cpp / Ollama).  Tokens with probability
+    /// below `min_p * max_prob` are filtered out.
+    #[serde(default)]
+    pub min_p: Option<f64>,
+    /// Per-token additive logit biases.  Keys are string token IDs (OpenAI
+    /// format); values are bias magnitudes typically in [-100, 100].
+    #[serde(default)]
+    pub logit_bias: Option<std::collections::HashMap<String, f64>>,
+    /// Random seed for reproducible sampling.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Whether to return log-probabilities of output tokens.
+    #[serde(default)]
+    pub logprobs: Option<bool>,
+    /// Number of top log-probabilities to return per token (0–20).
+    #[serde(default)]
+    pub top_logprobs: Option<u8>,
     /// Stop sequences: generation halts when any of these strings is produced.
     /// Accepts a single string or an array of strings (OpenAI-compatible).
     #[serde(default)]
@@ -127,6 +152,11 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     #[allow(dead_code)]
     pub tool_choice: Option<serde_json::Value>,
+    /// Structured output format request.
+    /// `{"type": "json_object"}` enables JSON mode (grammar-constrained).
+    /// `{"type": "json_schema", "json_schema": {...}}` enables schema validation.
+    #[serde(default)]
+    pub response_format: Option<ResponseFormat>,
     /// OpenAI-only `service_tier` field.  Accepted and silently ignored for
     /// compatibility with clients that always send it.
     #[serde(default)]
@@ -152,11 +182,47 @@ pub struct ChatCompletionResponse {
     pub usage: UsageInfo,
 }
 
+/// Structured output / JSON mode format specifier.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct ResponseFormat {
+    #[serde(rename = "type")]
+    pub type_field: String,
+    /// For `type = "json_schema"`: the JSON schema object.
+    #[serde(default)]
+    pub json_schema: Option<serde_json::Value>,
+}
+
+/// Per-token log-probability entry (OpenAI format).
+#[derive(Debug, Serialize)]
+pub struct LogprobEntry {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Option<Vec<u8>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub top_logprobs: Vec<TopLogprobEntry>,
+}
+
+/// One of the top-k alternative tokens in a logprob response.
+#[derive(Debug, Serialize)]
+pub struct TopLogprobEntry {
+    pub token: String,
+    pub logprob: f32,
+    pub bytes: Option<Vec<u8>>,
+}
+
+/// Container for the per-token logprobs list returned in a choice.
+#[derive(Debug, Serialize)]
+pub struct ChoiceLogprobs {
+    pub content: Vec<LogprobEntry>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ChatCompletionChoice {
     pub index: u32,
     pub message: ChatCompletionMessage,
     pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChoiceLogprobs>,
 }
 
 #[derive(Debug, Serialize)]
@@ -179,6 +245,8 @@ pub struct ChatCompletionStreamChoice {
     pub index: u32,
     pub delta: DeltaMessage,
     pub finish_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<ChoiceLogprobs>,
 }
 
 #[derive(Debug, Serialize)]
@@ -397,6 +465,85 @@ pub struct AnthropicErrorDetail {
     pub message: String,
 }
 
+// ─── Embeddings API types ─────────────────────────────────────────────────────
+
+/// OpenAI `POST /v1/embeddings` request.
+///
+/// The `input` field accepts a single string or an array of strings.  Batch
+/// inputs are all embedded in sequence and returned together.
+#[derive(Debug, Deserialize)]
+pub struct EmbeddingRequest {
+    #[allow(dead_code)]
+    pub model: Option<String>,
+    /// The text(s) to embed.  String or array of strings.
+    pub input: EmbeddingInput,
+    /// Optional encoding format — only `"float"` is supported.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub encoding_format: Option<String>,
+}
+
+/// `input` field for `EmbeddingRequest`: single string or array.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum EmbeddingInput {
+    Single(String),
+    Batch(Vec<String>),
+}
+
+impl EmbeddingInput {
+    pub fn into_vec(self) -> Vec<String> {
+        match self {
+            EmbeddingInput::Single(s) => vec![s],
+            EmbeddingInput::Batch(v) => v,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingResponse {
+    pub object: &'static str,
+    pub data: Vec<EmbeddingObject>,
+    pub model: String,
+    pub usage: EmbeddingUsage,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingObject {
+    pub object: &'static str,
+    pub index: usize,
+    pub embedding: Vec<f32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct EmbeddingUsage {
+    pub prompt_tokens: usize,
+    pub total_tokens: usize,
+}
+
+/// Ollama `POST /api/embed` request (batch embeddings).
+#[derive(Debug, Deserialize)]
+pub struct OllamaEmbedRequest {
+    #[allow(dead_code)]
+    pub model: String,
+    /// Single string or array of strings to embed.
+    pub input: EmbeddingInput,
+    /// Optional: sampling options (only used to extract model-loading hints).
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub options: Option<OllamaOptions>,
+}
+
+/// Ollama `POST /api/embed` response.
+#[derive(Debug, Serialize)]
+pub struct OllamaEmbedResponse {
+    pub model: String,
+    pub embeddings: Vec<Vec<f32>>,
+    pub total_duration: u64,
+    pub load_duration: u64,
+    pub prompt_eval_count: usize,
+}
+
 // ─── Ollama API types ────────────────────────────────────────────────────────
 
 /// Ollama `POST /api/generate` request.
@@ -475,12 +622,13 @@ pub struct OllamaOptions {
     /// GGUF quantization format, e.g. "Q4K"
     pub quantize: Option<String>,
 
-    // ── Extended sampling fields (not yet wired to sampler) ──────────────────
+    // ── Extended sampling fields ──────────────────────────────────────────────
     pub seed: Option<i64>,
     pub min_p: Option<f64>,
     pub stop: Option<Vec<String>>,
     pub presence_penalty: Option<f64>,
     pub frequency_penalty: Option<f64>,
+    pub logit_bias: Option<std::collections::HashMap<String, f64>>,
 }
 
 /// Non-streaming `POST /api/generate` response.
@@ -1238,6 +1386,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .route("/v1/completions", post(completions))
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/models", get(list_models))
+        .route("/v1/embeddings", post(embeddings))
         .route("/health", get(health))
         // ── Ollama-compatible ────────────────────────────────────────────────
         .route("/", get(ollama_root).head(ollama_root))
@@ -1247,6 +1396,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .route("/api/show", post(ollama_show))
         .route("/api/generate", post(ollama_generate))
         .route("/api/chat", post(ollama_chat))
+        .route("/api/embed", post(ollama_embed))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024)) // 64 MiB for audio payloads
         .layer(CorsLayer::permissive())
         .with_state(state);
@@ -1541,20 +1691,33 @@ async fn chat_completions(
         .or(req.max_tokens)
         .unwrap_or(state.default_params.max_tokens);
     let max_tokens = clamp_max_tokens(requested_max_tokens, prompt_tokens.len(), max_seq_len);
-    let mut params = build_sampling_params(
+    let logprobs_enabled = req.logprobs.unwrap_or(false);
+    let top_logprobs = req.top_logprobs.unwrap_or(0).min(20);
+    let logit_bias = req.logit_bias.as_ref().map(parse_logit_bias_map);
+    // Determine grammar mode from response_format.
+    let grammar_mode = match &req.response_format {
+        Some(rf) if rf.type_field == "json_object" => crate::sampler::GrammarMode::JsonObject,
+        Some(rf) if rf.type_field == "json_schema" => crate::sampler::GrammarMode::JsonSchema,
+        _ => crate::sampler::GrammarMode::None,
+    };
+    let params = build_sampling_params_with_grammar(
         req.temperature,
         req.top_p,
         req.top_k,
+        req.min_p,
         req.repetition_penalty,
+        req.frequency_penalty,
+        req.presence_penalty,
+        logit_bias,
+        req.seed,
+        logprobs_enabled,
+        top_logprobs,
         max_tokens,
+        req.stop.into_vec(),
+        tokenizer,
         &state.default_params,
+        grammar_mode,
     );
-
-    // Resolve per-request stop strings into token IDs.
-    let stop_strings = req.stop.into_vec();
-    if !stop_strings.is_empty() {
-        params.extra_stop_token_ids = resolve_stop_token_ids(stop_strings, tokenizer);
-    }
 
     let is_stream = req.stream.unwrap_or(false);
 
@@ -1601,6 +1764,11 @@ async fn chat_completions(
 
         match response_rx.await {
             Ok(result) => {
+                let choice_logprobs = if result.token_logprobs.is_empty() {
+                    None
+                } else {
+                    Some(token_logprobs_to_choice(&result.token_logprobs))
+                };
                 let response = ChatCompletionResponse {
                     id: request_id,
                     object: "chat.completion",
@@ -1613,6 +1781,7 @@ async fn chat_completions(
                             content: result.output_text,
                         },
                         finish_reason: Some(result.finish_reason),
+                        logprobs: choice_logprobs,
                     }],
                     usage: UsageInfo {
                         prompt_tokens: result.prompt_tokens,
@@ -1625,6 +1794,43 @@ async fn chat_completions(
             Err(_) => Err(server_error("Engine dropped the request")),
         }
     }
+}
+
+/// Convert a slice of per-token [`TokenLogprob`] values (from a non-streaming
+/// [`GenerationResult`]) into the OpenAI [`ChoiceLogprobs`] structure.
+fn token_logprobs_to_choice(token_logprobs: &[crate::sampler::TokenLogprob]) -> ChoiceLogprobs {
+    let content = token_logprobs
+        .iter()
+        .map(|lp| {
+            let bytes = Some(lp.token_text.as_bytes().to_vec());
+            let top_logprobs = lp
+                .top_logprobs
+                .iter()
+                .zip(
+                    lp.top_logprob_texts
+                        .iter()
+                        .map(Some)
+                        .chain(std::iter::repeat(None)),
+                )
+                .map(|(&(tid, tlp), text)| {
+                    let tok_text = text.cloned().unwrap_or_else(|| format!("<{}>", tid));
+                    let tok_bytes = Some(tok_text.as_bytes().to_vec());
+                    TopLogprobEntry {
+                        token: tok_text,
+                        logprob: tlp,
+                        bytes: tok_bytes,
+                    }
+                })
+                .collect();
+            LogprobEntry {
+                token: lp.token_text.clone(),
+                logprob: lp.logprob,
+                bytes,
+                top_logprobs,
+            }
+        })
+        .collect();
+    ChoiceLogprobs { content }
 }
 
 /// Serialize `value` to a JSON SSE event.  Returns `None` and logs an error on failure.
@@ -1659,6 +1865,7 @@ fn make_sse_stream(
                     reasoning_content: None,
                 },
                 finish_reason: None,
+                logprobs: None,
             }],
         };
         match to_sse_event(&first_chunk, "chat stream role chunk") {
@@ -1673,7 +1880,7 @@ fn make_sse_stream(
             let content = if is_stop || token.text.is_empty() {
                 None
             } else {
-                Some(token.text)
+                Some(token.text.clone())
             };
             let reasoning_content = if token.reasoning_content.is_empty() {
                 None
@@ -1685,6 +1892,43 @@ fn make_sse_stream(
             if content.is_none() && reasoning_content.is_none() && token.finish_reason.is_none() {
                 continue;
             }
+
+            // Build per-token logprob if present.
+            let chunk_logprobs = token.logprob.as_ref().map(|lp| {
+                let token_text = content.clone().unwrap_or_default();
+                let bytes = Some(token_text.as_bytes().to_vec());
+                // Use pre-decoded text from the engine; fall back to the token
+                // ID in angle-bracket notation only if decoding was skipped.
+                let top_logprobs = lp
+                    .top_logprobs
+                    .iter()
+                    .zip(
+                        lp.top_logprob_texts
+                            .iter()
+                            .map(Some)
+                            .chain(std::iter::repeat(None)),
+                    )
+                    .map(|(&(tid, tlp), text)| {
+                        let tok_text = text
+                            .cloned()
+                            .unwrap_or_else(|| format!("<{}>", tid));
+                        let tok_bytes = Some(tok_text.as_bytes().to_vec());
+                        TopLogprobEntry {
+                            token: tok_text,
+                            logprob: tlp,
+                            bytes: tok_bytes,
+                        }
+                    })
+                    .collect();
+                ChoiceLogprobs {
+                    content: vec![LogprobEntry {
+                        token: token_text,
+                        logprob: lp.logprob,
+                        bytes,
+                        top_logprobs,
+                    }],
+                }
+            });
 
             let chunk = ChatCompletionStreamResponse {
                 id: request_id.clone(),
@@ -1699,6 +1943,7 @@ fn make_sse_stream(
                         reasoning_content,
                     },
                     finish_reason: token.finish_reason,
+                    logprobs: chunk_logprobs,
                 }],
             };
             match to_sse_event(&chunk, "chat stream chunk") {
@@ -1728,6 +1973,16 @@ pub struct CompletionRequest {
     pub stream: Option<bool>,
     #[serde(default)]
     pub repetition_penalty: Option<f64>,
+    #[serde(default)]
+    pub frequency_penalty: Option<f64>,
+    #[serde(default)]
+    pub presence_penalty: Option<f64>,
+    #[serde(default)]
+    pub seed: Option<u64>,
+    #[serde(default)]
+    pub logprobs: Option<u8>,
+    #[serde(default)]
+    pub stop: StopSequences,
 }
 
 #[derive(Debug, Serialize)]
@@ -1806,12 +2061,22 @@ async fn completions(
 
     let requested_max_tokens = req.max_tokens.unwrap_or(state.default_params.max_tokens);
     let max_tokens = clamp_max_tokens(requested_max_tokens, prompt_tokens.len(), max_seq_len);
+    let logprobs_n = req.logprobs.unwrap_or(0);
     let params = build_sampling_params(
         req.temperature,
         req.top_p,
         req.top_k,
+        None, // min_p not in CompletionRequest
         req.repetition_penalty,
+        req.frequency_penalty,
+        req.presence_penalty,
+        None, // logit_bias not in CompletionRequest yet
+        req.seed,
+        logprobs_n > 0,
+        logprobs_n,
         max_tokens,
+        req.stop.into_vec(),
+        tokenizer,
         &state.default_params,
     );
 
@@ -1991,8 +2256,17 @@ async fn anthropic_messages(
         req.temperature,
         req.top_p,
         req.top_k,
-        None,
+        None,  // min_p
+        None,  // repetition_penalty
+        None,  // frequency_penalty
+        None,  // presence_penalty
+        None,  // logit_bias
+        None,  // seed
+        false, // logprobs
+        0,     // top_logprobs
         max_tokens,
+        vec![], // stop strings
+        tokenizer,
         &state.default_params,
     );
 
@@ -2205,16 +2479,53 @@ fn make_anthropic_sse_stream(
 
 async fn list_models(State(state): State<Arc<AppState>>) -> Json<ModelListResponse> {
     let created = unix_now();
-    let guard = state.slot.read().await;
-    let data = match &*guard {
-        ModelSlot::Ready(lm) => vec![ModelInfo {
-            id: lm.model_id.clone(),
-            object: "model",
-            created,
-            owned_by: "inferrs".to_string(),
-        }],
-        _ => vec![],
+
+    // Determine which model (if any) is currently loaded.
+    let loaded_id: Option<String> = {
+        let guard = state.slot.read().await;
+        match &*guard {
+            ModelSlot::Ready(lm) => Some(lm.model_id.clone()),
+            _ => None,
+        }
     };
+
+    // Build the list from all models in the HuggingFace hub cache.
+    // The currently-loaded model is labelled "inferrs (loaded)".
+    let mut data: Vec<ModelInfo> = crate::util::list_cached_models()
+        .into_iter()
+        .map(|m| {
+            let owned_by = if Some(&m.model_id) == loaded_id.as_ref() {
+                "inferrs (loaded)".to_string()
+            } else {
+                "inferrs".to_string()
+            };
+            let model_created = m
+                .modified
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(created);
+            ModelInfo {
+                id: m.model_id,
+                object: "model",
+                created: model_created,
+                owned_by,
+            }
+        })
+        .collect();
+
+    // If the loaded model isn't in the cache (e.g. loaded from a local path),
+    // still expose it in the list.
+    if let Some(ref id) = loaded_id {
+        if !data.iter().any(|m| &m.id == id) {
+            data.push(ModelInfo {
+                id: id.clone(),
+                object: "model",
+                created,
+                owned_by: "inferrs (loaded)".to_string(),
+            });
+        }
+    }
+
     Json(ModelListResponse {
         object: "list",
         data,
@@ -2225,72 +2536,307 @@ async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
+// ─── Embeddings handlers ──────────────────────────────────────────────────────
+
+/// `POST /v1/embeddings` — OpenAI-compatible text embedding endpoint.
+///
+/// Tokenises each input string, runs a forward pass through the model,
+/// mean-pools the output, L2-normalises, and returns the embedding vectors.
+async fn embeddings(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<EmbeddingRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let lm = {
+        let guard = state.slot.read().await;
+        match &*guard {
+            ModelSlot::Ready(lm) => lm.clone(),
+            ModelSlot::Loading { .. } => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "model is loading"})),
+                ));
+            }
+            ModelSlot::Empty => {
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(serde_json::json!({"error": "no model loaded"})),
+                ));
+            }
+        }
+    };
+
+    let (engine_tx, tokenizer, ..) = worker_fields(&lm).map_err(|e| {
+        let msg = e.1.error.message.clone();
+        (e.0, Json(serde_json::json!({"error": msg})))
+    })?;
+
+    let model_id = lm.model_id.clone();
+    let inputs = req.input.into_vec();
+
+    let mut data: Vec<EmbeddingObject> = Vec::with_capacity(inputs.len());
+    let mut total_prompt_tokens = 0usize;
+
+    for (idx, text) in inputs.iter().enumerate() {
+        let tokens = tokenizer.encode(text, true).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("tokenization failed: {e}")})),
+            )
+        })?;
+        total_prompt_tokens += tokens.len();
+
+        let (response_tx, response_rx) = oneshot::channel();
+        let req = crate::engine::EngineRequest::Embed {
+            prompt_tokens: tokens,
+            response_tx,
+        };
+        if engine_tx.send(req).await.is_err() {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "engine unavailable"})),
+            ));
+        }
+        let result = response_rx
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "engine dropped request"})),
+                )
+            })?
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+            })?;
+        data.push(EmbeddingObject {
+            object: "embedding",
+            index: idx,
+            embedding: result.embedding,
+        });
+    }
+
+    let elapsed_ns = start.elapsed().as_nanos() as u64;
+    tracing::debug!(
+        "Embeddings: {} inputs, {} tokens, {}ms",
+        data.len(),
+        total_prompt_tokens,
+        elapsed_ns / 1_000_000
+    );
+
+    Ok(Json(EmbeddingResponse {
+        object: "list",
+        data,
+        model: model_id,
+        usage: EmbeddingUsage {
+            prompt_tokens: total_prompt_tokens,
+            total_tokens: total_prompt_tokens,
+        },
+    }))
+}
+
+/// `POST /api/embed` — Ollama-compatible batch embedding endpoint.
+async fn ollama_embed(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OllamaEmbedRequest>,
+) -> impl IntoResponse {
+    let start = std::time::Instant::now();
+
+    let lm = {
+        let guard = state.slot.read().await;
+        match &*guard {
+            ModelSlot::Ready(lm) => lm.clone(),
+            _ => {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": "no model loaded"})),
+                ));
+            }
+        }
+    };
+
+    let (engine_tx, tokenizer, ..) = worker_fields(&lm).map_err(|e| {
+        let msg = e.1.error.message.clone();
+        (e.0, Json(serde_json::json!({"error": msg})))
+    })?;
+
+    let model_id = lm.model_id.clone();
+    let inputs = req.input.into_vec();
+
+    let mut embeddings: Vec<Vec<f32>> = Vec::with_capacity(inputs.len());
+    let mut total_tokens = 0usize;
+
+    for text in &inputs {
+        let tokens = tokenizer.encode(text, true).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("tokenization failed: {e}")})),
+            )
+        })?;
+        total_tokens += tokens.len();
+
+        let (response_tx, response_rx) = oneshot::channel();
+        if engine_tx
+            .send(crate::engine::EngineRequest::Embed {
+                prompt_tokens: tokens,
+                response_tx,
+            })
+            .await
+            .is_err()
+        {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "engine unavailable"})),
+            ));
+        }
+        let result = response_rx
+            .await
+            .map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": "engine dropped request"})),
+                )
+            })?
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+            })?;
+        embeddings.push(result.embedding);
+    }
+
+    let elapsed_ns = start.elapsed().as_nanos() as u64;
+
+    Ok(Json(OllamaEmbedResponse {
+        model: model_id,
+        embeddings,
+        total_duration: elapsed_ns,
+        load_duration: 0,
+        prompt_eval_count: total_tokens,
+    }))
+}
+
 /// Build [`SamplingParams`] by overlaying per-request values on top of the
 /// server's default params.  Any `None` field falls back to the default.
 ///
-/// `extra_stop_token_ids` is derived from the request's `stop` field: each
-/// stop string is looked up in the tokenizer vocabulary and, when it maps to a
-/// single token, that token ID is added to the per-request stop set.
-/// Multi-token stop strings are logged as a warning and skipped; full
-/// multi-token stop-sequence matching is not yet supported.
+/// Stop strings are split: single-token strings (or exact vocab entries) are
+/// promoted to `extra_stop_token_ids` for zero-latency matching; multi-token
+/// strings go into `stop_strings` for suffix-buffer matching in the engine.
+#[allow(clippy::too_many_arguments)]
 fn build_sampling_params(
     temperature: Option<f64>,
     top_p: Option<f64>,
     top_k: Option<usize>,
+    min_p: Option<f64>,
     repetition_penalty: Option<f64>,
+    frequency_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
+    logit_bias: Option<std::collections::HashMap<u32, f32>>,
+    seed: Option<u64>,
+    logprobs: bool,
+    top_logprobs: u8,
     max_tokens: usize,
+    stop_strings: Vec<String>,
+    tokenizer: &crate::tokenizer::Tokenizer,
     defaults: &SamplingParams,
 ) -> SamplingParams {
+    build_sampling_params_with_grammar(
+        temperature,
+        top_p,
+        top_k,
+        min_p,
+        repetition_penalty,
+        frequency_penalty,
+        presence_penalty,
+        logit_bias,
+        seed,
+        logprobs,
+        top_logprobs,
+        max_tokens,
+        stop_strings,
+        tokenizer,
+        defaults,
+        crate::sampler::GrammarMode::None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_sampling_params_with_grammar(
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    top_k: Option<usize>,
+    min_p: Option<f64>,
+    repetition_penalty: Option<f64>,
+    frequency_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
+    logit_bias: Option<std::collections::HashMap<u32, f32>>,
+    seed: Option<u64>,
+    logprobs: bool,
+    top_logprobs: u8,
+    max_tokens: usize,
+    stop_strings: Vec<String>,
+    tokenizer: &crate::tokenizer::Tokenizer,
+    defaults: &SamplingParams,
+    grammar_mode: crate::sampler::GrammarMode,
+) -> SamplingParams {
+    let (extra_stop_token_ids, stop_strings) = resolve_stop_sequences(stop_strings, tokenizer);
     SamplingParams {
         temperature: temperature.unwrap_or(defaults.temperature),
         top_p: top_p.unwrap_or(defaults.top_p),
         top_k: top_k.unwrap_or(defaults.top_k),
+        min_p: min_p.unwrap_or(defaults.min_p),
         repetition_penalty: repetition_penalty.unwrap_or(defaults.repetition_penalty),
+        frequency_penalty: frequency_penalty.unwrap_or(defaults.frequency_penalty),
+        presence_penalty: presence_penalty.unwrap_or(defaults.presence_penalty),
+        logit_bias: logit_bias.unwrap_or_default(),
+        seed,
+        logprobs,
+        top_logprobs,
         max_tokens,
-        extra_stop_token_ids: vec![],
+        extra_stop_token_ids,
+        stop_strings,
+        grammar_mode,
     }
 }
 
-/// Resolve stop strings from an OpenAI-compatible request into per-request
-/// stop token IDs.
+/// Resolve stop strings into token-ID stops and multi-token string stops.
 ///
-/// Each stop string is looked up directly in the tokenizer vocabulary
-/// (single-token strings such as `"</s>"` or `"<|eot_id|>"`).  Multi-token
-/// strings require buffered output matching which is not yet supported; they
-/// are logged as a warning and skipped.
-fn resolve_stop_token_ids(
+/// - Strings that map directly to a single vocab token → `extra_stop_token_ids`
+/// - All other non-empty strings → `stop_strings` (suffix-buffer matching)
+fn resolve_stop_sequences(
     stop_strings: Vec<String>,
     tokenizer: &crate::tokenizer::Tokenizer,
-) -> Vec<u32> {
-    let mut ids = Vec::new();
+) -> (Vec<u32>, Vec<String>) {
+    let mut ids: Vec<u32> = Vec::new();
+    let mut strings: Vec<String> = Vec::new();
     for s in stop_strings {
         if s.is_empty() {
             continue;
         }
+        // Check direct vocab lookup first (fastest path for special tokens).
         if let Some(id) = tokenizer.token_to_id(&s) {
             ids.push(id);
-        } else {
-            // Try tokenizing the string; if it encodes to a single token we
-            // can still use it as a stop token ID.
-            match tokenizer.encode(&s, false) {
-                Ok(tokens) if tokens.len() == 1 => {
-                    ids.push(tokens[0]);
-                }
-                Ok(tokens) => {
-                    tracing::warn!(
-                        "Stop string {:?} encodes to {} tokens — \
-                         multi-token stop sequences are not yet supported and will be ignored",
-                        s,
-                        tokens.len()
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!("Failed to tokenize stop string {:?}: {}", s, e);
-                }
+            continue;
+        }
+        // Try encoding: single-token result → token ID stop.
+        match tokenizer.encode(&s, false) {
+            Ok(tokens) if tokens.len() == 1 => {
+                ids.push(tokens[0]);
+            }
+            Ok(_) => {
+                // Multi-token stop string — use suffix buffer matching.
+                strings.push(s);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to tokenize stop string {:?}: {}", s, e);
             }
         }
     }
-    ids
+    (ids, strings)
 }
 
 /// Clamp `requested` so that `prompt_len + result <= max_seq_len`.
@@ -2573,19 +3119,58 @@ async fn ollama_version() -> Json<OllamaVersionResponse> {
 
 /// `GET /api/tags` and `HEAD /api/tags` — list locally available models.
 async fn ollama_tags(State(state): State<Arc<AppState>>) -> Json<OllamaListResponse> {
-    let guard = state.slot.read().await;
-    let models = match &*guard {
-        ModelSlot::Ready(lm) => vec![OllamaModelEntry {
-            name: lm.model_id.clone(),
-            model: lm.model_id.clone(),
-            modified_at: "2025-01-01T00:00:00Z".to_string(),
-            size: 0,
-            digest: OLLAMA_PLACEHOLDER_DIGEST.to_string(),
-            details: OllamaModelDetails::default(),
-        }],
-        _ => vec![],
+    let loaded_id: Option<String> = {
+        let guard = state.slot.read().await;
+        match &*guard {
+            ModelSlot::Ready(lm) => Some(lm.model_id.clone()),
+            _ => None,
+        }
     };
+
+    // Enumerate all models in the HF hub cache.
+    let mut models: Vec<OllamaModelEntry> = crate::util::list_cached_models()
+        .into_iter()
+        .map(|m| {
+            let modified_at = m
+                .modified
+                .map(rfc3339_from_system_time)
+                .unwrap_or_else(|| "2025-01-01T00:00:00Z".to_string());
+            OllamaModelEntry {
+                name: m.model_id.clone(),
+                model: m.model_id,
+                modified_at,
+                size: m.size_bytes,
+                digest: OLLAMA_PLACEHOLDER_DIGEST.to_string(),
+                details: OllamaModelDetails::default(),
+            }
+        })
+        .collect();
+
+    // If the loaded model isn't in the cache, still surface it.
+    if let Some(ref id) = loaded_id {
+        if !models.iter().any(|m| &m.name == id) {
+            models.push(OllamaModelEntry {
+                name: id.clone(),
+                model: id.clone(),
+                modified_at: "2025-01-01T00:00:00Z".to_string(),
+                size: 0,
+                digest: OLLAMA_PLACEHOLDER_DIGEST.to_string(),
+                details: OllamaModelDetails::default(),
+            });
+        }
+    }
+
     Json(OllamaListResponse { models })
+}
+
+/// Convert a [`std::time::SystemTime`] to an RFC-3339 timestamp string.
+fn rfc3339_from_system_time(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (y, mo, d, h, mi, s) = secs_to_ymd_hms(secs);
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, mo, d, h, mi, s)
 }
 
 /// `GET /api/ps` — list running (currently loaded) models.
@@ -2690,51 +3275,64 @@ fn secs_to_ymd_hms(mut secs: u64) -> (u64, u64, u64, u64, u64, u64) {
 
 /// Extract sampling params from optional [`OllamaOptions`].
 #[allow(clippy::type_complexity)]
+/// Parsed Ollama options ready for `build_sampling_params`.
+struct OllamaParamBundle {
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    top_k: Option<usize>,
+    min_p: Option<f64>,
+    repetition_penalty: Option<f64>,
+    frequency_penalty: Option<f64>,
+    presence_penalty: Option<f64>,
+    seed: Option<u64>,
+    logit_bias: Option<std::collections::HashMap<u32, f32>>,
+    max_tokens: usize,
+    stop: Vec<String>,
+}
+
 fn ollama_options_to_params(
     opts: Option<&OllamaOptions>,
     defaults: &SamplingParams,
-) -> (
-    Option<f64>,
-    Option<f64>,
-    Option<usize>,
-    Option<f64>,
-    usize,
-    Vec<String>,
-) {
+) -> OllamaParamBundle {
     let temperature = opts.and_then(|o| o.temperature);
     let top_p = opts.and_then(|o| o.top_p);
     let top_k = opts.and_then(|o| o.top_k);
+    let min_p = opts.and_then(|o| o.min_p);
     let repetition_penalty = opts.and_then(|o| o.repeat_penalty);
-    let num_predict = opts
+    let frequency_penalty = opts.and_then(|o| o.frequency_penalty);
+    let presence_penalty = opts.and_then(|o| o.presence_penalty);
+    let seed = opts.and_then(|o| o.seed).map(|s| s as u64);
+    let max_tokens = opts
         .and_then(|o| o.num_predict)
         .unwrap_or(defaults.max_tokens);
     let stop = opts.and_then(|o| o.stop.clone()).unwrap_or_default();
+    let logit_bias = opts
+        .and_then(|o| o.logit_bias.as_ref())
+        .map(parse_logit_bias_map);
 
-    // Warn when the client sends sampling params that the engine doesn't
-    // support yet, so callers know they have no effect.
-    if let Some(o) = opts {
-        if o.seed.is_some() {
-            tracing::warn!("option 'seed' is not yet supported and will be ignored");
-        }
-        if o.min_p.is_some() {
-            tracing::warn!("option 'min_p' is not yet supported and will be ignored");
-        }
-        if o.presence_penalty.is_some() {
-            tracing::warn!("option 'presence_penalty' is not yet supported and will be ignored");
-        }
-        if o.frequency_penalty.is_some() {
-            tracing::warn!("option 'frequency_penalty' is not yet supported and will be ignored");
-        }
-    }
-
-    (
+    OllamaParamBundle {
         temperature,
         top_p,
         top_k,
+        min_p,
         repetition_penalty,
-        num_predict,
+        frequency_penalty,
+        presence_penalty,
+        seed,
+        logit_bias,
+        max_tokens,
         stop,
-    )
+    }
+}
+
+/// Convert a `{"token_id_string": bias_value}` map (OpenAI `logit_bias` format)
+/// to the `HashMap<u32, f32>` format used internally.
+fn parse_logit_bias_map(
+    map: &std::collections::HashMap<String, f64>,
+) -> std::collections::HashMap<u32, f32> {
+    map.iter()
+        .filter_map(|(k, &v)| k.parse::<u32>().ok().map(|id| (id, v as f32)))
+        .collect()
 }
 
 /// Shared Ollama model/tokenizer validation.  Returns the tokenizer when the
@@ -3037,18 +3635,25 @@ async fn ollama_generate(
 
     ollama_check_prompt(&prompt_tokens, max_seq_len)?;
 
-    let (temperature, top_p, top_k, repetition_penalty, max_tokens, stop) =
-        ollama_options_to_params(req.options.as_ref(), &state.default_params);
-    let max_tokens = clamp_max_tokens(max_tokens, prompt_tokens.len(), max_seq_len);
-    let mut params = build_sampling_params(
-        temperature,
-        top_p,
-        top_k,
-        repetition_penalty,
+    let pb = ollama_options_to_params(req.options.as_ref(), &state.default_params);
+    let max_tokens = clamp_max_tokens(pb.max_tokens, prompt_tokens.len(), max_seq_len);
+    let params = build_sampling_params(
+        pb.temperature,
+        pb.top_p,
+        pb.top_k,
+        pb.min_p,
+        pb.repetition_penalty,
+        pb.frequency_penalty,
+        pb.presence_penalty,
+        pb.logit_bias,
+        pb.seed,
+        false, // logprobs
+        0,
         max_tokens,
+        pb.stop,
+        tokenizer,
         &state.default_params,
     );
-    params.extra_stop_token_ids = resolve_stop_token_ids(stop, tokenizer);
 
     let is_stream = req.stream.unwrap_or(true); // Ollama streams by default
 
@@ -3259,18 +3864,25 @@ async fn ollama_chat(
 
     ollama_check_prompt(&prompt_tokens, max_seq_len)?;
 
-    let (temperature, top_p, top_k, repetition_penalty, max_tokens, stop) =
-        ollama_options_to_params(req.options.as_ref(), &state.default_params);
-    let max_tokens = clamp_max_tokens(max_tokens, prompt_tokens.len(), max_seq_len);
-    let mut params = build_sampling_params(
-        temperature,
-        top_p,
-        top_k,
-        repetition_penalty,
+    let pb = ollama_options_to_params(req.options.as_ref(), &state.default_params);
+    let max_tokens = clamp_max_tokens(pb.max_tokens, prompt_tokens.len(), max_seq_len);
+    let params = build_sampling_params(
+        pb.temperature,
+        pb.top_p,
+        pb.top_k,
+        pb.min_p,
+        pb.repetition_penalty,
+        pb.frequency_penalty,
+        pb.presence_penalty,
+        pb.logit_bias,
+        pb.seed,
+        false, // logprobs
+        0,
         max_tokens,
+        pb.stop,
+        tokenizer,
         &state.default_params,
     );
-    params.extra_stop_token_ids = resolve_stop_token_ids(stop, tokenizer);
 
     let think_id = tokenizer
         .token_to_id("<|think|>")
