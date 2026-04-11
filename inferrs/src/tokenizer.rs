@@ -251,6 +251,8 @@ pub enum ChatTemplate {
     Gemma3,
     /// Gemma4 format: <bos><|turn>role\ncontent<turn|>\n
     Gemma4,
+    /// Phi format: pipe-delimited role markers with end token
+    Phi,
     /// Generic format: just concatenate with role markers
     #[allow(dead_code)]
     Generic,
@@ -324,6 +326,7 @@ impl Tokenizer {
         // Detect chat template, optionally overriding based on known architecture
         let chat_template = match arch_override {
             Some(crate::config::ModelArchitecture::Gemma4) => ChatTemplate::Gemma4,
+            Some(crate::config::ModelArchitecture::Phi3) => ChatTemplate::Phi,
             _ => detect_chat_template(&config),
         };
 
@@ -339,7 +342,13 @@ impl Tokenizer {
         if let Some(id) = eos_token_id {
             stop_token_ids.push(id);
         }
-        for extra in &["<|endoftext|>", "<|im_end|>", "<end_of_turn>", "<turn|>"] {
+        for extra in &[
+            "<|endoftext|>",
+            "<|im_end|>",
+            "<end_of_turn>",
+            "<turn|>",
+            "<|end|>",
+        ] {
             if let Some(id) = inner.token_to_id(extra) {
                 if !stop_token_ids.contains(&id) {
                     stop_token_ids.push(id);
@@ -408,6 +417,7 @@ impl Tokenizer {
             ChatTemplate::Gemma => apply_gemma(messages, &self.bos_token),
             ChatTemplate::Gemma3 => apply_gemma3(messages),
             ChatTemplate::Gemma4 => apply_gemma4(messages),
+            ChatTemplate::Phi => apply_phi(messages),
             ChatTemplate::Generic => apply_generic(messages),
         };
         Ok(prompt)
@@ -701,6 +711,20 @@ fn apply_gemma4_inner(
         prompt.push_str(&format!("<|turn>{}\n{}<turn|>\n", role, content));
     }
     prompt.push_str("<|turn>model\n");
+    prompt
+}
+
+fn apply_phi(messages: &[ChatMessage]) -> String {
+    let normalized = normalize_messages(messages, |role| match role {
+        Role::System => "system",
+        Role::User | Role::Tool | Role::Function => "user",
+        Role::Assistant => "assistant",
+    });
+    let mut prompt = String::new();
+    for (role, content) in &normalized {
+        prompt.push_str(&format!("<|{role}|>{content}<|end|>\n"));
+    }
+    prompt.push_str("<|assistant|>");
     prompt
 }
 
@@ -1214,5 +1238,40 @@ mod tests {
         // User follow-up is present.
         assert!(prompt.contains("Thanks!"));
         assert!(prompt.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn phi_template_basic() {
+        let msgs = vec![user_msg("Hello!")];
+        let prompt = apply_phi(&msgs);
+        assert!(prompt.contains("<|user|>Hello!<|end|>"));
+        assert!(prompt.ends_with("<|assistant|>"));
+    }
+
+    #[test]
+    fn phi_template_multi_turn() {
+        let msgs = vec![
+            system_msg("You are helpful."),
+            user_msg("Hi"),
+            assistant_msg("Hello!"),
+            user_msg("How are you?"),
+        ];
+        let prompt = apply_phi(&msgs);
+        assert!(prompt.contains("<|system|>You are helpful.<|end|>"));
+        assert!(prompt.contains("<|user|>Hi<|end|>"));
+        assert!(prompt.contains("<|assistant|>Hello!<|end|>"));
+        assert!(prompt.contains("<|user|>How are you?<|end|>"));
+        assert!(prompt.ends_with("<|assistant|>"));
+    }
+
+    #[test]
+    fn phi_template_system_prompt() {
+        let msgs = vec![system_msg("Be concise."), user_msg("What is 1+1?")];
+        let prompt = apply_phi(&msgs);
+        // System message should come first
+        let sys_pos = prompt.find("<|system|>").unwrap();
+        let user_pos = prompt.find("<|user|>").unwrap();
+        assert!(sys_pos < user_pos, "system must come before user");
+        assert!(prompt.ends_with("<|assistant|>"));
     }
 }

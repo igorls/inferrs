@@ -158,6 +158,7 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         dtype,
         &device,
         args.turbo_quant.0,
+        &model_files.config_path,
     )?;
 
     let engine_tokenizer = Tokenizer::from_file_with_arch(
