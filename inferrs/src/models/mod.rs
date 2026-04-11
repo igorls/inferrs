@@ -6,6 +6,7 @@
 pub mod attention_utils;
 pub mod audio_encoder;
 pub mod gemma4;
+pub mod quantized_linear;
 pub mod qwen3;
 pub mod qwen3_5;
 pub mod vision_encoder;
@@ -17,7 +18,7 @@ use std::path::Path;
 
 use crate::config::{ModelArchitecture, RawConfig, VisionConfig};
 use crate::kv_cache::{BlockTable, PagedKvStore};
-use gemma4::QGgufVarBuilder;
+use quantized_linear::QGgufVarBuilder;
 
 /// Unified model interface for the engine.
 pub trait CausalLM: Send {
@@ -500,17 +501,24 @@ pub fn load_model(
 
     // For Gemma4 loaded from GGUF, also build a QGgufVarBuilder that keeps
     // weights in their quantized form (e.g. Q4K) so that projection layers
-    // use QMatMul::QTensor → Metal's quantized GEMV kernel during decode.
+    // use QMatMul::QTensor → quantized GEMV kernel during decode.
     // This is the same strategy llama.cpp uses and gives ~3-4× decode speedup.
-    let gemma4_qvb: Option<QGgufVarBuilder> = if matches!(arch, ModelArchitecture::Gemma4) {
+    // NOTE: Only enabled for architectures that have been updated to use
+    // qlinear_b. Enabling it before the model uses QLinear would load weights
+    // twice (quantized + dequantized), doubling memory usage.
+    let qvb: Option<QGgufVarBuilder> = if matches!(arch, ModelArchitecture::Gemma4) {
         gguf_path.and_then(|p| {
             match QGgufVarBuilder::from_gguf(p, device) {
                 Ok(qvb) => {
-                    tracing::info!("Gemma4: using quantized weight projection (QMatMul) for GGUF model");
+                    tracing::info!(
+                        "{arch:?}: using quantized weight projection (QMatMul) for GGUF model"
+                    );
                     Some(qvb)
                 }
                 Err(e) => {
-                    tracing::warn!("Gemma4: failed to build QGgufVarBuilder, falling back to dequantized weights: {e}");
+                    tracing::warn!(
+                        "{arch:?}: failed to build QGgufVarBuilder, falling back to dequantized weights: {e}"
+                    );
                     None
                 }
             }
@@ -598,7 +606,7 @@ pub fn load_model(
                 config.num_key_value_heads,
             );
             Box::new(Qwen35ModelWrapper {
-                inner: qwen3_5::Qwen35Model::new(&config, vb)?,
+                inner: qwen3_5::Qwen35Model::new(&config, vb, qvb.as_ref())?,
             })
         }
         ModelArchitecture::Gemma4 => {
@@ -610,8 +618,7 @@ pub fn load_model(
                 config.hidden_size,
                 config.num_key_value_heads,
             );
-            let inner =
-                gemma4::Gemma4Model::new(&config, vb.clone(), gemma4_qvb.as_ref(), gguf_path)?;
+            let inner = gemma4::Gemma4Model::new(&config, vb.clone(), qvb.as_ref(), gguf_path)?;
 
             // Load audio encoder if audio_config is present in the model config.
             let audio_encoder = if let Some(audio_cfg) = &raw_config.audio_config {

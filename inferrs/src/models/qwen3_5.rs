@@ -16,6 +16,7 @@ use crate::models::attention_utils::{
     append_kv_tq, apply_output_gate, apply_rms_norm_heads, apply_rope, causal_mask, compute_logits,
     paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, Mlp, PagedCtx, PagedPassCache,
 };
+use crate::models::quantized_linear::QGgufVarBuilder;
 use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
 
 fn rms_norm_with_offset(size: usize, eps: f64, vb: VarBuilder, offset: f64) -> Result<RmsNorm> {
@@ -85,7 +86,12 @@ struct FullAttention {
 }
 
 impl FullAttention {
-    fn new(cfg: &Qwen35Config, vb: VarBuilder, tq_cfg: Option<&TurboQuantConfig>) -> Result<Self> {
+    fn new(
+        cfg: &Qwen35Config,
+        vb: VarBuilder,
+        _qvb: Option<&QGgufVarBuilder>,
+        tq_cfg: Option<&TurboQuantConfig>,
+    ) -> Result<Self> {
         // q_proj outputs num_heads * head_dim * 2: first half is query, second half is the
         // output gate (attn_output_gate). The o_proj then takes num_heads * head_dim.
         let q_proj_out = cfg.num_attention_heads * cfg.head_dim * 2;
@@ -354,7 +360,7 @@ struct LinearAttn {
 }
 
 impl LinearAttn {
-    fn new(cfg: &Qwen35Config, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &Qwen35Config, vb: VarBuilder, _qvb: Option<&QGgufVarBuilder>) -> Result<Self> {
         let n_heads = cfg.linear_num_key_heads; // = linear_num_value_heads
         let head_k_dim = cfg.linear_key_head_dim;
         let head_v_dim = cfg.linear_value_head_dim;
@@ -644,6 +650,7 @@ impl DecoderLayer {
     fn new(
         cfg: &Qwen35Config,
         vb: VarBuilder,
+        qvb: Option<&QGgufVarBuilder>,
         is_full_attention: bool,
         tq_cfg: Option<&TurboQuantConfig>,
     ) -> Result<Self> {
@@ -651,10 +658,15 @@ impl DecoderLayer {
             LayerAttn::Full(Box::new(FullAttention::new(
                 cfg,
                 vb.pp("self_attn"),
+                qvb.map(|q| q.pp("self_attn")).as_ref(),
                 tq_cfg,
             )?))
         } else {
-            LayerAttn::Linear(LinearAttn::new(cfg, vb.pp("linear_attn"))?)
+            LayerAttn::Linear(LinearAttn::new(
+                cfg,
+                vb.pp("linear_attn"),
+                qvb.map(|q| q.pp("linear_attn")).as_ref(),
+            )?)
         };
         Ok(Self {
             attn,
@@ -750,9 +762,10 @@ pub struct Qwen35Model {
 }
 
 impl Qwen35Model {
-    pub fn new(cfg: &Qwen35Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Qwen35Config, vb: VarBuilder, qvb: Option<&QGgufVarBuilder>) -> Result<Self> {
         // All language model weights are under model.language_model.*
         let lm_vb = vb.pp("model").pp("language_model");
+        let lm_qvb = qvb.map(|q| q.pp("model").pp("language_model"));
 
         let embed_tokens = embedding(cfg.vocab_size, cfg.hidden_size, lm_vb.pp("embed_tokens"))?;
 
@@ -767,9 +780,15 @@ impl Qwen35Model {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for (i, layer_type) in cfg.layer_types.iter().enumerate() {
             let layer_vb = lm_vb.pp("layers").pp(i.to_string());
-            let layer =
-                DecoderLayer::new(cfg, layer_vb, layer_type.is_full_attention, tq_cfg.as_ref())
-                    .with_context(|| format!("loading layer {i}"))?;
+            let layer_qvb = lm_qvb.as_ref().map(|q| q.pp("layers").pp(i.to_string()));
+            let layer = DecoderLayer::new(
+                cfg,
+                layer_vb,
+                layer_qvb.as_ref(),
+                layer_type.is_full_attention,
+                tq_cfg.as_ref(),
+            )
+            .with_context(|| format!("loading layer {i}"))?;
             layers.push(layer);
         }
 
