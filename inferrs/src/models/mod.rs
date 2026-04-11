@@ -169,6 +169,7 @@ impl_causal_lm_wrapper!(
 );
 impl_causal_lm_wrapper!(Gemma2Model, candle_transformers::models::gemma2::Model);
 impl_causal_lm_wrapper!(Gemma3Model, candle_transformers::models::gemma3::Model);
+impl_causal_lm_wrapper!(Phi3Model, candle_transformers::models::phi3::Model);
 
 /// A Qwen3 model wrapper.
 struct Qwen3ModelWrapper {
@@ -473,6 +474,7 @@ fn var_builder_from_gguf(
 }
 
 /// Load a model from weight files.
+#[allow(clippy::too_many_arguments)]
 pub fn load_model(
     raw_config: &RawConfig,
     arch: &ModelArchitecture,
@@ -481,6 +483,7 @@ pub fn load_model(
     dtype: DType,
     device: &Device,
     turbo_quant_bits: Option<u8>,
+    config_path: &Path,
 ) -> Result<Box<dyn CausalLM>> {
     tracing::info!("Loading model weights ({:?} architecture)...", arch);
 
@@ -671,6 +674,23 @@ pub fn load_model(
                 pending_audio: None,
                 vision_encoder,
                 pending_image: None,
+            })
+        }
+        ModelArchitecture::Phi3 => {
+            let content = std::fs::read_to_string(config_path)
+                .context("Failed to read config.json for Phi3")?;
+            let config: candle_transformers::models::phi3::Config =
+                serde_json::from_str(&content).context("Failed to parse Phi3 config")?;
+            tracing::info!(
+                "Phi3 config: {} layers, {} heads, {} hidden, {} kv_heads, head_dim={}",
+                config.num_hidden_layers,
+                config.num_attention_heads,
+                config.hidden_size,
+                config.num_key_value_heads,
+                config.head_dim(),
+            );
+            Box::new(Phi3Model {
+                inner: candle_transformers::models::phi3::Model::new(&config, vb)?,
             })
         }
     };

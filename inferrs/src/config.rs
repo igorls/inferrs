@@ -14,6 +14,7 @@ pub enum ModelArchitecture {
     Gemma2,
     Gemma3,
     Gemma4,
+    Phi3,
 }
 
 /// Rope parameters nested object (used in Qwen3.5 text_config).
@@ -313,6 +314,9 @@ impl RawConfig {
                 if arch.contains("Gemma2") {
                     return Ok(ModelArchitecture::Gemma2);
                 }
+                if arch.contains("Phi3") {
+                    return Ok(ModelArchitecture::Phi3);
+                }
             }
         }
 
@@ -324,6 +328,7 @@ impl RawConfig {
                 "gemma4" => return Ok(ModelArchitecture::Gemma4),
                 "gemma3" => return Ok(ModelArchitecture::Gemma3),
                 "gemma2" => return Ok(ModelArchitecture::Gemma2),
+                "phi3" => return Ok(ModelArchitecture::Phi3),
                 _ => {}
             }
         }
@@ -671,6 +676,15 @@ impl RawConfig {
                 let tc = self.text_config.as_ref();
                 tc.and_then(|t| t.max_position_embeddings).unwrap_or(8192)
             }
+            ModelArchitecture::Phi3 => {
+                // Phi-3/Phi-4 configs always carry `max_position_embeddings`
+                // in practice (e.g. 131072 for LongRoPE variants, 16384 for
+                // Phi-4).  The fallback below is intentionally conservative
+                // (matches the original Phi-3-mini-4k context) so a
+                // malformed config cannot accidentally trigger a very large
+                // KV-cache allocation when the field is missing.
+                self.max_position_embeddings.unwrap_or(4096)
+            }
         }
     }
 
@@ -752,6 +766,24 @@ impl RawConfig {
                         .count()
                 };
                 (num_kv_heads, head_dim, num_full_attn)
+            }
+            ModelArchitecture::Phi3 => {
+                // Defaults below match `microsoft/Phi-4-mini-instruct` (the
+                // primary tested Phi3 target) and are only used as a
+                // last-resort fallback when the corresponding field is
+                // absent from `config.json`.  The authoritative config used
+                // by the model itself is the `phi3::Config` parsed directly
+                // in `load_model`; these values are just for KV-cache
+                // sizing when RawConfig fields are missing.  Prefer the
+                // explicit `head_dim` field over `hidden_size /
+                // num_attention_heads` to avoid silent integer truncation
+                // when `hidden_size` isn't divisible by the head count.
+                let num_kv_heads = self.num_key_value_heads.unwrap_or(8);
+                let num_attention_heads = self.num_attention_heads.unwrap_or(24);
+                let hidden_size = self.hidden_size.unwrap_or(3072);
+                let head_dim = self.head_dim.unwrap_or(hidden_size / num_attention_heads);
+                let num_layers = self.num_hidden_layers.unwrap_or(32);
+                (num_kv_heads, head_dim, num_layers)
             }
         }
     }
@@ -856,5 +888,17 @@ mod tests {
         assert!(g3.hidden_size > 0);
         assert!(g3.sliding_window > 0);
         assert!(g3.sliding_window_pattern > 0);
+    }
+
+    #[test]
+    fn detect_phi3_architecture() {
+        let cfg = config_with_arch(&["Phi3ForCausalLM"], "phi3");
+        assert_eq!(cfg.detect_architecture().unwrap(), ModelArchitecture::Phi3);
+    }
+
+    #[test]
+    fn detect_phi3_by_model_type() {
+        let cfg = config_with_arch(&["UnknownArch"], "phi3");
+        assert_eq!(cfg.detect_architecture().unwrap(), ModelArchitecture::Phi3);
     }
 }
