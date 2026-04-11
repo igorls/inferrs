@@ -1704,6 +1704,7 @@ dependencies = [
  "candle-transformers",
  "clap",
  "crossterm",
+ "flate2",
  "futures",
  "half",
  "hf-hub",

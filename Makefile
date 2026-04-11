@@ -21,9 +21,14 @@ HEXAGON_PKG := -p inferrs-backend-hexagon
 # and can be built anywhere (they probe at runtime via dlopen/LoadLibrary).
 NO_GPU_PKGS := -p inferrs -p inferrs-benchmark -p inferrs-backend-vulkan $(HEXAGON_PKG) -p inferrs-backend-openvino $(CUDA_PKG)
 
-.PHONY: all build release fmt clippy test
+.PHONY: all build release fmt clippy test ui
 
 all: fmt clippy test build
+
+# Convenience target: rebuild just the inferrs binary (which also re-runs
+# build.rs to recompress the web UI if inferrs/ui/index.html changed).
+ui:
+	cargo build -p inferrs
 
 build:
 	cargo build $(NO_GPU_PKGS)

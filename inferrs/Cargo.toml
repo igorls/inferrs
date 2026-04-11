@@ -101,6 +101,11 @@ libc = "0.2"
 libloading = "0.8"
 
 
+[build-dependencies]
+# Used by build.rs to gzip-compress ui/index.html → OUT_DIR/ui.html.gz at
+# compile time.  The server embeds the result and serves it in daemon mode.
+flate2 = "1"
+
 [dev-dependencies]
 ureq = { version = "2", features = ["json"] }
 serde_json = "1"

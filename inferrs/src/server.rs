@@ -4,10 +4,10 @@
 use anyhow::Result;
 use axum::{
     extract::{DefaultBodyLimit, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::{
         sse::{Event, Sse},
-        IntoResponse, Json,
+        IntoResponse, Json, Response,
     },
     routing::{get, post},
     Router,
@@ -1039,6 +1039,49 @@ fn image_error(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) 
     )
 }
 
+// ─── Embedded web UI ─────────────────────────────────────────────────────────
+
+/// Gzip-compressed single-file web UI, produced by `build.rs` at compile time
+/// from `ui/index.html`.  Served only in daemon mode (`inferrs serve` with no
+/// model argument) so that `inferrs serve <model>` remains a pure API server.
+static UI_HTML_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ui.html.gz"));
+
+/// `GET /` in daemon mode.
+///
+/// Browsers send `Accept: text/html,…` so they receive the embedded web UI.
+/// CLI tools (`curl`, Ollama clients, health checkers) omit that header or
+/// send `Accept: */*`, so they get the plain-text Ollama heartbeat string —
+/// exactly the same response as `inferrs serve <model>` returns.
+async fn daemon_root(req_headers: axum::http::HeaderMap) -> Response {
+    // Only serve the UI when the client explicitly lists `text/html` in Accept.
+    // `curl` sends nothing (or `Accept: */*`); Ollama clients send JSON accept
+    // types — neither contains the literal string "text/html".
+    let prefers_html = req_headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.contains("text/html"))
+        .unwrap_or(false);
+
+    if prefers_html {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+            .header(header::CONTENT_ENCODING, "gzip")
+            .header(header::CACHE_CONTROL, "no-cache")
+            // Vary: Accept so proxies cache the two representations separately.
+            .header(header::VARY, "Accept")
+            .body(axum::body::Body::from(UI_HTML_GZ))
+            .expect("static response is always valid")
+    } else {
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(header::VARY, "Accept")
+            .body(axum::body::Body::from("inferrs is running"))
+            .expect("static response is always valid")
+    }
+}
+
 // ─── Server startup ─────────────────────────────────────────────────────────
 
 /// Default port when a specific model is pre-loaded (OpenAI-style API).
@@ -1380,6 +1423,16 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         http_client: reqwest::Client::new(),
     });
 
+    // In daemon mode (`inferrs serve` with no model), negotiate content at GET /:
+    //   - browsers (Accept: text/html) → embedded web UI
+    //   - curl / Ollama clients (Accept: */*, or absent) → "inferrs is running"
+    // In worker mode (`inferrs serve <model>`), always return the plain heartbeat.
+    let root_get: axum::routing::MethodRouter<Arc<AppState>> = if model_id_hint.is_none() {
+        get(daemon_root)
+    } else {
+        get(ollama_root)
+    };
+
     let app = Router::new()
         // ── OpenAI-compatible ────────────────────────────────────────────────
         .route("/v1/chat/completions", post(chat_completions))
@@ -1389,7 +1442,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .route("/v1/embeddings", post(embeddings))
         .route("/health", get(health))
         // ── Ollama-compatible ────────────────────────────────────────────────
-        .route("/", get(ollama_root).head(ollama_root))
+        .route("/", root_get)
         .route("/api/version", get(ollama_version).head(ollama_version))
         .route("/api/tags", get(ollama_tags).head(ollama_tags))
         .route("/api/ps", get(ollama_ps))
