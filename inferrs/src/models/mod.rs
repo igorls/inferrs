@@ -6,6 +6,7 @@
 pub mod attention_utils;
 pub mod audio_encoder;
 pub mod gemma4;
+mod gemma4_moe;
 pub mod quantized_linear;
 pub mod qwen3;
 pub mod qwen3_5;
