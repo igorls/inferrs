@@ -1294,9 +1294,10 @@ async fn load_model_on_demand(
                 rx,
             } if model_matches_id(loading_id, model_id) => {
                 // Another task is already loading this model — wait on its result.
+                let loading_id = loading_id.clone();
                 let mut rx = rx.clone();
                 drop(guard); // release read lock before awaiting
-                return wait_for_slot_load(&mut rx).await;
+                return wait_for_slot_load(&mut rx, state, &loading_id).await;
             }
             _ => {}
         }
@@ -1316,9 +1317,10 @@ async fn load_model_on_demand(
                 model_id: loading_id,
                 rx: existing_rx,
             } if model_matches_id(loading_id, model_id) => {
+                let loading_id = loading_id.clone();
                 let mut rx = existing_rx.clone();
                 drop(guard);
-                return wait_for_slot_load(&mut rx).await;
+                return wait_for_slot_load(&mut rx, state, &loading_id).await;
             }
             _ => {}
         }
@@ -1383,16 +1385,37 @@ async fn load_model_on_demand(
 /// Wait for a `Loading` slot to resolve, returning the `Arc<LoadedModel>` or
 /// an error.  Called by concurrent requests that arrive while a load is already
 /// in progress.
+///
+/// When the sender (the task performing the load) is dropped without publishing
+/// a result (e.g. the background thread panicked before sending), the slot is
+/// reset to `Empty` so that the next request can trigger a fresh load attempt
+/// rather than remaining stuck in `Loading` forever.
 async fn wait_for_slot_load(
     rx: &mut tokio::sync::watch::Receiver<Option<Result<Arc<LoadedModel>, String>>>,
+    state: &AppState,
+    waiting_for: &str,
 ) -> Result<Arc<LoadedModel>, OllamaHttpError> {
     loop {
         // Wait for a value to be published.
         if rx.changed().await.is_err() {
-            // Sender dropped without publishing — treat as error.
+            // Sender dropped without publishing — the load was abandoned (e.g.
+            // the background thread panicked).  Reset the slot to Empty so the
+            // next caller can start a fresh load attempt.
+            //
+            // Only reset if the slot is still Loading *for the same model* —
+            // a concurrent task may have already cleared it and started a new
+            // load for a different model.
+            {
+                let mut guard = state.slot.write().await;
+                if let ModelSlot::Loading { model_id, .. } = &*guard {
+                    if model_id == waiting_for {
+                        *guard = ModelSlot::Empty;
+                    }
+                }
+            }
             return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": "model load abandoned"})),
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "model load was interrupted; please retry"})),
             ));
         }
         match rx.borrow().as_ref() {
@@ -1523,11 +1546,64 @@ pub async fn run(args: ServeArgs) -> Result<()> {
 /// Resolve the model name for an OpenAI-format request: use the name from the
 /// request body if present, otherwise fall back to whatever model is currently
 /// loaded.  Returns an error if no model is named and none is loaded.
+///
+/// In single-model worker mode (`serve_args.model` is `Some`), any requested
+/// model name from the client is silently ignored and the preloaded model is
+/// returned.  This lets generic clients (e.g. those that always send
+/// `"model": "gpt-4"`) work against single-model servers without knowing the
+/// exact model identifier.
 async fn resolve_openai_model(
     state: &AppState,
     requested: Option<&str>,
 ) -> Result<Arc<LoadedModel>, (StatusCode, Json<ErrorResponse>)> {
-    let model_name = if let Some(m) = requested {
+    // In single-model worker mode, always use the preloaded model regardless of
+    // what name the client sends.  The slot may still be Loading if the model
+    // hasn't finished loading yet; wait for it in that case.
+    if state.serve_args.model.is_some() {
+        let guard = state.slot.read().await;
+        match &*guard {
+            ModelSlot::Ready(lm) => {
+                // Return the preloaded model unconditionally — the client's
+                // requested name (if any) is accepted without validation.
+                return Ok(Arc::clone(lm));
+            }
+            ModelSlot::Loading { model_id, rx } => {
+                let loading_id = model_id.clone();
+                let mut rx = rx.clone();
+                drop(guard);
+                return wait_for_slot_load(&mut rx, state, &loading_id)
+                    .await
+                    .map_err(|(status, json)| {
+                        let msg = json
+                            .0
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("model load failed")
+                            .to_string();
+                        (
+                            status,
+                            Json(ErrorResponse {
+                                error: ErrorDetail {
+                                    message: msg,
+                                    r#type: "server_error".to_string(),
+                                },
+                            }),
+                        )
+                    });
+            }
+            ModelSlot::Failed(e) => return Err(server_error(format!("Model load failed: {e}"))),
+            // Slot is empty — e.g. after a panic recovery reset.
+            // Fall through and trigger a fresh load using the *configured* model,
+            // not whatever name the client happened to send.
+            ModelSlot::Empty => {}
+        }
+    }
+
+    // In single-model mode use the configured model name; in multi-model mode
+    // use what the client requested (or infer from the currently-loaded slot).
+    let model_name = if let Some(configured) = &state.serve_args.model {
+        configured.clone()
+    } else if let Some(m) = requested {
         m.to_string()
     } else {
         // No model in request — use whatever is already loaded or loading.

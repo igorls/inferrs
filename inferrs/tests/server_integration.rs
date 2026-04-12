@@ -206,7 +206,7 @@ fn gemma4_e2b_returns_intelligible_output() {
         let body = serde_json::json!({
             "model": model_id,
             "messages": [
-                {"role": "user", "content": "What is 2 + 2?"}
+                {"role": "user", "content": "What is 2 + 2? Reply with the plain digit only, no LaTeX, no explanation."}
             ],
             "max_tokens": 64,
             "temperature": 0.0
@@ -240,7 +240,7 @@ fn gemma4_e2b_returns_intelligible_output() {
 
         assert!(
             !content.is_empty(),
-            "model returned an empty response for 'What is 2 + 2?'"
+            "model returned an empty response for 'What is 2 + 2? Reply with the plain digit only, no LaTeX, no explanation.'"
         );
 
         assert!(
@@ -253,7 +253,7 @@ fn gemma4_e2b_returns_intelligible_output() {
         // For "2 + 2 = 4", the answer should contain "4" somewhere.
         assert!(
             content.contains('4'),
-            "expected the answer '4' to appear in the response to 'What is 2 + 2?'.\
+            "expected the answer '4' to appear in the response to 'What is 2 + 2? Reply with the plain digit only, no LaTeX, no explanation.'.\
              \nGot: {:?}",
             content
         );
@@ -362,7 +362,10 @@ fn gemma4_e2b_turbo_quant_4bit_returns_intelligible_output() {
     let result = std::panic::catch_unwind(|| {
         wait_for_health(port, Duration::from_secs(300));
 
-        let resp = chat_completion(port, "What is 2 + 2?");
+        let resp = chat_completion(
+            port,
+            "What is 2 + 2? Reply with the plain digit only, no LaTeX, no explanation.",
+        );
         assert!(
             looks_intelligible(&resp),
             "4-bit TurboQuant response is not intelligible.\nGot: {:?}",
@@ -418,7 +421,10 @@ fn gemma4_e2b_paged_long_context_and_second_request() {
         eprintln!("paged long-context first response: {:?}", resp1);
 
         // Second request: short, to verify block reuse doesn't corrupt the cache.
-        let resp2 = chat_completion(port, "What is 2 + 2?");
+        let resp2 = chat_completion(
+            port,
+            "What is 2 + 2? Reply with the plain digit only, no LaTeX, no explanation.",
+        );
         assert!(
             resp2.contains('4'),
             "paged second request (after long-context) expected '4'.\nGot: {:?}",
