@@ -53,28 +53,28 @@ pub(super) fn rms_norm_no_scale(xs: &Tensor, eps: f64) -> Result<Tensor> {
 /// or a single fused dense tensor `[num_experts, rows, cols]` (safetensors path).
 #[derive(Debug, Clone)]
 enum MoeExpertWeights {
-    /// GGUF path: one `Arc<QTensor>` per expert, shape `[rows, cols]`, on CPU.
-    /// Only the experts actually used in a forward pass are dequantized.
+    /// GGUF path: one `Arc<QTensor>` per expert, shape `[rows, cols]`, on the
+    /// target device (Metal/CUDA/CPU).  `QLinear::from_qtensor` wraps each one
+    /// directly so the Metal GEMV kernel fires without a BF16 intermediate.
     Quantized(Vec<Arc<candle_core::quantized::QTensor>>),
     /// Safetensors path: fused dense tensor `[num_experts, rows, cols]`.
     Dense(Tensor),
 }
 
 impl MoeExpertWeights {
-    /// Return the dequantized weight matrix for a single expert on `device`.
+    /// Return a `QLinear` for a single expert.
     ///
-    /// On the GGUF path the per-expert QTensor (stored on CPU) is dequantized
-    /// directly to the target device (Metal/CUDA/CPU).  On the safetensors path
-    /// the dense weight slice is narrowed out and returned as-is.
-    ///
-    /// Note: `QLinear::from_qtensor` with a CPU-backed QTensor hangs when the
-    /// activation tensors are on Metal because the quantized GEMV kernel requires
-    /// both operands to be on the same device.  Explicit `dequantize(device)`
-    /// handles the CPU→Metal transfer correctly before the matmul.
-    fn expert_weight(&self, expert_idx: usize, dtype: DType, device: &Device) -> Result<Tensor> {
+    /// On the GGUF path the per-expert `Arc<QTensor>` is stored on the target
+    /// device (Metal/CUDA/CPU), so `QLinear::forward` dispatches directly to the
+    /// Metal/CUDA quantized GEMV kernel (Q8_0, Q4K, …) — no BF16 intermediate.
+    /// On the safetensors path the dense weight slice is wrapped as `QMatMul::Tensor`.
+    fn expert_linear(&self, expert_idx: usize) -> Result<QLinear> {
         match self {
-            Self::Quantized(qtensors) => qtensors[expert_idx].dequantize(device)?.to_dtype(dtype),
-            Self::Dense(t) => t.narrow(0, expert_idx, 1)?.squeeze(0),
+            Self::Quantized(qtensors) => QLinear::from_qtensor(qtensors[expert_idx].clone(), None),
+            Self::Dense(t) => Ok(QLinear::from_tensor(
+                t.narrow(0, expert_idx, 1)?.squeeze(0)?,
+                None,
+            )),
         }
     }
 }
@@ -89,6 +89,7 @@ fn split_expert_qtensor(
     qt: Arc<candle_core::quantized::QTensor>,
     num_experts: usize,
     per_expert_shape: (usize, usize),
+    device: &Device,
 ) -> Result<MoeExpertWeights> {
     use candle_core::quantized::{QStorage, QTensor};
     use std::borrow::Cow;
@@ -108,8 +109,7 @@ fn split_expert_qtensor(
     for e in 0..num_experts {
         let start = e * bytes_per_expert;
         let end = start + bytes_per_expert;
-        let storage =
-            QStorage::from_data(Cow::Owned(raw[start..end].to_vec()), &Device::Cpu, dtype_q)?;
+        let storage = QStorage::from_data(Cow::Owned(raw[start..end].to_vec()), device, dtype_q)?;
         experts.push(Arc::new(QTensor::new(storage, per_expert_shape)?));
     }
     Ok(MoeExpertWeights::Quantized(experts))
@@ -215,13 +215,15 @@ impl Gemma4MoeExperts {
         vb: VarBuilder,
         qvb: Option<&QGgufVarBuilder>,
     ) -> Result<Self> {
+        let device = vb.device();
         let (gate_up_proj, down_proj) = if let Some(q) = qvb {
-            // GGUF path: load fused QTensors and split per-expert.
+            // GGUF path: load fused QTensors and split per-expert onto target device.
             let gate_up_proj = match q.get_qtensor_named("gate_up_proj") {
                 Some(qt) => split_expert_qtensor(
                     qt,
                     cfg.num_experts,
                     (2 * cfg.moe_intermediate_size, cfg.hidden_size),
+                    device,
                 )?,
                 None => {
                     // GGUF file doesn't have the tensor; fall back to dense vb path.
@@ -243,6 +245,7 @@ impl Gemma4MoeExperts {
                     qt,
                     cfg.num_experts,
                     (cfg.hidden_size, cfg.moe_intermediate_size),
+                    device,
                 )?,
                 None => MoeExpertWeights::Dense(
                     vb.get(
@@ -338,8 +341,10 @@ impl Gemma4MoeExperts {
             let current = hidden.index_select(&idx_tensor, 0)?; // [n, hidden]
 
             // gate_up[expert_idx]: [2*intermediate, hidden]
-            let gate_up = self.gate_up_proj.expert_weight(expert_idx, dtype, device)?;
-            let gate_up_out = current.matmul(&gate_up.t()?)?; // [n, 2*intermediate]
+            // QLinear dispatches to the Metal/CUDA quantized GEMV kernel
+            // (Q8_0, Q4K, …) — no BF16 intermediate since the QTensor is on device.
+            let gate_up_linear = self.gate_up_proj.expert_linear(expert_idx)?;
+            let gate_up_out = current.apply(&gate_up_linear)?; // [n, 2*intermediate]
 
             let gate = gate_up_out.narrow(1, 0, self.moe_intermediate_size)?;
             let up =
@@ -347,8 +352,8 @@ impl Gemma4MoeExperts {
             let hidden_act = (self.act_fn.forward(&gate)? * up)?;
 
             // down[expert_idx]: [hidden, intermediate]
-            let down = self.down_proj.expert_weight(expert_idx, dtype, device)?;
-            let expert_out = hidden_act.matmul(&down.t()?)?; // [n, hidden]
+            let down_linear = self.down_proj.expert_linear(expert_idx)?;
+            let expert_out = hidden_act.apply(&down_linear)?; // [n, hidden]
 
             // Scale by routing weight and scatter-add.
             let w_tensor = Tensor::from_vec(tok_weights, n, device)?
