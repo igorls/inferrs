@@ -981,3 +981,462 @@ pub fn load_model(
     tracing::info!("Model loaded successfully");
     Ok(model)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ModelArchitecture;
+
+    /// Helper: assert that `gguf_rename_tensor(input, arch) == expected` for every pair.
+    fn check(arch: &ModelArchitecture, pairs: &[(&str, &str)]) {
+        for (input, expected) in pairs {
+            let got = gguf_rename_tensor(input, arch);
+            assert_eq!(
+                got, *expected,
+                "gguf_rename_tensor({:?}, {:?}): got {:?}, want {:?}",
+                input, arch, got, expected
+            );
+        }
+    }
+
+    #[test]
+    fn gguf_gemma2_rename_table() {
+        check(
+            &ModelArchitecture::Gemma2,
+            &[
+                // ── globals (tied lm_head — no output.weight) ──────────────
+                ("model.embed_tokens.weight", "token_embd.weight"),
+                ("model.norm.weight", "output_norm.weight"),
+                // ── attention ──────────────────────────────────────────────
+                (
+                    "model.layers.0.self_attn.q_proj.weight",
+                    "blk.0.attn_q.weight",
+                ),
+                (
+                    "model.layers.1.self_attn.k_proj.weight",
+                    "blk.1.attn_k.weight",
+                ),
+                (
+                    "model.layers.1.self_attn.v_proj.weight",
+                    "blk.1.attn_v.weight",
+                ),
+                (
+                    "model.layers.1.self_attn.o_proj.weight",
+                    "blk.1.attn_output.weight",
+                ),
+                // ── 4-norm per layer ───────────────────────────────────────
+                (
+                    "model.layers.2.input_layernorm.weight",
+                    "blk.2.attn_norm.weight",
+                ),
+                (
+                    "model.layers.2.post_attention_layernorm.weight",
+                    "blk.2.post_attention_norm.weight",
+                ),
+                (
+                    "model.layers.2.pre_feedforward_layernorm.weight",
+                    "blk.2.ffn_norm.weight",
+                ),
+                (
+                    "model.layers.2.post_feedforward_layernorm.weight",
+                    "blk.2.post_ffw_norm.weight",
+                ),
+                // ── MLP ────────────────────────────────────────────────────
+                (
+                    "model.layers.3.mlp.gate_proj.weight",
+                    "blk.3.ffn_gate.weight",
+                ),
+                ("model.layers.3.mlp.up_proj.weight", "blk.3.ffn_up.weight"),
+                (
+                    "model.layers.3.mlp.down_proj.weight",
+                    "blk.3.ffn_down.weight",
+                ),
+                // ── passthrough ────────────────────────────────────────────
+                (
+                    "model.some_future_tensor.weight",
+                    "model.some_future_tensor.weight",
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn gguf_gemma3_rename_table() {
+        check(
+            &ModelArchitecture::Gemma3,
+            &[
+                // ── globals ────────────────────────────────────────────────
+                ("model.embed_tokens.weight", "token_embd.weight"),
+                ("model.norm.weight", "output_norm.weight"),
+                // ── attention ──────────────────────────────────────────────
+                (
+                    "model.layers.0.self_attn.q_proj.weight",
+                    "blk.0.attn_q.weight",
+                ),
+                (
+                    "model.layers.4.self_attn.k_proj.weight",
+                    "blk.4.attn_k.weight",
+                ),
+                (
+                    "model.layers.4.self_attn.v_proj.weight",
+                    "blk.4.attn_v.weight",
+                ),
+                (
+                    "model.layers.4.self_attn.o_proj.weight",
+                    "blk.4.attn_output.weight",
+                ),
+                (
+                    "model.layers.6.self_attn.q_norm.weight",
+                    "blk.6.attn_q_norm.weight",
+                ),
+                (
+                    "model.layers.6.self_attn.k_norm.weight",
+                    "blk.6.attn_k_norm.weight",
+                ),
+                // ── norms (all 4 per layer) ────────────────────────────────
+                (
+                    "model.layers.2.input_layernorm.weight",
+                    "blk.2.attn_norm.weight",
+                ),
+                (
+                    "model.layers.2.pre_feedforward_layernorm.weight",
+                    "blk.2.ffn_norm.weight",
+                ),
+                (
+                    "model.layers.2.post_feedforward_layernorm.weight",
+                    "blk.2.post_ffw_norm.weight",
+                ),
+                (
+                    "model.layers.2.post_attention_layernorm.weight",
+                    "blk.2.post_attention_norm.weight",
+                ),
+                // ── MLP ────────────────────────────────────────────────────
+                (
+                    "model.layers.9.mlp.gate_proj.weight",
+                    "blk.9.ffn_gate.weight",
+                ),
+                ("model.layers.9.mlp.up_proj.weight", "blk.9.ffn_up.weight"),
+                (
+                    "model.layers.9.mlp.down_proj.weight",
+                    "blk.9.ffn_down.weight",
+                ),
+                // ── lm_head (Gemma3 has tied embeddings; but the rename function
+                // maps any lm_head.weight → output.weight regardless of arch)
+                ("lm_head.weight", "output.weight"),
+                // ── passthrough ────────────────────────────────────────────
+                (
+                    "model.some_future_tensor.weight",
+                    "model.some_future_tensor.weight",
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn gguf_gemma4_rename_table() {
+        check(
+            &ModelArchitecture::Gemma4,
+            &[
+                // ── globals ────────────────────────────────────────────────
+                (
+                    "model.language_model.embed_tokens.weight",
+                    "token_embd.weight",
+                ),
+                (
+                    "model.language_model.embed_tokens_per_layer.weight",
+                    "per_layer_token_embd.weight",
+                ),
+                (
+                    "model.language_model.per_layer_model_projection.weight",
+                    "per_layer_model_proj.weight",
+                ),
+                (
+                    "model.language_model.per_layer_projection_norm.weight",
+                    "per_layer_proj_norm.weight",
+                ),
+                ("model.language_model.norm.weight", "output_norm.weight"),
+                // ── attention ──────────────────────────────────────────────
+                (
+                    "model.language_model.layers.0.self_attn.q_proj.weight",
+                    "blk.0.attn_q.weight",
+                ),
+                (
+                    "model.language_model.layers.5.self_attn.k_proj.weight",
+                    "blk.5.attn_k.weight",
+                ),
+                (
+                    "model.language_model.layers.12.self_attn.v_proj.weight",
+                    "blk.12.attn_v.weight",
+                ),
+                (
+                    "model.language_model.layers.3.self_attn.o_proj.weight",
+                    "blk.3.attn_output.weight",
+                ),
+                (
+                    "model.language_model.layers.7.self_attn.q_norm.weight",
+                    "blk.7.attn_q_norm.weight",
+                ),
+                (
+                    "model.language_model.layers.7.self_attn.k_norm.weight",
+                    "blk.7.attn_k_norm.weight",
+                ),
+                // ── norms ──────────────────────────────────────────────────
+                (
+                    "model.language_model.layers.2.input_layernorm.weight",
+                    "blk.2.attn_norm.weight",
+                ),
+                (
+                    "model.language_model.layers.2.pre_feedforward_layernorm.weight",
+                    "blk.2.ffn_norm.weight",
+                ),
+                (
+                    "model.language_model.layers.2.post_feedforward_layernorm.weight",
+                    "blk.2.post_ffw_norm.weight",
+                ),
+                (
+                    "model.language_model.layers.2.post_attention_layernorm.weight",
+                    "blk.2.post_attention_norm.weight",
+                ),
+                // ── MLP ────────────────────────────────────────────────────
+                (
+                    "model.language_model.layers.10.mlp.gate_proj.weight",
+                    "blk.10.ffn_gate.weight",
+                ),
+                (
+                    "model.language_model.layers.10.mlp.up_proj.weight",
+                    "blk.10.ffn_up.weight",
+                ),
+                (
+                    "model.language_model.layers.10.mlp.down_proj.weight",
+                    "blk.10.ffn_down.weight",
+                ),
+                // ── Gemma4 PLI per-layer tensors ───────────────────────────
+                (
+                    "model.language_model.layers.1.per_layer_input_gate.weight",
+                    "blk.1.inp_gate.weight",
+                ),
+                (
+                    "model.language_model.layers.1.per_layer_projection.weight",
+                    "blk.1.proj.weight",
+                ),
+                (
+                    "model.language_model.layers.1.post_per_layer_input_norm.weight",
+                    "blk.1.post_norm.weight",
+                ),
+                (
+                    "model.language_model.layers.1.layer_scalar",
+                    "blk.1.layer_output_scale.weight",
+                ),
+                // ── lm_head (mapped globally to output.weight regardless of arch) ──
+                ("lm_head.weight", "output.weight"),
+                // ── passthrough ────────────────────────────────────────────
+                (
+                    "model.some_future_tensor.weight",
+                    "model.some_future_tensor.weight",
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn gguf_phi3_rename_table() {
+        check(
+            &ModelArchitecture::Phi3,
+            &[
+                // ── globals ────────────────────────────────────────────────
+                ("model.embed_tokens.weight", "token_embd.weight"),
+                ("model.norm.weight", "output_norm.weight"),
+                ("lm_head.weight", "output.weight"),
+                // ── fused QKV and output projection ───────────────────────
+                (
+                    "model.layers.0.self_attn.qkv_proj.weight",
+                    "blk.0.attn_qkv.weight",
+                ),
+                (
+                    "model.layers.0.self_attn.o_proj.weight",
+                    "blk.0.attn_output.weight",
+                ),
+                // ── norms ──────────────────────────────────────────────────
+                (
+                    "model.layers.1.input_layernorm.weight",
+                    "blk.1.attn_norm.weight",
+                ),
+                (
+                    "model.layers.1.post_attention_layernorm.weight",
+                    "blk.1.ffn_norm.weight",
+                ),
+                // ── fused gate+up and down projection ─────────────────────
+                (
+                    "model.layers.2.mlp.gate_up_proj.weight",
+                    "blk.2.ffn_up.weight",
+                ),
+                (
+                    "model.layers.2.mlp.down_proj.weight",
+                    "blk.2.ffn_down.weight",
+                ),
+                // ── passthrough ────────────────────────────────────────────
+                (
+                    "model.some_future_tensor.weight",
+                    "model.some_future_tensor.weight",
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn gguf_qwen3_rename_table() {
+        check(
+            &ModelArchitecture::Qwen3,
+            &[
+                // ── globals ────────────────────────────────────────────────
+                ("model.embed_tokens.weight", "token_embd.weight"),
+                ("model.norm.weight", "output_norm.weight"),
+                ("lm_head.weight", "output.weight"),
+                // ── attention ──────────────────────────────────────────────
+                (
+                    "model.layers.0.self_attn.q_proj.weight",
+                    "blk.0.attn_q.weight",
+                ),
+                (
+                    "model.layers.3.self_attn.k_proj.weight",
+                    "blk.3.attn_k.weight",
+                ),
+                (
+                    "model.layers.3.self_attn.v_proj.weight",
+                    "blk.3.attn_v.weight",
+                ),
+                (
+                    "model.layers.3.self_attn.o_proj.weight",
+                    "blk.3.attn_output.weight",
+                ),
+                (
+                    "model.layers.5.self_attn.q_norm.weight",
+                    "blk.5.attn_q_norm.weight",
+                ),
+                (
+                    "model.layers.5.self_attn.k_norm.weight",
+                    "blk.5.attn_k_norm.weight",
+                ),
+                // ── norms ──────────────────────────────────────────────────
+                (
+                    "model.layers.2.input_layernorm.weight",
+                    "blk.2.attn_norm.weight",
+                ),
+                // Qwen3: post_attention_layernorm → ffn_norm (not Gemma)
+                (
+                    "model.layers.2.post_attention_layernorm.weight",
+                    "blk.2.ffn_norm.weight",
+                ),
+                // ── MLP ────────────────────────────────────────────────────
+                (
+                    "model.layers.8.mlp.gate_proj.weight",
+                    "blk.8.ffn_gate.weight",
+                ),
+                ("model.layers.8.mlp.up_proj.weight", "blk.8.ffn_up.weight"),
+                (
+                    "model.layers.8.mlp.down_proj.weight",
+                    "blk.8.ffn_down.weight",
+                ),
+                // ── passthrough — top-level (not a layer tensor) ───────────
+                (
+                    "model.some_future_tensor.weight",
+                    "model.some_future_tensor.weight",
+                ),
+                // ── passthrough — unknown layer suffix (blk.{idx}. prefix applied) ──
+                (
+                    "model.layers.4.some_unknown_tensor.weight",
+                    "blk.4.some_unknown_tensor.weight",
+                ),
+            ],
+        );
+    }
+
+    #[test]
+    fn gguf_qwen35_rename_table() {
+        check(
+            &ModelArchitecture::Qwen35,
+            &[
+                // ── globals ────────────────────────────────────────────────
+                (
+                    "model.language_model.embed_tokens.weight",
+                    "token_embd.weight",
+                ),
+                ("model.language_model.norm.weight", "output_norm.weight"),
+                // ── full-attention layer ───────────────────────────────────
+                (
+                    "model.language_model.layers.0.self_attn.q_proj.weight",
+                    "blk.0.attn_q.weight",
+                ),
+                (
+                    "model.language_model.layers.0.self_attn.k_proj.weight",
+                    "blk.0.attn_k.weight",
+                ),
+                (
+                    "model.language_model.layers.0.self_attn.v_proj.weight",
+                    "blk.0.attn_v.weight",
+                ),
+                (
+                    "model.language_model.layers.0.self_attn.o_proj.weight",
+                    "blk.0.attn_output.weight",
+                ),
+                (
+                    "model.language_model.layers.3.self_attn.q_norm.weight",
+                    "blk.3.attn_q_norm.weight",
+                ),
+                (
+                    "model.language_model.layers.3.self_attn.k_norm.weight",
+                    "blk.3.attn_k_norm.weight",
+                ),
+                // ── norms ──────────────────────────────────────────────────
+                (
+                    "model.language_model.layers.1.input_layernorm.weight",
+                    "blk.1.attn_norm.weight",
+                ),
+                // Qwen3.5 (not Gemma): post_attention_layernorm → ffn_norm
+                (
+                    "model.language_model.layers.1.post_attention_layernorm.weight",
+                    "blk.1.ffn_norm.weight",
+                ),
+                // ── MLP ────────────────────────────────────────────────────
+                (
+                    "model.language_model.layers.5.mlp.gate_proj.weight",
+                    "blk.5.ffn_gate.weight",
+                ),
+                (
+                    "model.language_model.layers.5.mlp.up_proj.weight",
+                    "blk.5.ffn_up.weight",
+                ),
+                (
+                    "model.language_model.layers.5.mlp.down_proj.weight",
+                    "blk.5.ffn_down.weight",
+                ),
+                // ── SSM / linear-attention tensors (Qwen3.5-specific) ──────
+                (
+                    "model.language_model.layers.2.linear_attn.in_proj_qkv.weight",
+                    "blk.2.linear_attn_in_proj_qkv.weight",
+                ),
+                (
+                    "model.language_model.layers.2.linear_attn.in_proj_z.weight",
+                    "blk.2.linear_attn_in_proj_z.weight",
+                ),
+                (
+                    "model.language_model.layers.2.linear_attn.in_proj_a.weight",
+                    "blk.2.linear_attn_in_proj_a.weight",
+                ),
+                (
+                    "model.language_model.layers.2.linear_attn.in_proj_b.weight",
+                    "blk.2.linear_attn_in_proj_b.weight",
+                ),
+                (
+                    "model.language_model.layers.2.linear_attn.out_proj.weight",
+                    "blk.2.linear_attn_out_proj.weight",
+                ),
+                // ── passthrough ────────────────────────────────────────────
+                (
+                    "model.some_future_tensor.weight",
+                    "model.some_future_tensor.weight",
+                ),
+            ],
+        );
+    }
+}
