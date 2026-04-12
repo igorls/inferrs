@@ -528,3 +528,99 @@ fn gemma4_e2b_run_image() {
 
     eprintln!("gemma4 run --image response: {stdout:?}");
 }
+
+/// Smoke test for `google/gemma-4-26B-A4B-it` (the full 26B MoE model) verifying
+/// that the MoE forward pass (router + 128 sparse experts) produces intelligible
+/// output and that `What is 2 + 2?` returns an answer containing `4`.
+///
+/// Two gates prevent accidental execution:
+/// 1. `#[ignore]` — skipped by default `cargo test`.
+/// 2. `INFERRS_INTEGRATION_26B=1` env var — guards against running in CI or on
+///    machines without the ~23 GB model already downloaded.  Without this var the
+///    test exits immediately with a clear message rather than hanging.
+///
+/// Run explicitly with:
+///
+/// ```
+/// INFERRS_INTEGRATION_26B=1 cargo test --release --test server_integration \
+///   gemma4_26b_moe_produces_intelligible_output -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "requires ~23 GB model and INFERRS_INTEGRATION_26B=1; run with --ignored"]
+fn gemma4_26b_moe_produces_intelligible_output() {
+    if std::env::var("INFERRS_INTEGRATION_26B").as_deref() != Ok("1") {
+        eprintln!(
+            "skipping gemma4_26b_moe_produces_intelligible_output: \
+             set INFERRS_INTEGRATION_26B=1 to run (requires ~23 GB model)"
+        );
+        return;
+    }
+
+    let model_id = "google/gemma-4-26B-A4B-it";
+    let port = free_port();
+
+    let mut server = spawn_server(model_id, port);
+
+    // Allow up to 15 minutes: 23 GB download + weight loading on first run.
+    let result = std::panic::catch_unwind(|| {
+        wait_for_health(port, Duration::from_secs(900));
+
+        let url = format!("http://127.0.0.1:{}/v1/chat/completions", port);
+        let body = serde_json::json!({
+            "model": model_id,
+            "messages": [
+                {"role": "user", "content": "What is 2 + 2?"}
+            ],
+            "max_tokens": 64,
+            "temperature": 0.0
+        });
+
+        let resp = ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .send_string(&body.to_string())
+            .expect("HTTP request failed");
+
+        assert_eq!(resp.status(), 200, "expected 200 OK from chat completions");
+
+        let json: serde_json::Value = resp.into_json().expect("response is not valid JSON");
+
+        assert_eq!(
+            json["object"].as_str().unwrap_or(""),
+            "chat.completion",
+            "unexpected object type: {}",
+            json
+        );
+
+        let choices = json["choices"]
+            .as_array()
+            .expect("choices must be an array");
+        assert!(!choices.is_empty(), "choices array must not be empty");
+
+        let content = choices[0]["message"]["content"]
+            .as_str()
+            .expect("choices[0].message.content must be a string");
+
+        assert!(
+            !content.is_empty(),
+            "26B-A4B model returned an empty response for 'What is 2 + 2?'"
+        );
+
+        // A short arithmetic answer like "2 + 2 = 4" may contain no alphabetic
+        // characters, so we skip looks_intelligible() and check for '4' directly.
+        assert!(
+            content.contains('4'),
+            "expected the answer '4' to appear in the response to 'What is 2 + 2?'.\
+             \nGot: {:?}",
+            content
+        );
+
+        eprintln!("gemma4-26B-A4B MoE response: {:?}", content);
+    });
+
+    let _ = server.kill();
+    let _ = server.wait();
+
+    if let Err(e) = result {
+        std::panic::resume_unwind(e);
+    }
+}

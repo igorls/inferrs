@@ -5,7 +5,7 @@
 //! * [`Gemma4MoeRouter`]  — maps hidden states to top-k expert routing weights/indices.
 //! * [`Gemma4MoeExperts`] — per-expert FFN dispatch (gate+up SwiGLU + down projection).
 //! * [`Gemma4MoeBlock`]   — combines the shared dense MLP output with the sparse expert
-//!                          output using three additional RMSNorm layers.
+//!   output using three additional RMSNorm layers.
 //!
 //! ## Memory layout (GGUF path)
 //!
@@ -109,7 +109,11 @@ fn split_expert_qtensor(
     for e in 0..num_experts {
         let start = e * bytes_per_expert;
         let end = start + bytes_per_expert;
-        let storage = QStorage::from_data(Cow::Owned(raw[start..end].to_vec()), device, dtype_q)?;
+        // Use Cow::Borrowed so the original bytes stay alive through `qt`
+        // while `from_data` → `as_t_slice` reads them via a raw pointer.
+        // Using Cow::Owned would free the allocation inside `as_t_slice`
+        // (before `.to_vec()` copies it out), which is use-after-free.
+        let storage = QStorage::from_data(Cow::Borrowed(&raw[start..end]), device, dtype_q)?;
         experts.push(Arc::new(QTensor::new(storage, per_expert_shape)?));
     }
     Ok(MoeExpertWeights::Quantized(experts))
@@ -436,5 +440,198 @@ impl Gemma4MoeBlock {
         let sparse_normed = self.post_ffw_norm_2.forward(&sparse_out)?;
 
         shared_normed + sparse_normed
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device, Tensor};
+
+    fn cpu() -> Device {
+        Device::Cpu
+    }
+
+    // ── rms_norm_no_scale ─────────────────────────────────────────────────────
+
+    /// rms_norm_no_scale(x) = x / sqrt(mean(x²) + eps).
+    /// For x = [3.0, 4.0]: rms = sqrt((9+16)/2) = sqrt(12.5) ≈ 3.5355.
+    /// normed = [3/3.5355, 4/3.5355] ≈ [0.8485, 1.1314].
+    #[test]
+    fn rms_norm_no_scale_known_values() {
+        let x = Tensor::from_vec(vec![3.0f32, 4.0f32], (1, 2), &cpu()).unwrap();
+        let out = rms_norm_no_scale(&x, 0.0).unwrap();
+        let vals: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        let rms = (12.5f32).sqrt();
+        let tol = 1e-5;
+        assert!(
+            (vals[0] - 3.0 / rms).abs() < tol,
+            "vals[0]={} expected {}",
+            vals[0],
+            3.0 / rms
+        );
+        assert!(
+            (vals[1] - 4.0 / rms).abs() < tol,
+            "vals[1]={} expected {}",
+            vals[1],
+            4.0 / rms
+        );
+    }
+
+    /// All-ones input: rms = 1.0, so normed should equal the input.
+    #[test]
+    fn rms_norm_no_scale_ones_is_identity() {
+        let x = Tensor::ones((2usize, 8usize), DType::F32, &cpu()).unwrap();
+        let out = rms_norm_no_scale(&x, 1e-6).unwrap();
+        let vals: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+        for (i, v) in vals.iter().enumerate() {
+            assert!((v - 1.0).abs() < 1e-5, "element {i}: expected 1.0, got {v}");
+        }
+    }
+
+    // ── split_expert_qtensor ──────────────────────────────────────────────────
+
+    /// Build a Q8_0 QTensor whose raw bytes are filled with a known pattern,
+    /// split it into `num_experts` per-expert tensors, and verify each expert
+    /// gets exactly its own byte slice.
+    ///
+    /// Q8_0 block layout: 32 i8 values (32 bytes) + 1 f16 scale (2 bytes) = 34
+    /// bytes per block.  We use shape (num_experts * rows, block_size) so that:
+    ///   - each expert gets `rows` rows of `block_size` elements
+    ///   - total elements = num_experts * rows * block_size, all divisible by 32
+    #[test]
+    fn split_expert_qtensor_byte_layout() {
+        use candle_core::quantized::{GgmlDType, QTensor};
+
+        let num_experts = 4usize;
+        let rows_per_expert = 2usize; // 2 rows per expert
+        let cols = 64usize; // 64 cols (2 Q8_0 blocks of 32 per row)
+        let total_rows = num_experts * rows_per_expert;
+
+        // Build a dense F32 tensor with a recognisable per-expert pattern:
+        // expert e fills its rows with float value (e + 1) as f32.
+        let data: Vec<f32> = (0..num_experts)
+            .flat_map(|e| std::iter::repeat((e + 1) as f32).take(rows_per_expert * cols))
+            .collect();
+        let t = Tensor::from_vec(data, (total_rows, cols), &cpu()).unwrap();
+
+        // Quantize to Q8_0 to get a real QTensor.
+        let qt = std::sync::Arc::new(QTensor::quantize(&t, GgmlDType::Q8_0).unwrap());
+
+        // Split.
+        let weights =
+            split_expert_qtensor(qt, num_experts, (rows_per_expert, cols), &cpu()).unwrap();
+
+        let qtensors = match weights {
+            MoeExpertWeights::Quantized(v) => v,
+            MoeExpertWeights::Dense(_) => panic!("expected Quantized variant"),
+        };
+
+        assert_eq!(qtensors.len(), num_experts);
+
+        // Dequantize each expert and verify values are close to (e+1).
+        for (e, qt_e) in qtensors.iter().enumerate() {
+            assert_eq!(
+                qt_e.shape().dims(),
+                &[rows_per_expert, cols],
+                "expert {e} has wrong shape"
+            );
+            let dequant = qt_e.dequantize(&cpu()).unwrap();
+            let vals: Vec<f32> = dequant.flatten_all().unwrap().to_vec1().unwrap();
+            let expected = (e + 1) as f32;
+            for (i, v) in vals.iter().enumerate() {
+                assert!(
+                    (v - expected).abs() < 0.15, // Q8_0 max error ≈ 0.1
+                    "expert {e} element {i}: expected ~{expected}, got {v}"
+                );
+            }
+        }
+    }
+
+    // ── MoeExpertWeights::expert_linear (Dense path) ──────────────────────────
+
+    /// expert_linear on a Dense tensor must return the correct row slice.
+    /// We use a (4, 3, 2) tensor (4 experts, 3×2 weight each) and verify
+    /// expert 2 returns exactly the values from rows 6..9.
+    #[test]
+    fn moe_expert_weights_dense_slice_correctness() {
+        // Fill each expert e with float value (e as f32) so we can easily
+        // identify which slice we got.
+        let data: Vec<f32> = (0..4)
+            .flat_map(|e| std::iter::repeat(e as f32).take(3 * 2))
+            .collect();
+        let t = Tensor::from_vec(data, (4usize, 3usize, 2usize), &cpu()).unwrap();
+        let weights = MoeExpertWeights::Dense(t);
+
+        for e in 0..4usize {
+            let ql = weights.expert_linear(e).unwrap();
+            // Forward a ones input [1, 2] — result is sum of the row weights.
+            let input = Tensor::ones((1usize, 2usize), DType::F32, &cpu()).unwrap();
+            let out = ql.forward(&input).unwrap();
+            let vals: Vec<f32> = out.flatten_all().unwrap().to_vec1().unwrap();
+            // Each weight is (e as f32); input is all-ones; out = sum over cols = 2 * e.
+            let expected = 2.0 * e as f32;
+            for (i, v) in vals.iter().enumerate() {
+                assert!(
+                    (v - expected).abs() < 1e-4,
+                    "expert {e} output[{i}]: expected {expected}, got {v}"
+                );
+            }
+        }
+    }
+
+    // ── Router renormalisation invariant ─────────────────────────────────────
+
+    /// After the top-k gather and renorm step, weights for each token must sum
+    /// to 1.0 (before per_expert_scale is applied).
+    ///
+    /// We test this directly against `Gemma4MoeRouter::forward` by constructing
+    /// minimal router weights (identity proj, unit scale, unit per_expert_scale).
+    #[test]
+    fn router_topk_weights_sum_to_one() {
+        let num_experts = 8usize;
+        let hidden = 16usize;
+        let top_k = 3usize;
+        let dev = cpu();
+
+        // Build a router with controlled weights:
+        //   proj: random [num_experts, hidden] — we just need valid logits
+        //   scale: ones [hidden]
+        //   per_expert_scale: ones [num_experts]  (so it doesn't affect sum)
+        let proj_w = Tensor::randn(0f32, 1.0, (num_experts, hidden), &dev).unwrap();
+        let proj = QLinear::from_tensor(proj_w, None);
+        let scale = Tensor::ones(hidden, DType::F32, &dev).unwrap();
+        let per_expert_scale = Tensor::ones(num_experts, DType::F32, &dev).unwrap();
+
+        let router = Gemma4MoeRouter {
+            proj,
+            scale,
+            per_expert_scale,
+            scalar_root_size: (hidden as f64).powf(-0.5),
+            rms_eps: 1e-6,
+            top_k,
+        };
+
+        // Two tokens of random hidden states.
+        let hidden_states = Tensor::randn(0f32, 1.0, (2usize, hidden), &dev).unwrap();
+        let (weights, _indices) = router.forward(&hidden_states).unwrap();
+
+        // weights shape: [2, top_k]; each row must sum to 1.0.
+        let sums: Vec<f32> = weights
+            .sum(candle_core::D::Minus1)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+
+        for (tok, s) in sums.iter().enumerate() {
+            assert!(
+                (s - 1.0).abs() < 1e-5,
+                "token {tok}: top-k weights sum to {s}, expected 1.0"
+            );
+        }
     }
 }
