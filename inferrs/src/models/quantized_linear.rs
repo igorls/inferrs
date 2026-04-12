@@ -273,6 +273,16 @@ impl QGgufVarBuilder {
         self.load_qtensor(&name).ok().flatten()
     }
 
+    /// Retrieve the raw `Arc<QTensor>` for a tensor with an arbitrary suffix
+    /// (not necessarily "weight") at the current path.
+    ///
+    /// Used for HF parameters stored without the `.weight` suffix, such as
+    /// `experts.gate_up_proj` and `experts.down_proj` in Gemma4 MoE.
+    pub fn get_qtensor_named(&self, suffix: &str) -> Option<Arc<candle_core::quantized::QTensor>> {
+        let name = self.full_name(suffix);
+        self.load_qtensor(&name).ok().flatten()
+    }
+
     /// Build a bias-free `QLinear` from the "weight" tensor at the current path.
     ///
     /// Errors if the tensor is absent from the GGUF file.

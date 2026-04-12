@@ -697,33 +697,126 @@ impl Gemma4MoeRouter {
     }
 }
 
+/// Per-expert weight storage: either a Vec of per-expert QTensors (GGUF path)
+/// or a single fused dense tensor `[num_experts, rows, cols]` (safetensors path).
+#[derive(Debug, Clone)]
+enum MoeExpertWeights {
+    /// GGUF path: one `Arc<QTensor>` per expert, shape `[rows, cols]`, on CPU.
+    /// Only the experts actually used in a forward pass are dequantized.
+    Quantized(Vec<Arc<candle_core::quantized::QTensor>>),
+    /// Safetensors path: fused dense tensor `[num_experts, rows, cols]`.
+    Dense(Tensor),
+}
+
+impl MoeExpertWeights {
+    /// Return the weight matrix for a single expert, converted to `dtype` on `device`.
+    fn expert_weight(&self, expert_idx: usize, dtype: DType, device: &Device) -> Result<Tensor> {
+        match self {
+            Self::Quantized(qtensors) => qtensors[expert_idx].dequantize(device)?.to_dtype(dtype),
+            Self::Dense(t) => t.narrow(0, expert_idx, 1)?.squeeze(0),
+        }
+    }
+}
+
+/// Split a fused `[num_experts, rows, cols]` QTensor into per-expert QTensors.
+///
+/// The fused QTensor's raw bytes are laid out in expert-major order; we slice
+/// off `bytes_per_expert` bytes for each expert and build a `QTensor` of shape
+/// `(rows, cols)`.  Both `rows × cols` must be a multiple of the quantization
+/// block size.
+fn split_expert_qtensor(
+    qt: Arc<candle_core::quantized::QTensor>,
+    num_experts: usize,
+    per_expert_shape: (usize, usize),
+) -> Result<MoeExpertWeights> {
+    use candle_core::quantized::{QStorage, QTensor};
+    use std::borrow::Cow;
+
+    let raw = qt.data()?;
+    let dtype_q = qt.dtype();
+    let bytes_per_expert = raw.len() / num_experts;
+
+    let mut experts = Vec::with_capacity(num_experts);
+    for e in 0..num_experts {
+        let start = e * bytes_per_expert;
+        let end = start + bytes_per_expert;
+        let storage = QStorage::from_data(
+            Cow::Owned(raw[start..end].to_vec()),
+            &Device::Cpu,
+            dtype_q,
+        )?;
+        experts.push(Arc::new(QTensor::new(storage, per_expert_shape)?));
+    }
+    Ok(MoeExpertWeights::Quantized(experts))
+}
+
 /// Fused expert weight matrices for all `num_experts` experts.
 ///
 /// Gate and up projections are stored fused: `[num_experts, 2*moe_intermediate, hidden]`.
+/// On the GGUF path the weights are stored as per-expert `Arc<QTensor>` on CPU
+/// and dequantized on demand; only the 8 selected experts are ever dequantized
+/// per decode step, keeping VRAM usage at the quantized size (~23 GB vs ~46 GB BF16).
 #[derive(Debug, Clone)]
 struct Gemma4MoeExperts {
-    gate_up_proj: Tensor, // [num_experts, 2*moe_intermediate, hidden]
-    down_proj: Tensor,    // [num_experts, hidden, moe_intermediate]
+    gate_up_proj: MoeExpertWeights,
+    down_proj: MoeExpertWeights,
     act_fn: Activation,
     num_experts: usize,
     moe_intermediate_size: usize,
 }
 
 impl Gemma4MoeExperts {
-    fn new(cfg: &Gemma4Config, vb: VarBuilder) -> Result<Self> {
-        // Expert tensors use non-standard naming (no ".weight" suffix in HF).
-        let gate_up_proj = vb
-            .get(
-                (cfg.num_experts, 2 * cfg.moe_intermediate_size, cfg.hidden_size),
-                "gate_up_proj",
-            )?
-            .to_dtype(cfg.dtype)?;
-        let down_proj = vb
-            .get(
-                (cfg.num_experts, cfg.hidden_size, cfg.moe_intermediate_size),
-                "down_proj",
-            )?
-            .to_dtype(cfg.dtype)?;
+    fn new(cfg: &Gemma4Config, vb: VarBuilder, qvb: Option<&QGgufVarBuilder>) -> Result<Self> {
+        let (gate_up_proj, down_proj) = if let Some(q) = qvb {
+            // GGUF path: load fused QTensors and split per-expert.
+            let gate_up_proj = match q.get_qtensor_named("gate_up_proj") {
+                Some(qt) => split_expert_qtensor(
+                    qt,
+                    cfg.num_experts,
+                    (2 * cfg.moe_intermediate_size, cfg.hidden_size),
+                )?,
+                None => {
+                    // GGUF file doesn't have the tensor; fall back to dense vb path.
+                    MoeExpertWeights::Dense(
+                        vb.get(
+                            (cfg.num_experts, 2 * cfg.moe_intermediate_size, cfg.hidden_size),
+                            "gate_up_proj",
+                        )?
+                        .to_dtype(cfg.dtype)?,
+                    )
+                }
+            };
+            let down_proj = match q.get_qtensor_named("down_proj") {
+                Some(qt) => split_expert_qtensor(
+                    qt,
+                    cfg.num_experts,
+                    (cfg.hidden_size, cfg.moe_intermediate_size),
+                )?,
+                None => MoeExpertWeights::Dense(
+                    vb.get(
+                        (cfg.num_experts, cfg.hidden_size, cfg.moe_intermediate_size),
+                        "down_proj",
+                    )?
+                    .to_dtype(cfg.dtype)?,
+                ),
+            };
+            (gate_up_proj, down_proj)
+        } else {
+            // Safetensors path: dense BF16 tensors.
+            let gate_up = vb
+                .get(
+                    (cfg.num_experts, 2 * cfg.moe_intermediate_size, cfg.hidden_size),
+                    "gate_up_proj",
+                )?
+                .to_dtype(cfg.dtype)?;
+            let down = vb
+                .get(
+                    (cfg.num_experts, cfg.hidden_size, cfg.moe_intermediate_size),
+                    "down_proj",
+                )?
+                .to_dtype(cfg.dtype)?;
+            (MoeExpertWeights::Dense(gate_up), MoeExpertWeights::Dense(down))
+        };
         Ok(Self {
             gate_up_proj,
             down_proj,
@@ -786,7 +879,9 @@ impl Gemma4MoeExperts {
             let current = hidden.index_select(&idx_tensor, 0)?; // [n, hidden]
 
             // gate_up[expert_idx]: [2*intermediate, hidden]
-            let gate_up = self.gate_up_proj.narrow(0, expert_idx, 1)?.squeeze(0)?;
+            let gate_up = self
+                .gate_up_proj
+                .expert_weight(expert_idx, dtype, device)?;
             let gate_up_out = current.matmul(&gate_up.t()?)?; // [n, 2*intermediate]
 
             let gate = gate_up_out.narrow(1, 0, self.moe_intermediate_size)?;
@@ -795,7 +890,7 @@ impl Gemma4MoeExperts {
             let hidden_act = (self.act_fn.forward(&gate)? * up)?;
 
             // down[expert_idx]: [hidden, intermediate]
-            let down = self.down_proj.narrow(0, expert_idx, 1)?.squeeze(0)?;
+            let down = self.down_proj.expert_weight(expert_idx, dtype, device)?;
             let expert_out = hidden_act.matmul(&down.t()?)?; // [n, hidden]
 
             // Scale by routing weight and scatter-add.
@@ -824,7 +919,11 @@ impl Gemma4MoeBlock {
     fn new(cfg: &Gemma4Config, vb: VarBuilder, qvb: Option<&QGgufVarBuilder>) -> Result<Self> {
         let router =
             Gemma4MoeRouter::new(cfg, vb.pp("router"), qvb.map(|q| q.pp("router")).as_ref())?;
-        let experts = Gemma4MoeExperts::new(cfg, vb.pp("experts"))?;
+        let experts = Gemma4MoeExperts::new(
+            cfg,
+            vb.pp("experts"),
+            qvb.map(|q| q.pp("experts")).as_ref(),
+        )?;
         let post_ffw_norm_1 = rms_norm(
             cfg.hidden_size,
             cfg.rms_norm_eps,
