@@ -1710,6 +1710,7 @@ dependencies = [
  "hf-hub",
  "image",
  "indicatif",
+ "inferrs-models",
  "libc",
  "libloading 0.8.9",
  "rayon",
@@ -1791,6 +1792,13 @@ dependencies = [
  "serde_json",
  "sysinfo",
  "ureq",
+]
+
+[[package]]
+name = "inferrs-models"
+version = "0.1.0"
+dependencies = [
+ "candle-core",
 ]
 
 [[package]]

@@ -24,11 +24,11 @@ use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::config::{ModelArchitecture, RawConfig};
 use crate::hub::ModelFiles;
-use crate::kv_cache::{BlockPool, BlockTable, PagedCacheConfig, PagedKvStore};
 use crate::models::CausalLM;
 use crate::sampler::{self, SamplingParams};
 use crate::tokenizer::Tokenizer;
 use crate::ServeArgs;
+use inferrs_models::kv_cache::{BlockPool, BlockTable, PagedCacheConfig, PagedKvStore};
 
 // ---------------------------------------------------------------------------
 // Output buffer — decouples the engine thread from per-client channels

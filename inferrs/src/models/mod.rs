@@ -17,7 +17,7 @@ use candle_nn::VarBuilder;
 use std::path::Path;
 
 use crate::config::{ModelArchitecture, RawConfig, VisionConfig};
-use crate::kv_cache::{BlockTable, PagedKvStore};
+use inferrs_models::kv_cache::{BlockTable, PagedKvStore};
 use quantized_linear::QGgufVarBuilder;
 
 /// Unified model interface for the engine.

@@ -1,0 +1,18 @@
+[package]
+name = "inferrs-models"
+version = "0.1.0"
+edition = "2021"
+description = "Shared model implementations and supporting types for inferrs"
+license = "Apache-2.0"
+
+[lib]
+name = "inferrs_models"
+path = "src/lib.rs"
+
+[features]
+default = []
+cuda = ["candle-core/cuda"]
+metal = ["candle-core/metal"]
+
+[dependencies]
+candle-core = { workspace = true }

@@ -12,13 +12,13 @@ use candle_core::{DType, Device, Module, Tensor};
 use candle_nn::{embedding, Embedding, Init, RmsNorm, VarBuilder};
 use std::sync::Arc;
 
-use crate::kv_cache::{BlockTable, PagedKvStore};
 use crate::models::attention_utils::{
     append_kv_tq, apply_output_gate, apply_rms_norm_heads, apply_rope, causal_mask,
     paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, PagedCtx, PagedPassCache,
 };
 use crate::models::quantized_linear::{qlinear_b, QGgufVarBuilder, QLinear};
 use crate::turbo_quant::{TurboQuantConfig, TurboQuantKvCache};
+use inferrs_models::kv_cache::{BlockTable, PagedKvStore};
 
 fn rms_norm_with_offset(size: usize, eps: f64, vb: VarBuilder, offset: f64) -> Result<RmsNorm> {
     let weight = vb.get_with_hints(size, "weight", Init::Const(0.0))?;

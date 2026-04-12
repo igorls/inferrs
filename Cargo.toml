@@ -2,6 +2,7 @@
 members = [
     "inferrs",
     "inferrs-benchmark",
+    "inferrs-models",
     "backends/inferrs-backend-cann",
     "backends/inferrs-backend-cuda",
     "backends/inferrs-backend-musa",
@@ -24,6 +25,7 @@ members = [
 default-members = [
     "inferrs",
     "inferrs-benchmark",
+    "inferrs-models",
     "backends/inferrs-backend-musa",
     "backends/inferrs-backend-vulkan",
     "backends/inferrs-backend-hexagon",
