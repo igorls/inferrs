@@ -9,6 +9,7 @@ pub mod gemma4;
 pub mod quantized_linear;
 pub mod qwen3;
 pub mod qwen3_5;
+pub mod qwen3_5_linear_attn_scan;
 pub mod vision_encoder;
 
 use anyhow::{Context, Result};
