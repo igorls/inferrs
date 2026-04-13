@@ -7,7 +7,6 @@ mod grammar;
 mod hub;
 mod list;
 mod models;
-mod nvfp4;
 mod pull;
 mod quantize;
 mod rm;

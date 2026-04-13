@@ -186,7 +186,7 @@ pub fn convert_to_gguf(
     for name in &tensor_names {
         // Skip NVFP4 auxiliary tensors — they are consumed when dequantizing the
         // corresponding weight tensor and must not appear as independent entries.
-        if crate::nvfp4::is_nvfp4_aux(name) {
+        if inferrs_models::nvfp4::is_nvfp4_aux(name) {
             bar.inc(1);
             continue;
         }
@@ -199,7 +199,7 @@ pub fn convert_to_gguf(
         {
             let base = &name[..name.len() - 7]; // strip trailing ".weight"
             tracing::info!("NVFP4 dequantizing {name}");
-            crate::nvfp4::load_from_safetensors(&st, base)?
+            inferrs_models::nvfp4::load_from_safetensors(&st, base)?
         } else {
             // Load tensor on CPU in f32 — quantization requires f32 input.
             st.load(name, &Device::Cpu)?.to_dtype(DType::F32)?

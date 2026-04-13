@@ -5,9 +5,9 @@
 //! model code as the main binary while compiling against different
 //! `candle-core` feature sets.
 //!
-//! The extraction is being performed incrementally — this initial revision
-//! only hosts the block-based [`kv_cache`] module.  Additional modules
-//! (`config`, `turbo_quant`, `nvfp4`, and the model implementations
-//! themselves) will move here in subsequent PRs.
+//! The extraction is being performed incrementally — further modules
+//! (`config`, `turbo_quant`, and the model implementations themselves)
+//! will move here in subsequent PRs.
 
 pub mod kv_cache;
+pub mod nvfp4;
