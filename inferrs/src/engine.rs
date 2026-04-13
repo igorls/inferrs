@@ -2187,34 +2187,29 @@ impl Engine {
             _ => return Ok(vec![x1]), // MTP failed — emit only x1
         };
 
-        // ── 4. Batched verification forward ────────────────────────────────
-        // Build [x1, d1, ...] token tensor and run in one main-model call.
-        // seqlen_offset + 1: x1 is the first new token after the already-cached
-        // prefix.
-        let verify_token_ids: Vec<u32> = std::iter::once(x1)
-            .chain(drafts.iter().take(NUM_DRAFT).map(|(t, _)| *t))
-            .collect();
-        let verify_ids_tensor = Tensor::new(verify_token_ids.as_slice(), device)?.unsqueeze(0)?;
-        let verify_logits = match model.forward_full_logits(&verify_ids_tensor, seqlen_offset + 1) {
-            Some(Ok(l)) => l, // [1, len, vocab]
-            _ => return Ok(vec![x1]),
-        };
+        // ── 4. Sequential verification ───────────────────────────────────
+        // Feed tokens one at a time through forward() so that linear attention
+        // layers take the single-token decode path (t==1), correctly updating
+        // their recurrent SSM state.  Batched forward_full corrupts SSM state
+        // because it takes the chunked-prefill path for t>1 tokens.
+        //
+        // Step 4a: commit x1 into the KV/SSM state and get logits that predict
+        // the token *after* x1 (used to verify draft d1).
+        let x1_ids = Tensor::new(&[x1], device)?.unsqueeze(0)?;
+        let logits_x1 = model.forward(&x1_ids, seqlen_offset + 1)?;
+        let mut cur_logits: Vec<f32> = logits_x1
+            .squeeze(0)?
+            .squeeze(0)?
+            .to_dtype(candle_core::DType::F32)?
+            .to_vec1()?;
 
-        // ── 5. Rejection-sample each draft token ──────────────────────────
-        // verify_logits[:, i, :] predicts the token at position (seqlen_offset + 1 + i + 1),
-        // which is used to verify draft token drafts[i].
         let step_base = previous_tokens.len() as u64;
         let mut accepted: Vec<u32> = vec![x1];
+        let mut offset = seqlen_offset + 2;
 
         for (draft_idx, (draft_tok, draft_logits_raw)) in drafts.iter().enumerate() {
-            let verify_pos_logits = verify_logits
-                .narrow(1, draft_idx, 1)?
-                .squeeze(1)?
-                .to_dtype(candle_core::DType::F32)?
-                .to_vec1::<f32>()?;
-
-            let (verdict, target_probs) = sampler::speculative_verify(
-                &verify_pos_logits,
+            let (verdict, _) = sampler::speculative_verify(
+                &cur_logits,
                 draft_logits_raw,
                 *draft_tok,
                 params.temperature,
@@ -2225,21 +2220,29 @@ impl Engine {
             match verdict {
                 sampler::SpecVerdict::Accept => {
                     accepted.push(*draft_tok);
+                    let tok_ids = Tensor::new(&[*draft_tok], device)?.unsqueeze(0)?;
+                    let logits = model.forward(&tok_ids, offset)?;
+                    cur_logits = logits
+                        .squeeze(0)?
+                        .squeeze(0)?
+                        .to_dtype(candle_core::DType::F32)?
+                        .to_vec1()?;
+                    offset += 1;
                 }
                 sampler::SpecVerdict::Reject(replacement) => {
-                    // Replacement resampled from adjusted distribution p' = norm(max(0,p−q)).
                     accepted.push(replacement);
-                    // Stop: remaining drafts are invalid once one is rejected.
-                    let _ = target_probs; // used inside speculative_verify
+                    // Do NOT commit the replacement here — it will become last_token
+                    // in the next decode step, which commits it via forward_with_hidden.
+                    // Committing it now would double-commit the same position, corrupting
+                    // both the KV cache and the SSM recurrent state.
                     return Ok(accepted);
                 }
             }
         }
 
-        // All drafts accepted — also emit the bonus token predicted by the main
-        // model at the last verification position.
-        let last_verify_logits = verify_logits.narrow(1, verify_logits.dim(1)? - 1, 1)?;
-        let (bonus, _) = sampler::sample_token(&last_verify_logits, params, previous_tokens)?;
+        // All drafts accepted — emit bonus token from the last verification logits.
+        let bonus_logits = Tensor::from_vec(cur_logits.clone(), (1, 1, cur_logits.len()), device)?;
+        let (bonus, _) = sampler::sample_token(&bonus_logits, params, previous_tokens)?;
         accepted.push(bonus);
 
         Ok(accepted)
