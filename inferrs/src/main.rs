@@ -240,28 +240,17 @@ impl ServeArgs {
     }
 
     fn auto_device() -> Result<candle_core::Device> {
-        // macOS: always prefer Metal (linked directly, no plugin needed).
-        // After that, probe for Vulkan/MoltenVK and OpenVINO plugins.
+        // macOS: probe backends via the plugin system.
+        // Priority: Metal → OpenVINO → Vulkan → CPU.
         #[cfg(target_os = "macos")]
         {
             use crate::backend::BackendKind;
-            if let Ok(device) = candle_core::Device::new_metal(0) {
-                tracing::info!("Using Metal device");
-                // Still probe for OpenVINO so users know it is (or isn't)
-                // available for a future CPU-only OpenVINO path.
-                if matches!(crate::backend::detect_backend(), BackendKind::OpenVino) {
-                    tracing::info!(
-                        "OpenVINO runtime detected alongside Metal — OpenVINO CPU \
-                         acceleration will be available once candle gains an \
-                         OpenVINO backend."
-                    );
-                }
-                return Ok(device);
-            }
-
-            // Metal unavailable (e.g. CI VM without GPU): probe for
-            // Vulkan/MoltenVK and OpenVINO and log their availability.
             match crate::backend::detect_backend() {
+                BackendKind::Metal => {
+                    let device = candle_core::Device::new_metal(0)?;
+                    tracing::info!("Using Metal device (via plugin)");
+                    return Ok(device);
+                }
                 BackendKind::Vulkan => {
                     tracing::info!(
                         "Vulkan/MoltenVK driver detected but candle 0.8 has no \
@@ -288,7 +277,7 @@ impl ServeArgs {
         // Platform notes:
         //   Linux x86_64 / aarch64 : CUDA → ROCm → Hexagon → OpenVINO → MUSA → CANN → Vulkan → CPU
         //   Android aarch64         : Hexagon → OpenVINO → CANN → Vulkan → CPU
-        //   macOS                   : Metal → OpenVINO → Vulkan → CPU
+        //   macOS                   : Metal → OpenVINO → Vulkan → CPU  (handled above)
         //   Windows x86_64          : CUDA → ROCm → OpenVINO → MUSA → Vulkan → CPU
         //   Windows aarch64         : Hexagon → OpenVINO → Vulkan → CPU
         #[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]

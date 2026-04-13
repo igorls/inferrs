@@ -7,6 +7,7 @@ members = [
     "inferrs-kernels",
     "backends/inferrs-backend-cann",
     "backends/inferrs-backend-cuda",
+    "backends/inferrs-backend-metal",
     "backends/inferrs-backend-musa",
     "backends/inferrs-backend-rocm",
     "backends/inferrs-backend-vulkan",
@@ -20,6 +21,8 @@ members = [
 #   cargo build -p inferrs-backend-rocm     (requires hipcc / ROCm)
 #   cargo build -p inferrs-backend-cann     (Linux/Android only; requires
 #                                            libascendcl.so from CANN SDK)
+# The Metal backend links against the system Metal framework (always present on
+# macOS) and has no external SDK dependency; it is included in default-members.
 # The MUSA backend has no compile-time SDK dependency (it probes libmusart.so
 # via dlopen at runtime) so it is included in default-members.
 # The Hexagon backend likewise has no exotic toolchain requirement and compiles
@@ -30,6 +33,7 @@ default-members = [
     "inferrs-models",
     "inferrs-multimodal",
     "inferrs-kernels",
+    "backends/inferrs-backend-metal",
     "backends/inferrs-backend-musa",
     "backends/inferrs-backend-vulkan",
     "backends/inferrs-backend-hexagon",

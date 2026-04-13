@@ -1,0 +1,13 @@
+[package]
+name = "inferrs-backend-metal"
+version = "0.1.0"
+edition = "2021"
+description = "Apple Metal backend plugin for inferrs"
+license = "Apache-2.0"
+
+[lib]
+name = "inferrs_backend_metal"
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { workspace = true, features = ["metal"] }

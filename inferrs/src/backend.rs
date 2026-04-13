@@ -20,14 +20,14 @@
 //!
 //! ## Platform support matrix
 //!
-//! | Platform                  | CUDA | MUSA | ROCm | CANN | Hexagon | Vulkan |
-//! |---------------------------|------|------|------|------|---------|--------|
-//! | Linux x86_64              | ✓    | ✓    | ✓    | ✓    | —       | ✓      |
-//! | Linux aarch64             | ✓    | ✓    | ✓    | ✓    | ✓       | ✓      |
-//! | Windows x86_64            | ✓    | ✓    | ✓    | —    | —       | ✓      |
-//! | Windows aarch64           | —    | —    | —    | —    | ✓       | ✓      |
-//! | macOS x86_64 / aarch64    | —    | —    | —    | —    | —       | ✓      |
-//! | Android aarch64           | —    | —    | —    | ✓    | ✓       | ✓      |
+//! | Platform                  | CUDA | MUSA | ROCm | CANN | Hexagon | Vulkan | Metal |
+//! |---------------------------|------|------|------|------|---------|--------|-------|
+//! | Linux x86_64              | ✓    | ✓    | ✓    | ✓    | —       | ✓      | —     |
+//! | Linux aarch64             | ✓    | ✓    | ✓    | ✓    | ✓       | ✓      | —     |
+//! | Windows x86_64            | ✓    | ✓    | ✓    | —    | —       | ✓      | —     |
+//! | Windows aarch64           | —    | —    | —    | —    | ✓       | ✓      | —     |
+//! | macOS x86_64 / aarch64    | —    | —    | —    | —    | —       | ✓      | ✓     |
+//! | Android aarch64           | —    | —    | —    | ✓    | ✓       | ✓      | —     |
 //!
 //! ROCm on Windows is supported from ROCm 5.5+ (HIP SDK for Windows).
 //! ROCm on Linux aarch64 is supported on hardware such as AMD MI300A APUs
@@ -61,11 +61,6 @@
 //!   3. OpenVINO (`.dll`) → CPU fallback with info log
 //!   4. CPU     (always available)
 //!
-//! **macOS x86_64 / aarch64:**
-//!   Metal is tried first (linked directly).  If Metal fails:
-//!   1. Vulkan (`.dylib`, via MoltenVK) → CPU fallback with info log
-//!   2. CPU    (always available)
-//!
 //! **Android aarch64:**
 //!   1. CANN    (`.so`)   → CPU fallback with info log (pending candle CANN Device)
 //!   2. Hexagon (`.so`)   → CPU fallback with info log (pending candle Hexagon Device)
@@ -74,10 +69,10 @@
 //!   5. CPU     (always available)
 //!
 //! **macOS x86_64 / aarch64:**
-//!   Metal is tried first (linked directly).  If Metal fails:
-//!   1. Vulkan  (`.dylib`, via MoltenVK) → CPU fallback with info log
-//!   2. OpenVINO (`.dylib`)              → CPU fallback with info log
-//!   3. CPU     (always available)
+//!   1. Metal   (`.dylib`) → `Device::new_metal(0)` (via plugin)
+//!   2. OpenVINO (`.dylib`) → CPU fallback with info log
+//!   3. Vulkan  (`.dylib`, via MoltenVK) → CPU fallback with info log
+//!   4. CPU     (always available)
 
 // ── Shared helpers ────────────────────────────────────────────────────────────
 //
@@ -304,9 +299,10 @@ pub use android::{detect_backend, BackendKind};
 
 // ── macOS ─────────────────────────────────────────────────────────────────────
 //
-// Metal is linked directly and is always preferred.  Vulkan is also available
-// via MoltenVK.  OpenVINO is probed for future CPU acceleration (Intel provides
-// macOS builds for both x86_64 and aarch64).
+// Metal is probed first via the plugin system; if Metal is unavailable (e.g.
+// headless CI VM without a GPU), Vulkan is available via MoltenVK and
+// OpenVINO is probed for future CPU acceleration (Intel provides macOS builds
+// for both x86_64 and aarch64).
 //
 // Architectures: x86_64-apple-darwin, aarch64-apple-darwin.
 
@@ -314,10 +310,11 @@ pub use android::{detect_backend, BackendKind};
 mod macos {
     use std::path::PathBuf;
 
-    /// The detected backend on macOS (Metal is handled directly in
-    /// `auto_device` before the plugin system is invoked).
+    /// The detected backend on macOS.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum BackendKind {
+        /// Apple Metal GPU — probed via the `inferrs-backend-metal` plugin.
+        Metal,
         /// Vulkan via MoltenVK is detected; candle 0.8 has no Vulkan Device yet.
         Vulkan,
         /// OpenVINO runtime found; the main binary uses Metal for GPU inference
@@ -329,7 +326,9 @@ mod macos {
     pub fn detect_backend() -> BackendKind {
         let search_dirs = plugin_search_dirs();
 
+        // Priority: Metal → OpenVINO → Vulkan → CPU.
         let candidates: &[(&str, BackendKind)] = &[
+            ("libinferrs_backend_metal.dylib", BackendKind::Metal),
             ("libinferrs_backend_openvino.dylib", BackendKind::OpenVino),
             ("libinferrs_backend_vulkan.dylib", BackendKind::Vulkan),
         ];

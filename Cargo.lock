@@ -1757,6 +1757,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "inferrs-backend-metal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "candle-core",
+]
+
+[[package]]
 name = "inferrs-backend-musa"
 version = "0.1.0"
 dependencies = [
