@@ -8,30 +8,24 @@
 //!
 //! # Performance TODOs
 //!
-//! 1. **Forward substitution O(S²) Tensor::cat loop** — `gated_delta_rule_chunked`
-//!    rebuilds the full `attn` tensor via `Tensor::cat` at every row of the
-//!    forward-substitution loop (63 iterations for CHUNK_SIZE=64).  Each cat
-//!    triggers a new allocation + GPU kernel launch.  Replace with an in-place
-//!    slice-assign (`slice_scatter` or equivalent) to avoid O(S²) copies.
-//!
-//! 2. **Redundant `decay_mask` materialisation** — `diff.broadcast_mul(&tril_strict)?`
+//! 1. **Redundant `decay_mask` materialisation** — `diff.broadcast_mul(&tril_strict)?`
 //!    allocates a full [b, n_h, C, S, S] tensor just to zero the upper triangle
 //!    before `exp`, then re-multiplies by `tril_strict` after `exp`.  A fused
 //!    masked-exp kernel (or computing only the lower triangle) would halve memory
 //!    traffic for this step.
 //!
-//! 3. **Inter-chunk loop sequential matmuls** — the `for ci in 0..num_chunks` loop
+//! 2. **Inter-chunk loop sequential matmuls** — the `for ci in 0..num_chunks` loop
 //!    issues 3 independent matmuls per chunk sequentially.  Some could be batched
 //!    across chunks (e.g. `v_prime = w @ state` before the loop if state were
 //!    fixed), but causality requires sequential state updates.  Investigate whether
 //!    CUDA graphs or explicit stream pipelining could hide latency.
 //!
-//! 4. **Inter-chunk state tensor re-allocation** — `s = (s.broadcast_mul(...) + state_update)?`
+//! 3. **Inter-chunk state tensor re-allocation** — `s = (s.broadcast_mul(...) + state_update)?`
 //!    allocates a new tensor on every chunk iteration.  For long sequences (many chunks)
 //!    this adds up to `num_chunks` extra allocations of [b, n_h, hk, hv].  If candle
 //!    exposes in-place `mul_` / `add_` ops, use them to update `s` without re-allocating.
 //!
-//! 5. **Defensive `contiguous()` copies** — many `narrow` + `contiguous` + `reshape`
+//! 4. **Defensive `contiguous()` copies** — many `narrow` + `contiguous` + `reshape`
 //!    chains create intermediate copies.  Profile to identify which are load-bearing
 //!    (CUDA non-contiguous reshape bug) vs unnecessary, and remove the latter.
 
@@ -171,8 +165,10 @@ pub fn gated_delta_rule_chunked(
     //
     // We build attn as [b, n_h, C, S, S], init with identity.
     let identity = Tensor::eye(chunk, DType::F32, &device)?.reshape((1, 1, 1, chunk, chunk))?;
-    let identity = identity.broadcast_as((b, n_heads, num_chunks, chunk, chunk))?;
-    let mut attn = identity;
+    let identity = identity
+        .broadcast_as((b, n_heads, num_chunks, chunk, chunk))?
+        .contiguous()?;
+    let attn = identity;
 
     // Forward substitution: solve (I − a_mat) * attn = I  →  attn = (I − a_mat)^{-1}
     //
@@ -205,20 +201,16 @@ pub fn gated_delta_rule_chunked(
             .broadcast_matmul(&attn_sub.reshape((bhnc, i, chunk))?)?
             .reshape((b, n_heads, num_chunks, 1, chunk))?;
 
-        // new_row = e_i + contrib  (attn[i, :] starts as e_i from the identity)
+        // new_row = e_i + contrib  (row i of attn is still e_i: only rows 0..i-1 have been updated)
         // Solving (I − a_mat) X = I: X[i,:] = e_i + Σ_{k<i} a_mat[i,k] X[k,:]
         // (a_mat has negative entries, so this slightly shrinks each row)
-        let cur_row = attn.narrow(candle_core::D::Minus2, i, 1)?; // [b, n_h, C, 1, S] = e_i
-        let new_row = (&cur_row + &contrib)?; // [b, n_h, C, 1, S]
+        // same_storage check in slice_set is between attn and new_row — safe because + allocates new storage.
+        let cur_row = attn.narrow(candle_core::D::Minus2, i, 1)?; // [b, n_h, C, 1, S] = e_i (unmodified)
+        let new_row = (&cur_row + &contrib)?.contiguous()?; // [b, n_h, C, 1, S]
 
-        // Splice new_row into attn at position i
-        let top = attn.narrow(candle_core::D::Minus2, 0, i)?;
-        let bottom = if i + 1 < chunk {
-            attn.narrow(candle_core::D::Minus2, i + 1, chunk - i - 1)?
-        } else {
-            Tensor::zeros((b, n_heads, num_chunks, 0, chunk), DType::F32, &device)?
-        };
-        attn = Tensor::cat(&[top, new_row, bottom], candle_core::D::Minus2)?;
+        // Splice new_row into attn at position i. In-place via copy2d — avoids the
+        // alloc + full-tensor copy of Tensor::cat and slice_scatter.
+        attn.slice_set(&new_row, candle_core::D::Minus2, i)?;
     }
 
     // ── Step 3e: Apply WY representation ──────────────────────────────────
@@ -352,8 +344,8 @@ fn sequential_loop(
     beta: &Tensor,
     state: &mut Tensor,
 ) -> Result<Tensor> {
-    let (b, t, n_heads, _) = q.dims4()?;
-    let head_v_dim = v.dim(3)?;
+    let (_b, t, _n_heads, _) = q.dims4()?;
+    let _head_v_dim = v.dim(3)?;
     // Permute to [b, n_h, t, d] so we can iterate over the time axis
     let q_p = q.permute((0, 2, 1, 3))?.contiguous()?; // [b, n_h, t, hk]
     let k_p = k.permute((0, 2, 1, 3))?.contiguous()?;
@@ -432,9 +424,14 @@ mod tests {
             .fold(0.0f32, f32::max)
     }
 
-    fn run_chunked_vs_sequential(device: &Device, t: usize, n_heads: usize, hk: usize, hv: usize) {
-        let b = 1usize;
-
+    fn run_chunked_vs_sequential(
+        device: &Device,
+        b: usize,
+        t: usize,
+        n_heads: usize,
+        hk: usize,
+        hv: usize,
+    ) {
         let q = Tensor::randn(0f32, 0.1f32, (b, t, n_heads, hk), device).unwrap();
         let k = Tensor::randn(0f32, 0.1f32, (b, t, n_heads, hk), device).unwrap();
         let v = Tensor::randn(0f32, 1.0f32, (b, t, n_heads, hv), device).unwrap();
@@ -456,15 +453,15 @@ mod tests {
         let out_diff = max_abs_diff(&out_seq, &out_chk);
         let state_diff = max_abs_diff(&state_seq, &state_chk);
 
-        println!("t={t} n_h={n_heads} hk={hk} hv={hv}: out_diff={out_diff:.6} state_diff={state_diff:.6}");
+        println!("b={b} t={t} n_h={n_heads} hk={hk} hv={hv}: out_diff={out_diff:.6} state_diff={state_diff:.6}");
 
         assert!(
             out_diff < 1e-3,
-            "t={t}: output mismatch: max diff = {out_diff}"
+            "b={b} t={t}: output mismatch: max diff = {out_diff}"
         );
         assert!(
             state_diff < 1e-3,
-            "t={t}: state mismatch: max diff = {state_diff}"
+            "b={b} t={t}: state mismatch: max diff = {state_diff}"
         );
     }
 
@@ -544,18 +541,21 @@ mod tests {
     fn chunked_matches_sequential_cpu() {
         let device = Device::Cpu;
         // t < CHUNK_SIZE (padded): simulates typical first/second REPL turn
-        run_chunked_vs_sequential(&device, 29, 2, 4, 4);
-        run_chunked_vs_sequential(&device, 56, 2, 4, 4);
+        run_chunked_vs_sequential(&device, 1, 29, 2, 4, 4);
+        run_chunked_vs_sequential(&device, 1, 56, 2, 4, 4);
         // t == CHUNK_SIZE (no padding)
-        run_chunked_vs_sequential(&device, 64, 2, 4, 4);
+        run_chunked_vs_sequential(&device, 1, 64, 2, 4, 4);
         // t > CHUNK_SIZE (multiple chunks)
-        run_chunked_vs_sequential(&device, 128, 2, 4, 4);
+        run_chunked_vs_sequential(&device, 1, 128, 2, 4, 4);
         // realistic model dims (n_heads=16, hk=hv=128) — single chunk
-        run_chunked_vs_sequential(&device, 56, 16, 128, 128);
+        run_chunked_vs_sequential(&device, 1, 56, 16, 128, 128);
         // realistic model dims — multi-chunk (2 chunks)
-        run_chunked_vs_sequential(&device, 128, 16, 128, 128);
+        run_chunked_vs_sequential(&device, 1, 128, 16, 128, 128);
         // realistic model dims — 3 chunks
-        run_chunked_vs_sequential(&device, 192, 16, 128, 128);
+        run_chunked_vs_sequential(&device, 1, 192, 16, 128, 128);
+        // batch > 1: validates identity broadcast and slice_set across batch dim
+        run_chunked_vs_sequential(&device, 2, 56, 2, 4, 4);
+        run_chunked_vs_sequential(&device, 2, 128, 2, 4, 4);
     }
 
     #[test]
@@ -565,14 +565,17 @@ mod tests {
             eprintln!("CUDA not available, skipping GPU test");
             return;
         }
-        run_chunked_vs_sequential(&device, 29, 2, 4, 4);
-        run_chunked_vs_sequential(&device, 56, 2, 4, 4);
-        run_chunked_vs_sequential(&device, 128, 2, 4, 4);
+        run_chunked_vs_sequential(&device, 1, 29, 2, 4, 4);
+        run_chunked_vs_sequential(&device, 1, 56, 2, 4, 4);
+        run_chunked_vs_sequential(&device, 1, 128, 2, 4, 4);
         // single chunk, realistic dims
-        run_chunked_vs_sequential(&device, 56, 16, 128, 128);
+        run_chunked_vs_sequential(&device, 1, 56, 16, 128, 128);
         // multi-chunk, realistic dims — the case that fails in production
-        run_chunked_vs_sequential(&device, 128, 16, 128, 128);
-        run_chunked_vs_sequential(&device, 200, 16, 128, 128);
+        run_chunked_vs_sequential(&device, 1, 128, 16, 128, 128);
+        run_chunked_vs_sequential(&device, 1, 200, 16, 128, 128);
+        // batch > 1: validates identity broadcast and slice_set across batch dim
+        run_chunked_vs_sequential(&device, 2, 56, 2, 4, 4);
+        run_chunked_vs_sequential(&device, 2, 128, 2, 4, 4);
     }
 
     /// Run a chunked prefill followed by sequential decode steps, comparing
@@ -780,5 +783,107 @@ mod tests {
         run_prefill_then_decode(&device, 80, 20, 16, 128, 128);
         run_prefill_then_decode(&device, 128, 30, 16, 128, 128);
         run_prefill_then_decode(&device, 200, 30, 16, 128, 128);
+    }
+
+    /// Validate `slice_scatter` correctness on CUDA by running `gated_delta_rule_chunked`
+    /// on both CPU and CUDA with identical inputs and requiring tight numerical agreement.
+    ///
+    /// The forward substitution loop is the primary user of `slice_scatter`.  Any device-
+    /// specific bug (wrong strides, misaligned write, etc.) surfaces here before the error
+    /// propagates through the rest of the attention computation and becomes hard to diagnose.
+    fn run_forward_subst_cpu_vs_cuda(
+        cuda: &Device,
+        b: usize,
+        t: usize,
+        n_heads: usize,
+        hk: usize,
+        hv: usize,
+    ) {
+        let cpu = Device::Cpu;
+
+        // Build inputs on CPU, then clone to CUDA.
+        let q_cpu = Tensor::randn(0f32, 0.1f32, (b, t, n_heads, hk), &cpu).unwrap();
+        let k_cpu = Tensor::randn(0f32, 0.1f32, (b, t, n_heads, hk), &cpu).unwrap();
+        let v_cpu = Tensor::randn(0f32, 1.0f32, (b, t, n_heads, hv), &cpu).unwrap();
+        let g_raw = Tensor::randn(-2.0f32, 1.0f32, (b, t, n_heads), &cpu).unwrap();
+        let log_g_cpu = candle_nn::ops::sigmoid(&g_raw).unwrap().log().unwrap();
+        let beta_cpu =
+            candle_nn::ops::sigmoid(&Tensor::randn(0f32, 1.0f32, (b, t, n_heads), &cpu).unwrap())
+                .unwrap();
+
+        let q_gpu = q_cpu.to_device(cuda).unwrap();
+        let k_gpu = k_cpu.to_device(cuda).unwrap();
+        let v_gpu = v_cpu.to_device(cuda).unwrap();
+        let log_g_gpu = log_g_cpu.to_device(cuda).unwrap();
+        let beta_gpu = beta_cpu.to_device(cuda).unwrap();
+
+        let mut state_cpu = Tensor::zeros((b, n_heads, hk, hv), DType::F32, &cpu).unwrap();
+        let mut state_gpu = Tensor::zeros((b, n_heads, hk, hv), DType::F32, cuda).unwrap();
+
+        let out_cpu = gated_delta_rule_chunked(
+            &q_cpu,
+            &k_cpu,
+            &v_cpu,
+            &log_g_cpu,
+            &beta_cpu,
+            &mut state_cpu,
+        )
+        .unwrap();
+        let out_gpu = gated_delta_rule_chunked(
+            &q_gpu,
+            &k_gpu,
+            &v_gpu,
+            &log_g_gpu,
+            &beta_gpu,
+            &mut state_gpu,
+        )
+        .unwrap()
+        .to_device(&cpu)
+        .unwrap();
+
+        // No NaN/Inf on GPU path.
+        let flat: Vec<f32> = out_gpu.flatten_all().unwrap().to_vec1().unwrap();
+        assert!(
+            flat.iter().all(|x| x.is_finite()),
+            "t={t}: NaN or Inf in CUDA chunked output"
+        );
+
+        // Tight tolerance: same algorithm on both devices should agree to ~1e-5.
+        let diff = max_abs_diff(&out_cpu, &out_gpu);
+        println!(
+            "forward_subst_cpu_vs_cuda b={b} t={t} n_h={n_heads} hk={hk} hv={hv}: diff={diff:.2e}"
+        );
+        assert!(
+            diff < 5e-5,
+            "b={b} t={t}: CPU vs CUDA output mismatch after slice_set: max diff = {diff}"
+        );
+
+        // State should also match.
+        let state_gpu_cpu = state_gpu.to_device(&cpu).unwrap();
+        let state_diff = max_abs_diff(&state_cpu, &state_gpu_cpu);
+        assert!(
+            state_diff < 5e-5,
+            "b={b} t={t}: CPU vs CUDA state mismatch after slice_set: max diff = {state_diff}"
+        );
+    }
+
+    /// CPU-vs-CUDA parity test for the forward substitution `slice_scatter` path.
+    #[test]
+    fn forward_subst_cpu_vs_cuda() {
+        let cuda = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
+        if matches!(cuda, Device::Cpu) {
+            eprintln!("CUDA not available, skipping forward_subst_cpu_vs_cuda");
+            return;
+        }
+        // Single-chunk (t ≤ 64): exercises the full 63-iteration loop.
+        run_forward_subst_cpu_vs_cuda(&cuda, 1, 30, 2, 4, 4);
+        run_forward_subst_cpu_vs_cuda(&cuda, 1, 64, 2, 4, 4); // exactly one chunk, no padding
+        run_forward_subst_cpu_vs_cuda(&cuda, 1, 50, 16, 128, 128); // realistic single-chunk
+                                                                   // Multi-chunk: verifies correct behaviour across chunk boundaries.
+        run_forward_subst_cpu_vs_cuda(&cuda, 1, 128, 16, 128, 128); // 2 chunks
+        run_forward_subst_cpu_vs_cuda(&cuda, 1, 200, 16, 128, 128); // 3+ chunks
+                                                                    // batch > 1: validates identity broadcast and slice_set across batch dim
+        run_forward_subst_cpu_vs_cuda(&cuda, 2, 56, 2, 4, 4);
+        run_forward_subst_cpu_vs_cuda(&cuda, 2, 128, 2, 4, 4);
     }
 }
