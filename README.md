@@ -51,12 +51,6 @@ inferrs run google/gemma-4-E2B-it
 
 ### Serve
 
-#### Serve a specific model (OpenAI/Anthropic/Ollama API on port 8080)
-
-```bash
-inferrs serve google/gemma-4-E2B-it
-```
-
 #### Serve a specific model vLLM-style
 
 ```bash
@@ -66,7 +60,7 @@ inferrs serve --paged-attention google/gemma-4-E2B-it
 #### Serve a specific model llama.cpp-style
 
 ```bash
-inferrs serve --quantize google/gemma-4-E2B-it
+inferrs serve google/gemma-4-E2B-it
 ```
 
 #### Serve models ollama-style
@@ -78,16 +72,4 @@ inferrs serve
 This behaves like `ollama serve` the server starts on `0.0.0.0:17434` and
 exposes the full Ollama API. Any Ollama client — including the `ollama`
 CLI — can point at it directly.
-
-## Architecture
-
-```
-┌─────────┐      HTTP       ┌────────┐  channel  ┌────────┐
-│  Client │ ──────────────▶ │ Server │ ────────▶ │ Engine │
-└─────────┘  (axum + SSE)   └────────┘           └────────┘
-                                                     │
-                               ┌──────────┬──────────┼──────────┐
-                               ▼          ▼          ▼          ▼
-                          Scheduler    Transformer  KV Cache  Sampler
-```
 

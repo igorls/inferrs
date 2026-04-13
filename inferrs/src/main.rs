@@ -187,10 +187,12 @@ pub struct ServeArgs {
     /// Accepted formats (case-insensitive): Q4_0, Q4_1, Q5_0, Q5_1, Q8_0,
     /// Q2K, Q3K, Q4K (Q4_K_M), Q5K, Q6K.
     ///
-    /// When used as a plain flag (`--quantize`) the default Q4_K_M (= Q4K) is used.
+    /// Defaults to Q4K when `--paged-attention` is not used.
+    /// Automatically disabled when `--paged-attention` is passed.
+    /// Pass `--quantize=none` (or `--quantize=false`) to run full-precision inference.
     /// Embedding and output (lm_head) tensors are kept at F16 for accuracy.
-    #[arg(long, num_args(0..=1), default_missing_value("Q4K"), require_equals(true),
-          value_name = "FORMAT")]
+    #[arg(long, num_args(0..=1), default_value("Q4K"), default_missing_value("Q4K"),
+          require_equals(true), value_name = "FORMAT")]
     pub quantize: Option<String>,
 }
 
@@ -493,12 +495,29 @@ impl ServeArgs {
         }
     }
 
-    /// Parse the `--quantize` format string (if provided) into a `GgmlDType`.
+    /// Parse the `--quantize` format string into a `GgmlDType`.
+    ///
+    /// Returns `None` in two cases:
+    /// - `--paged-attention` is active (paged attention requires un-quantized
+    ///   safetensors weights; the two options are mutually exclusive at load time).
+    /// - The user explicitly passed `--quantize=none` or `--quantize=false` to
+    ///   request full-precision inference without enabling paged attention.
     pub fn resolve_quant_dtype(&self) -> Result<Option<candle_core::quantized::GgmlDType>> {
-        self.quantize
-            .as_deref()
-            .map(crate::quantize::parse_format)
-            .transpose()
+        if self.paged_attention.is_some() {
+            if let Some(ref q) = self.quantize {
+                if !matches!(q.to_lowercase().as_str(), "none" | "false") {
+                    tracing::warn!(
+                        "--quantize={q} ignored: paged-attention requires un-quantized \
+                         safetensors weights"
+                    );
+                }
+            }
+            return Ok(None);
+        }
+        match self.quantize.as_deref() {
+            Some(s) if matches!(s.to_lowercase().as_str(), "none" | "false") => Ok(None),
+            other => other.map(crate::quantize::parse_format).transpose(),
+        }
     }
 }
 

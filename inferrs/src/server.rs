@@ -1210,8 +1210,12 @@ async fn spawn_worker(
         if let Some(ref tq) = o.turbo_quant {
             args.push(format!("--turbo-quant={tq}"));
         }
-        if let Some(ref q) = o.quantize {
-            args.push(format!("--quantize={q}"));
+        // Only forward --quantize when paged-attention is not active; the two are
+        // mutually exclusive and paged-attention requires un-quantized weights.
+        if o.paged_attention.is_none() {
+            if let Some(ref q) = o.quantize {
+                args.push(format!("--quantize={q}"));
+            }
         }
         if let Some(ref f) = o.gguf_file {
             args.extend(["--gguf-file".into(), f.clone()]);
