@@ -168,12 +168,25 @@ fn pick_best_gguf_file(repo: &hf_hub::api::sync::ApiRepo, model_id: &str) -> Res
         "No .gguf files found in {model_id} (and no config.json present)"
     );
 
-    // Prefer Q4K, then Q8_0, otherwise the first file.
+    // Prefer by quality/size trade-off: Q4K > Q5K > Q6K > Q8_0 > anything
+    // else (avoids accidentally picking a massive bf16 or f32 file).
     let preferred = gguf_files
         .iter()
         .find(|f| {
             let lower = f.to_lowercase();
-            lower.contains("q4_k_m") || lower.contains("q4k") || lower.contains("q4_k-m")
+            lower.contains("q4_k") || lower.contains("q4k")
+        })
+        .or_else(|| {
+            gguf_files.iter().find(|f| {
+                let lower = f.to_lowercase();
+                lower.contains("q5_k") || lower.contains("q5k")
+            })
+        })
+        .or_else(|| {
+            gguf_files.iter().find(|f| {
+                let lower = f.to_lowercase();
+                lower.contains("q6_k") || lower.contains("q6k")
+            })
         })
         .or_else(|| {
             gguf_files.iter().find(|f| {
@@ -208,7 +221,13 @@ fn download_gguf_only_repo(
     let source_repo_id = if let Some(ts) = tokenizer_source {
         Some(ts.to_string())
     } else {
-        let from_gguf = read_gguf_source_repo(&gguf_path)?;
+        // Use `unwrap_or_else` so a parse error (e.g. unknown GGUF metadata
+        // type in a future format version) falls through to the HF model card
+        // fallback instead of aborting the whole pull.
+        let from_gguf = read_gguf_source_repo(&gguf_path).unwrap_or_else(|e| {
+            tracing::debug!("Could not read GGUF source repo from metadata: {e:#}");
+            None
+        });
         if from_gguf.is_some() {
             from_gguf
         } else {
