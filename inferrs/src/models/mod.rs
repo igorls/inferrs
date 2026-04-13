@@ -20,6 +20,144 @@ use crate::config::{ModelArchitecture, RawConfig, VisionConfig};
 use crate::multimodal_plugin::{AudioEncoderHandle, MultimodalPlugin, VisionEncoderHandle};
 use inferrs_models::kv_cache::{BlockTable, PagedKvStore};
 use quantized_linear::QGgufVarBuilder;
+use std::sync::Mutex;
+
+// ---------------------------------------------------------------------------
+// Lazy encoder wrappers
+//
+// Encoders are expensive to load (~300–600 MB of weights) and are only needed
+// when a multimodal request actually arrives.  We store the parameters needed
+// to construct them and load on first use, so text-only servers pay no memory
+// or startup cost for encoders.
+// ---------------------------------------------------------------------------
+
+/// All parameters needed to load an audio encoder on demand.
+struct AudioEncoderParams {
+    weight_paths: Vec<std::path::PathBuf>,
+    cfg_json: String,
+    lm_hidden_size: usize,
+    dtype: DType,
+    device: Device,
+}
+
+/// All parameters needed to load a vision encoder on demand.
+struct VisionEncoderParams {
+    weight_paths: Vec<std::path::PathBuf>,
+    cfg_json: String,
+    lm_hidden_size: usize,
+    dtype: DType,
+    device: Device,
+}
+
+/// Lazily-loaded audio encoder. Loads on first `encode()` call.
+///
+/// The `Mutex` serialises concurrent first-call races: the first caller holds
+/// the lock while loading, and every subsequent caller waits and then finds the
+/// encoder already populated — eliminating the TOCTOU window.
+struct LazyAudioEncoder {
+    params: AudioEncoderParams,
+    /// `None` until the first `encode()` call successfully loads the encoder.
+    /// `Mutex` guards both the lazy-init check and the encoder reference.
+    inner: Mutex<Option<AudioEncoderHandle>>,
+}
+
+impl LazyAudioEncoder {
+    fn new(params: AudioEncoderParams) -> Self {
+        Self {
+            params,
+            inner: Mutex::new(None),
+        }
+    }
+
+    fn encode(&self, mel: &Tensor) -> Result<Tensor> {
+        let mut guard = self.inner.lock().unwrap();
+        if guard.is_none() {
+            let paths_ref: Vec<&Path> = self
+                .params
+                .weight_paths
+                .iter()
+                .map(|p| p.as_path())
+                .collect();
+            match MultimodalPlugin::load().and_then(|plugin| {
+                plugin.load_audio_encoder(
+                    &paths_ref,
+                    &self.params.cfg_json,
+                    self.params.lm_hidden_size,
+                    self.params.dtype,
+                    &self.params.device,
+                )
+            }) {
+                Ok(enc) => {
+                    tracing::info!("Audio encoder loaded on first multimodal request");
+                    *guard = Some(enc);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load audio encoder: {e:#}");
+                }
+            }
+        }
+        guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("audio encoder unavailable"))?
+            .encode(mel)
+    }
+}
+
+/// Lazily-loaded vision encoder. Loads on first `encode()` call.
+///
+/// See [`LazyAudioEncoder`] for the locking rationale.
+struct LazyVisionEncoder {
+    params: VisionEncoderParams,
+    /// `None` until the first `encode()` call successfully loads the encoder.
+    inner: Mutex<Option<VisionEncoderHandle>>,
+}
+
+impl LazyVisionEncoder {
+    fn new(params: VisionEncoderParams) -> Self {
+        Self {
+            params,
+            inner: Mutex::new(None),
+        }
+    }
+
+    fn encode(
+        &self,
+        pixel_values: &Tensor,
+        position_ids: &Tensor,
+        n_soft_tokens: usize,
+    ) -> Result<Tensor> {
+        let mut guard = self.inner.lock().unwrap();
+        if guard.is_none() {
+            let paths_ref: Vec<&Path> = self
+                .params
+                .weight_paths
+                .iter()
+                .map(|p| p.as_path())
+                .collect();
+            match MultimodalPlugin::load().and_then(|plugin| {
+                plugin.load_vision_encoder(
+                    &paths_ref,
+                    &self.params.cfg_json,
+                    self.params.lm_hidden_size,
+                    self.params.dtype,
+                    &self.params.device,
+                )
+            }) {
+                Ok(enc) => {
+                    tracing::info!("Vision encoder loaded on first multimodal request");
+                    *guard = Some(enc);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load vision encoder: {e:#}");
+                }
+            }
+        }
+        guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("vision encoder unavailable"))?
+            .encode(pixel_values, position_ids, n_soft_tokens)
+    }
+}
 
 /// Unified model interface for the engine.
 pub trait CausalLM: Send {
@@ -209,13 +347,13 @@ impl CausalLM for Qwen3ModelWrapper {
     }
 }
 
-/// A Gemma4 model wrapper (with optional audio and vision encoders).
+/// A Gemma4 model wrapper (with optional lazy audio and vision encoders).
 struct Gemma4ModelWrapper {
     inner: gemma4::Gemma4Model,
-    audio_encoder: Option<AudioEncoderHandle>,
+    audio_encoder: Option<LazyAudioEncoder>,
     /// Pending audio: embeddings + positions of audio soft tokens in input_ids.
     pending_audio: Option<(Tensor, Vec<usize>)>,
-    vision_encoder: Option<VisionEncoderHandle>,
+    vision_encoder: Option<LazyVisionEncoder>,
     /// Pending image: embeddings + positions of image soft tokens in input_ids.
     pending_image: Option<(Tensor, Vec<usize>)>,
 }
@@ -288,11 +426,10 @@ impl CausalLM for Gemma4ModelWrapper {
     }
 
     fn encode_audio(&mut self, mel: &Tensor) -> Result<Tensor> {
-        let enc = self
-            .audio_encoder
+        self.audio_encoder
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Gemma4 model was loaded without an audio tower"))?;
-        enc.encode(mel)
+            .ok_or_else(|| anyhow::anyhow!("Gemma4 model was loaded without an audio tower"))?
+            .encode(mel)
     }
 
     fn set_pending_audio(&mut self, embeds: Tensor, positions: Vec<usize>) {
@@ -309,11 +446,10 @@ impl CausalLM for Gemma4ModelWrapper {
         position_ids: &Tensor,
         n_soft_tokens: usize,
     ) -> Result<Tensor> {
-        let enc = self
-            .vision_encoder
+        self.vision_encoder
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Gemma4 model was loaded without a vision tower"))?;
-        enc.encode(pixel_values, position_ids, n_soft_tokens)
+            .ok_or_else(|| anyhow::anyhow!("Gemma4 model was loaded without a vision tower"))?
+            .encode(pixel_values, position_ids, n_soft_tokens)
     }
 
     fn set_pending_image(&mut self, embeds: Tensor, positions: Vec<usize>) {
@@ -933,116 +1069,56 @@ pub fn load_model(
             );
             let inner = gemma4::Gemma4Model::new(&config, vb.clone(), qvb.as_ref(), gguf_path)?;
 
-            // Load audio and vision encoders via the inferrs-multimodal plugin.
-            // The plugin is dlopened from the same directory as the binary.
-            // GGUF files typically only contain LM weights; skip encoder loading
-            // when weight tensors are absent (plugin returns an error we treat as
-            // a soft skip).
-            let plugin = MultimodalPlugin::load();
+            // Build lazy encoder wrappers: no weights are loaded here.
+            // Each encoder loads its weights on the first multimodal request
+            // so text-only servers pay no memory cost for the encoder weights.
+            let weight_paths_owned: Vec<std::path::PathBuf> = weight_paths
+                .iter()
+                .map(|p| p.as_ref().to_path_buf())
+                .collect();
 
-            let paths_ref: Vec<&Path> = weight_paths.iter().map(|p| p.as_ref()).collect();
-
-            let audio_encoder = if let Some(audio_cfg) = &raw_config.audio_config {
+            let audio_encoder = raw_config.audio_config.as_ref().map(|audio_cfg| {
                 tracing::info!(
-                    "Gemma4 audio encoder: {} layers, hidden={}, output_dims={}",
+                    "Gemma4 audio encoder available (lazy): {} layers, hidden={}, output_dims={}",
                     audio_cfg.num_hidden_layers,
                     audio_cfg.hidden_size,
                     audio_cfg.output_proj_dims,
                 );
-                match &plugin {
-                    Err(e) => {
-                        tracing::warn!(
-                            "inferrs-multimodal plugin not available, audio encoder skipped: {e:#}"
-                        );
-                        None
-                    }
-                    Ok(plugin) => {
-                        let cfg_json = serde_json::to_string(audio_cfg)
-                            .context("Failed to serialize AudioConfig")?;
-                        match plugin.load_audio_encoder(
-                            &paths_ref,
-                            &cfg_json,
-                            config.hidden_size,
-                            dtype,
-                            device,
-                        ) {
-                            Ok(enc) => {
-                                tracing::info!("Audio encoder loaded successfully");
-                                Some(enc)
-                            }
-                            Err(e)
-                                if gguf_path.is_some()
-                                    && format!("{e:#}").contains("cannot find tensor") =>
-                            {
-                                tracing::warn!("Audio encoder weights not found, skipping: {e:#}");
-                                None
-                            }
-                            Err(e) => return Err(e).context("Failed to load Gemma4 audio encoder"),
-                        }
-                    }
-                }
-            } else {
-                None
-            };
+                let cfg_json =
+                    serde_json::to_string(audio_cfg).expect("Failed to serialize AudioConfig");
+                LazyAudioEncoder::new(AudioEncoderParams {
+                    weight_paths: weight_paths_owned.clone(),
+                    cfg_json,
+                    lm_hidden_size: config.hidden_size,
+                    dtype,
+                    device: device.clone(),
+                })
+            });
 
-            // Load vision encoder if vision_config is present in the model config.
-            let vision_encoder = if let Some(vision_cfg) = &raw_config.vision_config {
-                match vision_cfg {
-                    VisionConfig::Gemma4(cfg) => {
-                        tracing::info!(
-                            "Gemma4 vision encoder: {} layers, hidden={}, patch_size={}, output_length={}",
-                            cfg.num_hidden_layers,
-                            cfg.hidden_size,
-                            cfg.patch_size,
-                            cfg.default_output_length,
-                        );
-                        match &plugin {
-                            Err(e) => {
-                                tracing::warn!(
-                                    "inferrs-multimodal plugin not available, vision encoder skipped: {e:#}"
-                                );
-                                None
-                            }
-                            Ok(plugin) => {
-                                let cfg_json = serde_json::to_string(cfg)
-                                    .context("Failed to serialize Gemma4VisionConfig")?;
-                                match plugin.load_vision_encoder(
-                                    &paths_ref,
-                                    &cfg_json,
-                                    config.hidden_size,
-                                    dtype,
-                                    device,
-                                ) {
-                                    Ok(enc) => {
-                                        tracing::info!("Vision encoder loaded successfully");
-                                        Some(enc)
-                                    }
-                                    Err(e)
-                                        if gguf_path.is_some()
-                                            && format!("{e:#}").contains("cannot find tensor") =>
-                                    {
-                                        tracing::warn!(
-                                            "Vision encoder weights not found, skipping: {e:#}"
-                                        );
-                                        None
-                                    }
-                                    Err(e) => {
-                                        return Err(e)
-                                            .context("Failed to load Gemma4 vision encoder")
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    VisionConfig::Qwen(_) => {
-                        tracing::info!(
-                            "Qwen vision encoder detected but not yet supported, skipping"
-                        );
-                        None
-                    }
+            let vision_encoder = match &raw_config.vision_config {
+                Some(VisionConfig::Gemma4(cfg)) => {
+                    tracing::info!(
+                        "Gemma4 vision encoder available (lazy): {} layers, hidden={}, patch_size={}, output_length={}",
+                        cfg.num_hidden_layers,
+                        cfg.hidden_size,
+                        cfg.patch_size,
+                        cfg.default_output_length,
+                    );
+                    let cfg_json =
+                        serde_json::to_string(cfg).expect("Failed to serialize Gemma4VisionConfig");
+                    Some(LazyVisionEncoder::new(VisionEncoderParams {
+                        weight_paths: weight_paths_owned,
+                        cfg_json,
+                        lm_hidden_size: config.hidden_size,
+                        dtype,
+                        device: device.clone(),
+                    }))
                 }
-            } else {
-                None
+                Some(VisionConfig::Qwen(_)) => {
+                    tracing::info!("Qwen vision encoder detected but not yet supported, skipping");
+                    None
+                }
+                None => None,
             };
 
             Box::new(Gemma4ModelWrapper {

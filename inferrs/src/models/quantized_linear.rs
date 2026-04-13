@@ -205,6 +205,10 @@ impl QLinear {
 /// `get_qtensor`, and cached so that each tensor is read from disk at most once.
 /// Tensors that are never requested (norms, biases, embeddings) are never
 /// loaded, eliminating the double-memory issue of an eager approach.
+///
+/// Key renaming (GGUF → HuggingFace tensor name mapping) is stored as a pure
+/// metadata table and applied lazily at load time, so `rename_keys` never
+/// touches device memory or reads from the file.
 #[derive(Clone)]
 pub struct QGgufVarBuilder {
     file: Arc<std::sync::Mutex<std::fs::File>>,
@@ -212,6 +216,9 @@ pub struct QGgufVarBuilder {
     cache: Arc<
         std::sync::Mutex<std::collections::HashMap<String, Arc<candle_core::quantized::QTensor>>>,
     >,
+    /// Maps HuggingFace tensor names → GGUF tensor names.
+    /// Populated by `rename_keys`; empty when no renaming is needed.
+    name_remap: Arc<std::collections::HashMap<String, String>>,
     device: Device,
     path: Vec<String>,
 }
@@ -230,6 +237,7 @@ impl QGgufVarBuilder {
             file: Arc::new(std::sync::Mutex::new(file)),
             content: Arc::new(content),
             cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            name_remap: Arc::new(std::collections::HashMap::new()),
             device: device.clone(),
             path: Vec::new(),
         })
@@ -243,6 +251,7 @@ impl QGgufVarBuilder {
             file: self.file.clone(),
             content: self.content.clone(),
             cache: self.cache.clone(),
+            name_remap: self.name_remap.clone(),
             device: self.device.clone(),
             path,
         }
@@ -258,6 +267,10 @@ impl QGgufVarBuilder {
     }
 
     /// Load a tensor by name, returning the cached copy if already loaded.
+    ///
+    /// `name` is the HuggingFace-style key; if a `name_remap` table is present
+    /// (built by `rename_keys`) it is consulted to find the actual GGUF key
+    /// before reading from the file.
     fn load_qtensor(
         &self,
         name: &str,
@@ -268,12 +281,20 @@ impl QGgufVarBuilder {
                 return Ok(Some(qt.clone()));
             }
         }
-        if !self.content.tensor_infos.contains_key(name) {
+        // Resolve the GGUF tensor name: use the remap table if present,
+        // otherwise assume the name is already in GGUF format.
+        let gguf_name: std::borrow::Cow<str> = if let Some(g) = self.name_remap.get(name) {
+            std::borrow::Cow::Borrowed(g.as_str())
+        } else {
+            std::borrow::Cow::Borrowed(name)
+        };
+        if !self.content.tensor_infos.contains_key(gguf_name.as_ref()) {
             return Ok(None);
         }
         let qt = {
             let mut file = self.file.lock().unwrap();
-            self.content.tensor(&mut *file, name, &self.device)?
+            self.content
+                .tensor(&mut *file, gguf_name.as_ref(), &self.device)?
         };
         let qt = Arc::new(qt);
         self.cache
@@ -327,26 +348,28 @@ impl QGgufVarBuilder {
     ///
     /// Because the lazy loader looks up tensors by name in the GGUF content
     /// metadata, this method eagerly loads all tensors under their mapped names
-    /// into the shared cache.  Future calls to `qlinear_weight` / `get_qtensor`
-    /// will hit the cache and find the tensor under its HF key.
+    /// Build a key-remapping table that maps HuggingFace tensor names to GGUF
+    /// tensor names.  No tensors are loaded from disk; the mapping is applied
+    /// lazily inside `load_qtensor` when a tensor is first requested.
+    ///
+    /// This replaces the previous eager implementation that loaded every GGUF
+    /// tensor into device memory upfront, causing a large transient RSS spike
+    /// and preventing parallelisation with other startup work.
     pub fn rename_keys<F: Fn(&str) -> String>(&self, map_fn: F) -> Result<Self> {
-        for tensor_name in self.content.tensor_infos.keys() {
-            let hf_name = map_fn(tensor_name);
-            let needs_insert = {
-                let cache = self.cache.lock().unwrap();
-                !cache.contains_key(&hf_name)
-            };
-            if !needs_insert {
-                continue;
-            }
-            let qt = {
-                let mut file = self.file.lock().unwrap();
-                self.content.tensor(&mut *file, tensor_name, &self.device)?
-            };
-            let mut cache = self.cache.lock().unwrap();
-            cache.entry(hf_name).or_insert_with(|| Arc::new(qt));
-        }
-        Ok(self.clone())
+        let remap: std::collections::HashMap<String, String> = self
+            .content
+            .tensor_infos
+            .keys()
+            .map(|gguf_name| (map_fn(gguf_name), gguf_name.clone()))
+            .collect();
+        Ok(Self {
+            file: self.file.clone(),
+            content: self.content.clone(),
+            cache: self.cache.clone(),
+            name_remap: Arc::new(remap),
+            device: self.device.clone(),
+            path: self.path.clone(),
+        })
     }
 }
 

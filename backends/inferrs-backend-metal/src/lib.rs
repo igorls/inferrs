@@ -17,8 +17,8 @@ pub extern "C" fn inferrs_backend_probe() -> i32 {
     #[cfg(target_os = "macos")]
     {
         match candle_core::Device::new_metal(0) {
-            Ok(_) => return 0,
-            Err(_) => return 1,
+            Ok(_) => 0,
+            Err(_) => 1,
         }
     }
     #[cfg(not(target_os = "macos"))]

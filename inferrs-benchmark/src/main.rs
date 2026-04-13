@@ -113,12 +113,13 @@ fn main() -> Result<()> {
         args.inferrs_model
     ));
     let summary_inferrs_nq = {
+        let t_spawn = Instant::now();
         let mut server =
             start_inferrs(&inferrs_bin, &args.inferrs_model, args.inferrs_nq_port, &[])?;
         ok(&format!("inferrs serve started (pid {})", server.id()));
 
         let health = format!("http://127.0.0.1:{}/health", args.inferrs_nq_port);
-        let tth_ms = match wait_for_health(&health, args.server_ready_timeout) {
+        let tth_ms = match wait_for_health(&health, args.server_ready_timeout, t_spawn) {
             Ok(t) => Some(t),
             Err(e) => {
                 err(&format!("inferrs serve failed to start: {e}"));
@@ -160,11 +161,12 @@ fn main() -> Result<()> {
         args.llama_model
     ));
     let summary_llama = {
+        let t_spawn = Instant::now();
         let mut server = start_llama_server(&args.llama_model, args.llama_port)?;
         ok(&format!("llama-server started (pid {})", server.id()));
 
         let health = format!("http://127.0.0.1:{}/health", args.llama_port);
-        let tth_ms = match wait_for_health(&health, args.server_ready_timeout) {
+        let tth_ms = match wait_for_health(&health, args.server_ready_timeout, t_spawn) {
             Ok(t) => Some(t),
             Err(e) => {
                 err(&format!("llama-server failed to start: {e}"));
@@ -244,11 +246,12 @@ where
     F: FnOnce() -> Result<(Child, Option<Box<dyn FnOnce()>>)>,
 {
     log_header(label);
+    let t_spawn = Instant::now();
     let (mut server, cleanup) = start_fn()?;
     ok(&format!("{label} started (pid {})", server.id()));
 
     let health = format!("http://127.0.0.1:{port}/health");
-    let tth_ms = match wait_for_health(&health, args.server_ready_timeout) {
+    let tth_ms = match wait_for_health(&health, args.server_ready_timeout, t_spawn) {
         Ok(t) => Some(t),
         Err(e) => {
             err(&format!("{label} failed to start: {e}"));
@@ -860,8 +863,7 @@ fn stop_docker_container(name: &str) {
 
 /// Wait for a server to become healthy. Returns the time-to-healthy in
 /// milliseconds on success.
-fn wait_for_health(url: &str, timeout_secs: u64) -> Result<f64> {
-    let t0 = Instant::now();
+fn wait_for_health(url: &str, timeout_secs: u64, t0: Instant) -> Result<f64> {
     let deadline = t0 + Duration::from_secs(timeout_secs);
     eprint!("    Waiting for {url} ");
 
@@ -881,7 +883,7 @@ fn wait_for_health(url: &str, timeout_secs: u64) -> Result<f64> {
         }
 
         eprint!(".");
-        std::thread::sleep(Duration::from_secs(2));
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 

@@ -1105,11 +1105,9 @@ fn loaded_model_from_ctx(
     model_id: String,
     ctx: crate::engine::EngineContext,
 ) -> Result<LoadedModel> {
-    let tok = Arc::new(Tokenizer::from_file_with_arch(
-        &ctx.model_files.tokenizer_path,
-        ctx.model_files.tokenizer_config_path.as_deref(),
-        Some(&ctx.arch),
-    )?);
+    // Reuse the tokenizer that was already loaded during engine initialisation
+    // rather than reading the file from disk a second time.
+    let tok = ctx.tokenizer;
 
     let max_seq_len = ctx.max_seq_len;
     let audio_token_id = ctx.raw_config.audio_token_id;

@@ -23,7 +23,6 @@ use candle_core::{DType, Device, Tensor};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use crate::config::{ModelArchitecture, RawConfig};
-use crate::hub::ModelFiles;
 use crate::models::CausalLM;
 use crate::sampler::{self, SamplingParams};
 use crate::tokenizer::Tokenizer;
@@ -92,18 +91,16 @@ pub struct EngineContext {
     pub engine: Engine,
     pub raw_config: RawConfig,
     pub arch: ModelArchitecture,
-    pub model_files: ModelFiles,
     pub dtype: DType,
     pub max_seq_len: usize,
+    /// The tokenizer loaded during engine initialisation, wrapped in an `Arc`
+    /// so the HTTP server can reuse it without a second disk read.
+    pub tokenizer: Arc<Tokenizer>,
 }
 
 /// Build an [`Engine`] from [`ServeArgs`], handling the repeated sequence:
 /// parse quantize → download → load config → detect arch → load model →
 /// build engine tokenizer → construct Engine → attach paged KV.
-///
-/// The caller is responsible for building any *additional* tokenizer instances
-/// (e.g. the one used by the HTTP server / REPL) from the returned
-/// [`EngineContext::model_files`] and [`EngineContext::arch`].
 pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
     let device = args.resolve_device()?;
     let dtype = {
@@ -151,26 +148,39 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         tracing::info!("Model KV cache capacity: {} tokens", max_seq_len);
     }
 
-    let model = crate::models::load_model(
-        &raw_config,
-        &arch,
-        &model_files.weight_paths,
-        model_files.gguf_path.as_deref(),
-        dtype,
-        &device,
-        args.turbo_quant.0,
-        &model_files.config_path,
-    )?;
+    // Load model weights and tokenizer in parallel: both are I/O + CPU bound
+    // and independent of each other.  On a 256K-token vocabulary the tokenizer
+    // parse takes ~300 ms; running it concurrently with the ~840 ms weight load
+    // hides it almost entirely.
+    let (model, tokenizer) = std::thread::scope(|s| {
+        let tok_handle = s.spawn(|| {
+            Tokenizer::from_file_with_arch(
+                &model_files.tokenizer_path,
+                model_files.tokenizer_config_path.as_deref(),
+                Some(&arch),
+            )
+        });
 
-    let engine_tokenizer = Tokenizer::from_file_with_arch(
-        &model_files.tokenizer_path,
-        model_files.tokenizer_config_path.as_deref(),
-        Some(&arch),
-    )?;
+        let model_result = crate::models::load_model(
+            &raw_config,
+            &arch,
+            &model_files.weight_paths,
+            model_files.gguf_path.as_deref(),
+            dtype,
+            &device,
+            args.turbo_quant.0,
+            &model_files.config_path,
+        );
+
+        let tok_result = tok_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("tokenizer thread panicked"))?;
+        Ok::<_, anyhow::Error>((model_result?, Arc::new(tok_result?)))
+    })?;
 
     let mut engine = Engine::new(
         model,
-        engine_tokenizer,
+        Arc::clone(&tokenizer),
         device.clone(),
         args.max_batch_size,
         args.max_tokens_per_step,
@@ -190,9 +200,9 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         engine,
         raw_config,
         arch,
-        model_files,
         dtype,
         max_seq_len,
+        tokenizer,
     })
 }
 
@@ -1273,7 +1283,7 @@ pub fn attach_paged_kv_if_requested(
 /// used to accept and queue requests between decode steps.
 pub struct Engine {
     model: Box<dyn CausalLM>,
-    tokenizer: Tokenizer,
+    tokenizer: Arc<Tokenizer>,
     device: Device,
     stop_token_ids: Vec<u32>,
     max_batch_size: usize,
@@ -1283,9 +1293,10 @@ pub struct Engine {
     paged: Option<PagedState>,
     /// Pre-computed UTF-8 byte string for every token ID.
     /// Used by the grammar masker to avoid decoding the vocabulary at every step.
-    /// Empty when the tokenizer vocab size is very large (> 512K tokens) to
+    /// `None` until the first grammar-constrained request triggers the scan.
+    /// Stays `None` when the tokenizer vocab size exceeds 512K tokens to
     /// avoid excessive memory use.
-    token_bytes: Vec<Vec<u8>>,
+    token_bytes: Option<Vec<Vec<u8>>>,
 }
 
 /// Shared state for paged-attention mode.
@@ -1306,35 +1317,12 @@ struct PagedState {
 impl Engine {
     pub fn new(
         model: Box<dyn CausalLM>,
-        tokenizer: Tokenizer,
+        tokenizer: Arc<Tokenizer>,
         device: Device,
         max_batch_size: usize,
         max_tokens_per_step: usize,
     ) -> Self {
         let stop_token_ids = tokenizer.stop_token_ids.clone();
-        // Pre-compute byte strings for each vocabulary token.  This is used
-        // by the JSON grammar masker to check which tokens are valid without
-        // doing a per-step vocab scan.  Capped at 512K tokens to avoid
-        // excessive startup overhead on huge vocabularies.
-        let token_bytes = {
-            let vocab_size = tokenizer.vocab_size();
-            if vocab_size <= 512 * 1024 {
-                (0u32..vocab_size as u32)
-                    .map(|id| {
-                        tokenizer
-                            .decode(&[id], false)
-                            .unwrap_or_default()
-                            .into_bytes()
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                tracing::debug!(
-                    "Vocabulary size {} > 512K — skipping grammar token-byte pre-computation",
-                    vocab_size
-                );
-                Vec::new()
-            }
-        };
         Self {
             model,
             tokenizer,
@@ -1343,7 +1331,9 @@ impl Engine {
             max_batch_size,
             max_tokens_per_step,
             paged: None,
-            token_bytes,
+            // Defer the vocab scan to the first grammar-constrained request so
+            // it does not add ~100 ms to every server startup.
+            token_bytes: None,
         }
     }
 
@@ -1389,8 +1379,12 @@ impl Engine {
             max_batch_size,
             max_tokens_per_step: _,
             paged,
-            token_bytes,
+            token_bytes: token_bytes_opt,
         } = self;
+        // Lazily-populated cache of per-token byte strings for grammar masking.
+        // Populated on the first grammar-constrained request so startup is not
+        // penalised by a full vocabulary decode (~120 ms for 256K-token vocabs).
+        let mut token_bytes_opt = token_bytes_opt;
 
         let mut paged = paged;
         let is_paged = paged.is_some();
@@ -1561,8 +1555,30 @@ impl Engine {
                 // When a JSON FSM is active, mask logits for tokens that
                 // cannot legally continue the current partial output.
                 let logits = if let Some(fsm) = &seq.grammar_fsm {
+                    // Lazily build the token-bytes table on the first grammar
+                    // request. Capped at 512K tokens to bound memory use.
+                    let token_bytes = token_bytes_opt.get_or_insert_with(|| {
+                        let vocab_size = tokenizer.vocab_size();
+                        if vocab_size <= 512 * 1024 {
+                            (0u32..vocab_size as u32)
+                                .map(|id| {
+                                    tokenizer
+                                        .decode(&[id], false)
+                                        .unwrap_or_default()
+                                        .into_bytes()
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            tracing::debug!(
+                                "Vocabulary size {} > 512K — skipping grammar \
+                                 token-byte pre-computation",
+                                vocab_size
+                            );
+                            Vec::new()
+                        }
+                    });
                     if !token_bytes.is_empty() {
-                        match apply_grammar_mask(&logits, fsm, &token_bytes, &device) {
+                        match apply_grammar_mask(&logits, fsm, token_bytes, &device) {
                             Ok(masked) => masked,
                             Err(e) => {
                                 tracing::warn!("Grammar masking failed (non-fatal): {e}");

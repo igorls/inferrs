@@ -12,6 +12,14 @@ else
   CUDA_PKG := -p inferrs-backend-cuda
 endif
 
+# inferrs-backend-metal is only built on macOS (standard Apple SDK, no exotic
+# toolchain required).
+ifeq ($(UNAME_S),Darwin)
+  METAL_PKG := -p inferrs-backend-metal
+else
+  METAL_PKG :=
+endif
+
 # inferrs-backend-hexagon compiles cleanly on all host platforms (it fast-fails
 # at runtime on non-Snapdragon hardware).  Include it unconditionally.
 HEXAGON_PKG := -p inferrs-backend-hexagon
@@ -19,7 +27,7 @@ HEXAGON_PKG := -p inferrs-backend-hexagon
 # Packages that can be built/tested without GPU toolchains (CUDA, ROCm).
 # Both the Hexagon and OpenVINO backends have no exotic toolchain requirement
 # and can be built anywhere (they probe at runtime via dlopen/LoadLibrary).
-NO_GPU_PKGS := -p inferrs -p inferrs-benchmark -p inferrs-multimodal -p inferrs-kernels -p inferrs-backend-vulkan $(HEXAGON_PKG) -p inferrs-backend-openvino $(CUDA_PKG)
+NO_GPU_PKGS := -p inferrs -p inferrs-benchmark -p inferrs-multimodal -p inferrs-kernels -p inferrs-backend-vulkan $(HEXAGON_PKG) -p inferrs-backend-openvino $(CUDA_PKG) $(METAL_PKG)
 
 .PHONY: all build release lint test ui
 

@@ -14,7 +14,6 @@ use anyhow::Result;
 
 use crate::engine::load_engine;
 use crate::sampler::SamplingParams;
-use crate::tokenizer::Tokenizer;
 use crate::util::format_bytes;
 use crate::ServeArgs;
 use inferrs_models::turbo_quant::GROUP_SIZE;
@@ -49,11 +48,8 @@ pub fn run(args: BenchArgs) -> Result<()> {
     let arch = ctx.arch;
     let dtype = ctx.dtype;
 
-    // Bench only needs a plain tokenizer (no chat template) for the BOS id.
-    let tokenizer = Tokenizer::from_file(
-        &ctx.model_files.tokenizer_path,
-        ctx.model_files.tokenizer_config_path.as_deref(),
-    )?;
+    // Reuse the tokenizer already loaded during engine initialisation.
+    let tokenizer = ctx.tokenizer;
 
     // Build a synthetic prompt of the requested length.
     // Use the tokenizer's BOS token id if available, otherwise token id 1.
