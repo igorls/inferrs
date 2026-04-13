@@ -22,6 +22,10 @@ use inferrs_models::kv_cache::{BlockTable, PagedKvStore};
 use quantized_linear::QGgufVarBuilder;
 use std::sync::Mutex;
 
+/// Draft token id paired with its normalised probability vector (one entry per
+/// vocab position).  Returned by [`CausalLM::mtp_draft`].
+pub type MtpDraftTokens = Vec<(u32, Vec<f32>)>;
+
 // ---------------------------------------------------------------------------
 // Lazy encoder wrappers
 //
@@ -165,6 +169,23 @@ pub trait CausalLM: Send {
     /// Returns logits for the last token position: shape (batch_size, 1, vocab_size).
     fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor>;
 
+    /// Like `forward`, but also returns the final hidden state for speculative
+    /// decoding draft models (e.g. Qwen3.5 MTP).
+    ///
+    /// Returns `(logits, Some(hidden))` where `hidden` has shape
+    /// `[batch, hidden_size]` (last-token hidden state, squeezed).
+    ///
+    /// The default implementation calls `forward` and returns `None` for the
+    /// hidden state, so models that don't need MTP don't have to change.
+    fn forward_with_hidden(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let logits = self.forward(input_ids, seqlen_offset)?;
+        Ok((logits, None))
+    }
+
     /// Hint: the next `forward()` call will be a single-token decode step for
     /// this `token_id`.  Models that cache per-token state (e.g. PLI embeddings)
     /// can use this to pre-populate the cache without a GPU→CPU device transfer.
@@ -204,6 +225,40 @@ pub trait CausalLM: Send {
 
     /// Clear all KV caches (for starting a new sequence).
     fn clear_kv_cache(&mut self);
+
+    /// Run MTP draft steps starting from `anchor_token` (the token just sampled
+    /// from the main model) using `hidden` (the main model's last-layer hidden
+    /// state for that step).
+    ///
+    /// Returns `Some(Ok(vec))` where each entry is `(draft_token_id, raw_logits)`
+    /// for each of the `num_draft` draft positions.  The raw logits are f32 and
+    /// correspond to the full vocabulary.
+    ///
+    /// Returns `None` if MTP is not available for this model.
+    ///
+    /// `seqlen_offset` is the position of `anchor_token` + 1 (i.e. the offset
+    /// to use for the FIRST draft step in the MTP block's own KV cache).
+    fn mtp_draft(
+        &mut self,
+        _hidden: &Tensor,
+        _anchor_token: u32,
+        _num_draft: usize,
+        _seqlen_offset: usize, // MTP block's own KV offset, not the main model's
+    ) -> Option<Result<MtpDraftTokens>> {
+        None
+    }
+
+    /// Forward pass returning logits for **all** token positions: `[b, t, vocab]`.
+    ///
+    /// Used by the MTP batched verification step.  Returns `None` if the model
+    /// does not support this (fallback to sequential verification or no MTP).
+    fn forward_full_logits(
+        &mut self,
+        _input_ids: &Tensor,
+        _seqlen_offset: usize,
+    ) -> Option<Result<Tensor>> {
+        None
+    }
 
     // ── Audio ────────────────────────────────────────────────────────────────
 
@@ -476,6 +531,87 @@ struct Qwen35ModelWrapper {
 impl CausalLM for Qwen35ModelWrapper {
     fn forward(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
         self.inner.forward(input_ids, seqlen_offset)
+    }
+
+    fn forward_with_hidden(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        if self.inner.mtp.is_some() {
+            let (logits, hidden) = self
+                .inner
+                .forward_returning_hidden(input_ids, seqlen_offset)?;
+            Ok((logits, Some(hidden)))
+        } else {
+            let logits = self.inner.forward(input_ids, seqlen_offset)?;
+            Ok((logits, None))
+        }
+    }
+
+    fn mtp_draft(
+        &mut self,
+        hidden: &Tensor,
+        anchor_token: u32,
+        num_draft: usize,
+        _seqlen_offset: usize, // MTP block clears its cache and uses i=0,1,… as offset
+    ) -> Option<Result<MtpDraftTokens>> {
+        let mtp = self.inner.mtp.as_mut()?;
+        // Clear MTP KV cache so each draft session starts from a clean state.
+        // The main model's hidden already encodes the full history.
+        mtp.clear_kv_cache();
+
+        let mut results = Vec::with_capacity(num_draft);
+        let mut cur_hidden = hidden.clone();
+        let mut cur_token = anchor_token;
+        let embed_weight = self.inner.embed_tokens.embeddings().clone();
+
+        for i in 0..num_draft {
+            let embed = match qwen3_5::MtpModule::embed_token(&embed_weight, cur_token) {
+                Ok(e) => e,
+                Err(e) => return Some(Err(e)),
+            };
+            let (draft_logits, draft_hidden) = match mtp.draft_step(&cur_hidden, &embed, i) {
+                Ok(r) => r,
+                Err(e) => return Some(Err(e)),
+            };
+            // draft_logits: [1, 1, vocab] → squeeze to [vocab]
+            let flat = match draft_logits.squeeze(0).and_then(|t| t.squeeze(0)) {
+                Ok(t) => t,
+                Err(e) => return Some(Err(e.into())),
+            };
+            let logits_vec: Vec<f32> = match flat
+                .to_dtype(candle_core::DType::F32)
+                .and_then(|t| t.to_vec1())
+            {
+                Ok(v) => v,
+                Err(e) => return Some(Err(e.into())),
+            };
+            // Greedy sample from draft logits (maximises acceptance probability).
+            let draft_token = logits_vec
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0);
+
+            // Build one-hot q so speculative_verify uses the correct acceptance
+            // ratio: p(x)/q(x) = p(x)/1 for the greedy token (Chen et al. §3).
+            let mut one_hot = vec![0.0f32; logits_vec.len()];
+            one_hot[draft_token as usize] = 1.0;
+            results.push((draft_token, one_hot));
+            cur_hidden = draft_hidden;
+            cur_token = draft_token;
+        }
+        Some(Ok(results))
+    }
+
+    fn forward_full_logits(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+    ) -> Option<Result<Tensor>> {
+        Some(self.inner.forward_full(input_ids, seqlen_offset))
     }
 
     fn forward_paged(

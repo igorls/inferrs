@@ -370,6 +370,146 @@ fn rand_f32(seed: Option<u64>, step: u64) -> f32 {
     u as f32 / (u32::MAX as f32 + 1.0)
 }
 
+// ── Speculative decoding (rejection sampling) ─────────────────────────────────
+
+/// Outcome of one speculative verification step.
+#[derive(Debug)]
+pub enum SpecVerdict {
+    /// Draft token accepted (the original draft token id was used).
+    Accept,
+    /// Draft token rejected.  Contains the replacement token id resampled from
+    /// the adjusted distribution `p' = norm(max(0, p - q))` (Chen et al. 2302.01318).
+    Reject(u32),
+}
+
+/// Verify one draft token against the target model's distribution.
+///
+/// Algorithm 1 from Chen et al. "Accelerating Large Language Model Decoding
+/// with Speculative Sampling" (https://arxiv.org/abs/2302.01318):
+///
+/// Given draft token `x` sampled from q(·|ctx):
+///   r ~ Uniform(0,1)
+///   if r < p(x)/q(x):  accept x
+///   else:               resample from p'(v) = norm(max(0, p(v) - q(v)))
+///
+/// `target_logits`: raw logits from the *main* model for this position,
+///                  shape `(vocab_size,)` as f32.
+/// `draft_probs`:   **normalised** probability vector for the draft position
+///                  (not raw logits). For greedy drafts pass a one-hot vector
+///                  `{draft_token: 1.0}` so q(draft_token) = 1 and the ratio
+///                  p/q = p(draft_token), giving the correct acceptance
+///                  criterion and adjusted distribution per Chen et al.
+/// `draft_token`:   the token id the draft model sampled.
+/// `seed` + `step`: forwarded to `rand_f32` for reproducible sampling.
+///
+/// `temperature`: user sampling temperature, applied to `target_logits` before
+///                softmax so that `p` matches the actual target distribution.
+///                Pass `1.0` for unscaled softmax.  Values ≤ 0 are treated as
+///                greedy (p becomes a one-hot on the argmax).
+///
+/// Returns the verdict and a softmax-probability vector for `target_logits`
+/// (so the caller can reuse it for subsequent steps without recomputing).
+pub fn speculative_verify(
+    target_logits: &[f32],
+    draft_probs: &[f32],
+    draft_token: u32,
+    temperature: f64,
+    seed: Option<u64>,
+    step: u64,
+) -> Result<(SpecVerdict, Vec<f32>)> {
+    let vocab = target_logits.len();
+    anyhow::ensure!(
+        draft_probs.len() == vocab,
+        "speculative_verify: target vocab {} != draft vocab {}",
+        vocab,
+        draft_probs.len()
+    );
+
+    // Apply temperature scaling so p matches the distribution sample_token uses.
+    let p = if temperature <= 0.0 {
+        // Greedy: one-hot on argmax.
+        let best = target_logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        let mut v = vec![0.0f32; vocab];
+        v[best] = 1.0;
+        v
+    } else if (temperature - 1.0).abs() < 1e-6 {
+        softmax_vec(target_logits)
+    } else {
+        let inv_t = (1.0 / temperature) as f32;
+        let scaled: Vec<f32> = target_logits.iter().map(|&l| l * inv_t).collect();
+        softmax_vec(&scaled)
+    };
+    let q = draft_probs; // already normalised — caller's responsibility
+
+    let x = draft_token as usize;
+    let px = p.get(x).copied().unwrap_or(0.0);
+    let qx = q.get(x).copied().unwrap_or(f32::MIN_POSITIVE);
+
+    let r = rand_f32(seed, step);
+    if r < px / qx {
+        return Ok((SpecVerdict::Accept, p));
+    }
+
+    // Rejection: resample from p' = norm(max(0, p(v) - q(v)))
+    let mut adjusted: Vec<f32> = p
+        .iter()
+        .zip(q.iter())
+        .map(|(&pv, &qv)| (pv - qv).max(0.0))
+        .collect();
+    let sum: f32 = adjusted.iter().sum();
+    if sum > 0.0 {
+        for v in &mut adjusted {
+            *v /= sum;
+        }
+    } else {
+        // Degenerate: fall back to argmax of target.
+        let best = p
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        return Ok((SpecVerdict::Reject(best as u32), p));
+    }
+
+    let replacement = sample_from_probs(&adjusted, seed, step + 1);
+    Ok((SpecVerdict::Reject(replacement), p))
+}
+
+/// Sample a token id from a normalised probability vector.
+pub fn sample_from_probs(probs: &[f32], seed: Option<u64>, step: u64) -> u32 {
+    let mut r = rand_f32(seed, step);
+    let mut last = 0usize;
+    for (i, &p) in probs.iter().enumerate() {
+        if p > 0.0 {
+            last = i;
+            if r < p {
+                return i as u32;
+            }
+            r -= p;
+        }
+    }
+    last as u32
+}
+
+/// Compute softmax of a raw logits slice, returning a probability vector.
+pub fn softmax_vec(logits: &[f32]) -> Vec<f32> {
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let mut probs: Vec<f32> = logits.iter().map(|&v| (v - max).exp()).collect();
+    let sum: f32 = probs.iter().sum();
+    if sum > 0.0 {
+        for v in &mut probs {
+            *v /= sum;
+        }
+    }
+    probs
+}
+
 /// Advance and return the thread-local xorshift64* state.
 fn rand_state_thread_local() -> u64 {
     use std::time::SystemTime;

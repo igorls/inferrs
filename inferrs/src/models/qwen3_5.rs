@@ -63,6 +63,8 @@ pub struct Qwen35Config {
     pub dtype: DType,
     pub device: Device,
     pub turbo_quant_bits: Option<u8>,
+    /// Number of MTP transformer blocks embedded in the model weights (0 = none).
+    pub mtp_num_hidden_layers: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -822,12 +824,15 @@ impl DecoderLayer {
 // ---------------------------------------------------------------------------
 
 pub struct Qwen35Model {
-    embed_tokens: Embedding,
+    pub embed_tokens: Embedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     lm_head: QLinear,
     cos: Tensor,
     sin: Tensor,
+    /// Optional MTP draft module. Present when the model was trained with MTP
+    /// (`mtp_num_hidden_layers > 0` in config) and the weights are available.
+    pub mtp: Option<MtpModule>,
 }
 
 impl Qwen35Model {
@@ -947,6 +952,31 @@ impl Qwen35Model {
             &cfg.device,
         )?;
 
+        // Build optional MTP draft module.
+        let mtp = if cfg.mtp_num_hidden_layers > 0 {
+            match MtpModule::new(
+                cfg,
+                embed_tokens.embeddings().clone(),
+                lm_head.clone(),
+                lm_vb.clone(),
+                lm_qvb.as_ref(),
+            ) {
+                Ok(m) => {
+                    tracing::info!(
+                        "MTP draft module loaded ({} block(s))",
+                        cfg.mtp_num_hidden_layers
+                    );
+                    Some(m)
+                }
+                Err(e) => {
+                    tracing::warn!("MTP weights not found or failed to load ({e}); speculative decoding disabled");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             embed_tokens,
             layers,
@@ -954,6 +984,7 @@ impl Qwen35Model {
             lm_head,
             cos,
             sin,
+            mtp,
         })
     }
 
@@ -1029,5 +1060,187 @@ impl Qwen35Model {
         for layer in &mut self.layers {
             layer.clear_cache();
         }
+        if let Some(m) = &mut self.mtp {
+            m.clear_kv_cache();
+        }
+    }
+
+    /// Forward pass returning logits for **all** positions: `[b, t, vocab]`.
+    ///
+    /// Used by the MTP batched verification step which runs the main model over
+    /// [x1, d1] and needs per-position logits to verify each draft token.
+    pub fn forward_full(&mut self, input_ids: &Tensor, seqlen_offset: usize) -> Result<Tensor> {
+        let mut x = self.embed_tokens.forward(input_ids)?;
+        for layer in self.layers.iter_mut() {
+            x = layer.forward(&x, seqlen_offset, &self.cos, &self.sin)?;
+        }
+        x = self.norm.forward(&x)?;
+        x.apply(&self.lm_head).map_err(Into::into) // [b, t, vocab]
+    }
+
+    /// Forward pass that also returns the last-token hidden state (pre-lm_head,
+    /// post final RMSNorm).  Used by the MTP draft module.
+    ///
+    /// Returns `(logits [b, 1, vocab], hidden [b, hidden_size])`.
+    pub fn forward_returning_hidden(
+        &mut self,
+        input_ids: &Tensor,
+        seqlen_offset: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let mut x = self.embed_tokens.forward(input_ids)?;
+        for layer in self.layers.iter_mut() {
+            x = layer.forward(&x, seqlen_offset, &self.cos, &self.sin)?;
+        }
+        let (_b, t, _h) = x.dims3()?;
+        // Extract pre-norm hidden for MTP (hnorm is applied inside draft_step).
+        let last_raw = x.narrow(1, t - 1, 1)?.squeeze(1)?.contiguous()?; // [b, hidden]
+        let last_normed = self.norm.forward(&last_raw)?;
+        let logits = last_normed.apply(&self.lm_head)?.unsqueeze(1)?;
+        Ok((logits, last_raw))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MTP draft module (Multi-Token Prediction)
+//
+// Architecture (per DeepSeek-V3 §2.1 and llama.cpp PR #20700):
+//   input: hidden_state h [b, hidden_size] from the main model's last layer,
+//          plus the token id of the previously accepted draft token.
+//
+//   1. enorm(h) and hnorm(embed(token)) — independent RMSNorms
+//   2. concat([hnorm_out, enorm_out], dim=-1) then eh_proj → [b, hidden_size]
+//   3. standard decoder block (full-attention + MLP + layernorms)
+//   4. lm_head (tied to main model's embed_tokens) → logits [b, vocab]
+// ---------------------------------------------------------------------------
+
+pub struct MtpModule {
+    /// RMSNorm applied to the main model's hidden state before concat.
+    hnorm: RmsNorm,
+    /// RMSNorm applied to the draft token's embedding before concat.
+    enorm: RmsNorm,
+    /// Linear(hidden_size * 2 → hidden_size) — fuses hidden + embed.
+    eh_proj: QLinear,
+    /// One standard decoder block (full-attention only — no SSM in MTP).
+    block: DecoderLayer,
+    /// Final RMSNorm shared with the main model (model.language_model.norm),
+    /// applied to the MTP block output before lm_head.
+    norm: RmsNorm,
+    /// Shared lm_head (tied to main model's embed_tokens).
+    lm_head: QLinear,
+    cos: Tensor,
+    sin: Tensor,
+}
+
+impl MtpModule {
+    pub fn new(
+        cfg: &Qwen35Config,
+        embed_tokens_weight: Tensor,
+        lm_head: QLinear,
+        vb: VarBuilder,
+        qvb: Option<&QGgufVarBuilder>,
+    ) -> Result<Self> {
+        let mtp_vb = vb.pp("mtp").pp("0");
+        let mtp_qvb = qvb.map(|q| q.pp("mtp").pp("0"));
+
+        let hnorm =
+            rms_norm_with_offset(cfg.hidden_size, cfg.rms_norm_eps, mtp_vb.pp("hnorm"), 1.0)?;
+        let enorm =
+            rms_norm_with_offset(cfg.hidden_size, cfg.rms_norm_eps, mtp_vb.pp("enorm"), 1.0)?;
+
+        let eh_proj = qlinear_b(
+            cfg.hidden_size * 2,
+            cfg.hidden_size,
+            false,
+            mtp_vb.pp("eh_proj"),
+            mtp_qvb.as_ref().map(|q| q.pp("eh_proj")).as_ref(),
+        )?;
+
+        // The MTP block is always a full-attention layer.
+        let block = DecoderLayer::new(
+            cfg,
+            mtp_vb.clone(),
+            mtp_qvb.as_ref(),
+            true, // is_full_attention
+            None, // no TurboQuant for MTP block
+        )?;
+
+        let _ = embed_tokens_weight; // weight is already in lm_head
+
+        // Shared final norm from the main model trunk (model.language_model.norm).
+        // Applied after the MTP block, before lm_head — same role as in forward().
+        let norm = rms_norm_with_offset(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"), 1.0)?;
+
+        let (cos, sin) = precompute_rope(
+            cfg.head_dim,
+            cfg.partial_rotary_factor,
+            cfg.rope_theta,
+            32768,
+            cfg.dtype,
+            &cfg.device,
+        )?;
+
+        Ok(Self {
+            hnorm,
+            enorm,
+            eh_proj,
+            block,
+            norm,
+            lm_head,
+            cos,
+            sin,
+        })
+    }
+
+    /// Run one draft step.
+    ///
+    /// `hidden`     — last-token hidden state from the main model: [1, hidden_size]
+    /// `embed_fn`   — closure to embed a token id: u32 → [1, hidden_size]
+    /// `draft_token_id` — previously committed or main-model sampled token id
+    /// `seqlen_offset`  — KV cache offset (same as used by main model for this step)
+    ///
+    /// Returns `(draft_logits [1, 1, vocab], new_hidden [1, hidden_size])`.
+    /// The new_hidden can be fed back for a second draft step.
+    pub fn draft_step(
+        &mut self,
+        hidden: &Tensor,            // [1, hidden_size]
+        draft_token_embed: &Tensor, // [1, hidden_size]
+        seqlen_offset: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        // 1. Normalise independently then concatenate.
+        let h_normed = self.hnorm.forward(hidden)?; // [1, hidden_size]
+        let e_normed = self.enorm.forward(draft_token_embed)?; // [1, hidden_size]
+        let cat = Tensor::cat(&[&h_normed, &e_normed], 1)?; // [1, hidden_size * 2]
+
+        // 2. Project to hidden_size and add residual from hidden.
+        let fused = self.eh_proj.forward(&cat)?; // [1, hidden_size]
+                                                 // Add residual: helps gradient flow (observed in llama.cpp impl).
+        let fused = (fused + hidden)?; // [1, hidden_size]
+
+        // 3. Unsqueeze to [b=1, t=1, hidden] for the decoder block.
+        let x = fused.unsqueeze(1)?; // [1, 1, hidden_size]
+        let x = self
+            .block
+            .forward(&x, seqlen_offset, &self.cos, &self.sin)?;
+
+        // 4. Squeeze back to [1, hidden_size], apply final norm, then lm_head.
+        let out_hidden = x.squeeze(1)?.contiguous()?; // [1, hidden_size] pre-norm
+        let out_normed = self.norm.forward(&out_hidden)?;
+        let logits = out_normed.apply(&self.lm_head)?.unsqueeze(1)?; // [1, 1, vocab]
+
+        // Return pre-norm hidden for chaining (next draft step's hnorm input).
+        Ok((logits, out_hidden))
+    }
+
+    /// Embed a single token id using the provided embedding table.
+    /// `embed_weight`: [vocab_size, hidden_size]
+    #[allow(dead_code)]
+    pub fn embed_token(embed_weight: &Tensor, token_id: u32) -> Result<Tensor> {
+        // Gather row `token_id` from the embedding table.
+        let idx = Tensor::new(&[token_id], embed_weight.device())?;
+        embed_weight.index_select(&idx, 0).map_err(Into::into) // [1, hidden_size]
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        self.block.clear_cache();
     }
 }

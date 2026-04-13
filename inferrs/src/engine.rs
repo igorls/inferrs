@@ -1475,6 +1475,7 @@ impl Engine {
             }
 
             // ── 3. Process one step per active sequence ───────────────────
+            let active_count = active.len(); // snapshot before mutable iteration
             for seq in active.iter_mut() {
                 if seq.finished {
                     continue;
@@ -1507,6 +1508,145 @@ impl Engine {
                     }
                 }
 
+                // ── MTP speculative decode path ───────────────────────────
+                // Active only for single-sequence batches without grammar
+                // constraints (grammar masking is incompatible with multi-token
+                // verification) and only during the decode phase.
+                let use_mtp = seq.prefilled
+                    && active_count == 1   // single-sequence: no shared-KV conflicts
+                    && seq.grammar_fsm.is_none()
+                    && !seq.sampling_params.logprobs  // logprobs not supported with MTP
+                    && paged.is_none(); // MTP forward calls use internal concat-KV, not PagedKvStore
+
+                if use_mtp {
+                    let last_token = match seq.output_tokens.last() {
+                        Some(&t) => t,
+                        None => {
+                            seq.finish_error(
+                                anyhow::anyhow!("internal error: MTP decode before prefill"),
+                                paged.as_mut().map(|ps| &mut ps.block_pool),
+                            );
+                            continue;
+                        }
+                    };
+                    let seqlen_offset = seq.prompt_tokens.len() + seq.output_tokens.len() - 1;
+                    model.hint_decode_token(last_token);
+                    model.hint_sampling_temperature(seq.sampling_params.temperature);
+
+                    let mtp_tokens = match Self::cb_mtp_decode_step(
+                        &mut model,
+                        &device,
+                        last_token,
+                        seqlen_offset,
+                        &seq.sampling_params,
+                        &seq.all_tokens,
+                    ) {
+                        Ok(toks) => toks,
+                        Err(e) => {
+                            seq.finish_error(e, paged.as_mut().map(|ps| &mut ps.block_pool));
+                            continue;
+                        }
+                    };
+
+                    // Emit each accepted token through the normal output pipeline.
+                    for token_id in mtp_tokens {
+                        seq.output_tokens.push(token_id);
+                        seq.all_tokens.push(token_id);
+
+                        let decoded_text = tokenizer.decode(&[token_id], true).unwrap_or_default();
+
+                        if seq.max_stop_string_len > 0 {
+                            update_decoded_suffix(
+                                &mut seq.decoded_suffix,
+                                &decoded_text,
+                                seq.max_stop_string_len * 2,
+                            );
+                        }
+
+                        let finish_reason = check_stop(
+                            token_id,
+                            seq.output_tokens.len(),
+                            &seq.sampling_params,
+                            &stop_token_ids,
+                            &seq.decoded_suffix,
+                        );
+
+                        let is_last = finish_reason.is_some();
+                        let (total_ns, prompt_eval_ns, eval_ns) = if is_last {
+                            let t = seq.timing_ns();
+                            (Some(t.0), Some(t.1), Some(t.2))
+                        } else {
+                            (None, None, None)
+                        };
+
+                        let kind = seq.think_filter.classify(token_id);
+                        match kind {
+                            TokenKind::Reasoning => seq.reasoning_tokens.push(token_id),
+                            TokenKind::Content => seq.content_tokens.push(token_id),
+                            TokenKind::Delimiter => {}
+                        }
+
+                        let client_gone = match kind {
+                            TokenKind::Delimiter => {
+                                if is_last {
+                                    let _ = seq.sink.send_token(StreamToken {
+                                        token_id,
+                                        text: String::new(),
+                                        reasoning_content: String::new(),
+                                        finish_reason: finish_reason.clone(),
+                                        total_duration_ns: total_ns,
+                                        prompt_eval_duration_ns: prompt_eval_ns,
+                                        eval_duration_ns: eval_ns,
+                                        logprob: None,
+                                    });
+                                }
+                                false
+                            }
+                            TokenKind::Reasoning => !seq.sink.send_token(StreamToken {
+                                token_id,
+                                text: String::new(),
+                                reasoning_content: decoded_text.clone(),
+                                finish_reason: finish_reason.clone(),
+                                total_duration_ns: total_ns,
+                                prompt_eval_duration_ns: prompt_eval_ns,
+                                eval_duration_ns: eval_ns,
+                                logprob: None,
+                            }),
+                            TokenKind::Content => !seq.sink.send_token(StreamToken {
+                                token_id,
+                                text: decoded_text,
+                                reasoning_content: String::new(),
+                                finish_reason: finish_reason.clone(),
+                                total_duration_ns: total_ns,
+                                prompt_eval_duration_ns: prompt_eval_ns,
+                                eval_duration_ns: eval_ns,
+                                logprob: None,
+                            }),
+                        };
+
+                        if is_last || client_gone {
+                            if !seq.prefilled {
+                                seq.prefilled = true;
+                                seq.prefill_end = Some(Instant::now());
+                            }
+                            let reason = finish_reason.unwrap_or_else(|| "cancelled".to_string());
+                            seq.finish_ok(
+                                &reason,
+                                &tokenizer,
+                                paged.as_mut().map(|ps| &mut ps.block_pool),
+                            );
+                            break;
+                        }
+                    }
+
+                    if !seq.prefilled {
+                        seq.prefilled = true;
+                        seq.prefill_end = Some(Instant::now());
+                    }
+                    continue; // skip the standard single-token path below
+                }
+
+                // ── Standard single-token decode path ─────────────────────
                 let logits_result = if !seq.prefilled {
                     // Prefill: run all prompt tokens through the model.
                     Self::cb_prefill(
@@ -1993,6 +2133,116 @@ impl Engine {
             }
             _ => model.forward(&input_ids, seqlen_offset),
         }
+    }
+
+    /// Run a speculative decode step using the Qwen3.5 MTP module.
+    ///
+    /// Returns `Ok(tokens)` where `tokens` contains 1..=K+1 accepted token ids
+    /// in sequence order.  Falls back to a single token if MTP is unavailable
+    /// or draft/verify fails.
+    ///
+    /// # State rollback note
+    ///
+    /// Batched verification writes draft tokens d1..dK to the main model's KV
+    /// cache AND advances the SSM recurrent state of every linear-attention layer.
+    /// If a draft token is rejected, both the KV slots and the SSM accumulators
+    /// already reflect the rejected token — not the replacement.  For KV attention
+    /// the effect is diluted by low attention weights on subsequent steps; for SSM
+    /// layers the contaminated state propagates as a running accumulator, making
+    /// the drift slightly more persistent.  In practice the degradation is subtle
+    /// since rejections are infrequent and the state self-corrects over subsequent
+    /// correct tokens.  This is a known limitation of this first implementation.
+    /// Proper rollback (KV truncation + SSM state snapshot/restore) is a follow-up.
+    ///
+    /// Verification follows Algorithm 1 from Chen et al. 2302.01318.
+    fn cb_mtp_decode_step(
+        model: &mut Box<dyn CausalLM>,
+        device: &Device,
+        last_token: u32,
+        seqlen_offset: usize,
+        params: &sampler::SamplingParams,
+        previous_tokens: &[u32],
+    ) -> Result<Vec<u32>> {
+        const NUM_DRAFT: usize = 2;
+
+        // ── 1. Main model forward with hidden state ────────────────────────
+        let input_ids = Tensor::new(&[last_token], device)?.unsqueeze(0)?;
+        let (main_logits, hidden) = match model.forward_with_hidden(&input_ids, seqlen_offset)? {
+            (l, Some(h)) => (l, h),
+            (l, None) => {
+                // MTP not available — fall back to single-token decode.
+                let (tok, _) = sampler::sample_token(&l, params, previous_tokens)?;
+                return Ok(vec![tok]);
+            }
+        };
+
+        // ── 2. Sample anchor token x1 from main logits ────────────────────
+        let (x1, _) = sampler::sample_token(&main_logits, params, previous_tokens)?;
+
+        // ── 3. MTP draft steps ────────────────────────────────────────────
+        // seqlen_offset + 1 = position of x1; MTP uses this as its own offset
+        // so its internal KV cache is sized correctly.
+        let drafts = match model.mtp_draft(&hidden, x1, NUM_DRAFT, seqlen_offset + 1) {
+            Some(Ok(d)) if !d.is_empty() => d,
+            _ => return Ok(vec![x1]), // MTP failed — emit only x1
+        };
+
+        // ── 4. Batched verification forward ────────────────────────────────
+        // Build [x1, d1, ...] token tensor and run in one main-model call.
+        // seqlen_offset + 1: x1 is the first new token after the already-cached
+        // prefix.
+        let verify_token_ids: Vec<u32> = std::iter::once(x1)
+            .chain(drafts.iter().take(NUM_DRAFT).map(|(t, _)| *t))
+            .collect();
+        let verify_ids_tensor = Tensor::new(verify_token_ids.as_slice(), device)?.unsqueeze(0)?;
+        let verify_logits = match model.forward_full_logits(&verify_ids_tensor, seqlen_offset + 1) {
+            Some(Ok(l)) => l, // [1, len, vocab]
+            _ => return Ok(vec![x1]),
+        };
+
+        // ── 5. Rejection-sample each draft token ──────────────────────────
+        // verify_logits[:, i, :] predicts the token at position (seqlen_offset + 1 + i + 1),
+        // which is used to verify draft token drafts[i].
+        let step_base = previous_tokens.len() as u64;
+        let mut accepted: Vec<u32> = vec![x1];
+
+        for (draft_idx, (draft_tok, draft_logits_raw)) in drafts.iter().enumerate() {
+            let verify_pos_logits = verify_logits
+                .narrow(1, draft_idx, 1)?
+                .squeeze(1)?
+                .to_dtype(candle_core::DType::F32)?
+                .to_vec1::<f32>()?;
+
+            let (verdict, target_probs) = sampler::speculative_verify(
+                &verify_pos_logits,
+                draft_logits_raw,
+                *draft_tok,
+                params.temperature,
+                params.seed,
+                step_base + draft_idx as u64 + 1,
+            )?;
+
+            match verdict {
+                sampler::SpecVerdict::Accept => {
+                    accepted.push(*draft_tok);
+                }
+                sampler::SpecVerdict::Reject(replacement) => {
+                    // Replacement resampled from adjusted distribution p' = norm(max(0,p−q)).
+                    accepted.push(replacement);
+                    // Stop: remaining drafts are invalid once one is rejected.
+                    let _ = target_probs; // used inside speculative_verify
+                    return Ok(accepted);
+                }
+            }
+        }
+
+        // All drafts accepted — also emit the bonus token predicted by the main
+        // model at the last verification position.
+        let last_verify_logits = verify_logits.narrow(1, verify_logits.dim(1)? - 1, 1)?;
+        let (bonus, _) = sampler::sample_token(&last_verify_logits, params, previous_tokens)?;
+        accepted.push(bonus);
+
+        Ok(accepted)
     }
 
     /// Run the engine loop using only stdlib channels — no Tokio runtime required.

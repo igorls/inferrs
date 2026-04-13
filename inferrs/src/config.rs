@@ -237,6 +237,9 @@ pub struct TextConfig {
     #[serde(default)]
     pub rope_parameters: RopeParameters,
 
+    // Qwen3.5 MTP fields
+    pub mtp_num_hidden_layers: Option<usize>,
+
     // Gemma4-specific text_config fields
     pub global_head_dim: Option<usize>,
     pub sliding_window: Option<usize>,
@@ -679,6 +682,7 @@ impl RawConfig {
             dtype,
             device,
             turbo_quant_bits,
+            mtp_num_hidden_layers: tc.and_then(|t| t.mtp_num_hidden_layers).unwrap_or(0),
         }
     }
 
