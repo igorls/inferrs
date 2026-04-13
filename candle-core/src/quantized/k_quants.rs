@@ -1452,63 +1452,65 @@ impl GgmlType for BlockQ4K {
     }
 
     fn from_float(xs: &[f32], ys: &mut [Self]) {
-        for (block, x) in group_for_quantization(xs, ys) {
-            let mut mins: [f32; QK_K / 32] = [0.0; QK_K / 32];
-            let mut scales: [f32; QK_K / 32] = [0.0; QK_K / 32];
+        group_for_quantization(xs, ys)
+            .into_par_iter()
+            .for_each(|(block, x)| {
+                let mut mins: [f32; QK_K / 32] = [0.0; QK_K / 32];
+                let mut scales: [f32; QK_K / 32] = [0.0; QK_K / 32];
 
-            for (j, x_scale_slice) in x.chunks_exact(32).enumerate() {
-                (scales[j], mins[j]) = make_qkx1_quants(15, 5, x_scale_slice);
-            }
-
-            // get max scale and max min and ensure they are >= 0.0
-            let max_scale = scales.iter().fold(0.0, |max, &val| val.max(max));
-            let max_min = mins.iter().fold(0.0, |max, &val| val.max(max));
-
-            let inv_scale = if max_scale > 0.0 {
-                63.0 / max_scale
-            } else {
-                0.0
-            };
-            let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
-
-            for j in 0..QK_K / 32 {
-                let ls = nearest_int(inv_scale * scales[j]).min(63) as u8;
-                let lm = nearest_int(inv_min * mins[j]).min(63) as u8;
-                if j < 4 {
-                    block.scales[j] = ls;
-                    block.scales[j + 4] = lm;
-                } else {
-                    block.scales[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
-                    block.scales[j - 4] |= (ls >> 4) << 6;
-                    block.scales[j] |= (lm >> 4) << 6;
+                for (j, x_scale_slice) in x.chunks_exact(32).enumerate() {
+                    (scales[j], mins[j]) = make_qkx1_quants(15, 5, x_scale_slice);
                 }
-            }
 
-            block.d = f16::from_f32(max_scale / 63.0);
-            block.dmin = f16::from_f32(max_min / 63.0);
+                // get max scale and max min and ensure they are >= 0.0
+                let max_scale = scales.iter().fold(0.0, |max, &val| val.max(max));
+                let max_min = mins.iter().fold(0.0, |max, &val| val.max(max));
 
-            let mut l: [u8; QK_K] = [0; QK_K];
+                let inv_scale = if max_scale > 0.0 {
+                    63.0 / max_scale
+                } else {
+                    0.0
+                };
+                let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
 
-            for j in 0..QK_K / 32 {
-                let (sc, m) = get_scale_min_k4(j, &block.scales);
-                let d = block.d.to_f32() * sc as f32;
-                if d != 0.0 {
-                    let dm = block.dmin.to_f32() * m as f32;
-                    for ii in 0..32 {
-                        let l_val = nearest_int((x[32 * j + ii] + dm) / d);
-                        l[32 * j + ii] = l_val.clamp(0, 15) as u8;
+                for j in 0..QK_K / 32 {
+                    let ls = nearest_int(inv_scale * scales[j]).min(63) as u8;
+                    let lm = nearest_int(inv_min * mins[j]).min(63) as u8;
+                    if j < 4 {
+                        block.scales[j] = ls;
+                        block.scales[j + 4] = lm;
+                    } else {
+                        block.scales[j + 4] = (ls & 0xF) | ((lm & 0xF) << 4);
+                        block.scales[j - 4] |= (ls >> 4) << 6;
+                        block.scales[j] |= (lm >> 4) << 6;
                     }
                 }
-            }
 
-            let q = &mut block.qs;
-            for j in (0..QK_K).step_by(64) {
-                for l_val in 0..32 {
-                    let offset_index = (j / 64) * 32 + l_val;
-                    q[offset_index] = l[j + l_val] | (l[j + l_val + 32] << 4);
+                block.d = f16::from_f32(max_scale / 63.0);
+                block.dmin = f16::from_f32(max_min / 63.0);
+
+                let mut l: [u8; QK_K] = [0; QK_K];
+
+                for j in 0..QK_K / 32 {
+                    let (sc, m) = get_scale_min_k4(j, &block.scales);
+                    let d = block.d.to_f32() * sc as f32;
+                    if d != 0.0 {
+                        let dm = block.dmin.to_f32() * m as f32;
+                        for ii in 0..32 {
+                            let l_val = nearest_int((x[32 * j + ii] + dm) / d);
+                            l[32 * j + ii] = l_val.clamp(0, 15) as u8;
+                        }
+                    }
                 }
-            }
-        }
+
+                let q = &mut block.qs;
+                for j in (0..QK_K).step_by(64) {
+                    for l_val in 0..32 {
+                        let offset_index = (j / 64) * 32 + l_val;
+                        q[offset_index] = l[j + l_val] | (l[j + l_val + 32] << 4);
+                    }
+                }
+            });
     }
 
     fn from_float_imatrix(xs: &[f32], ys: &mut [Self], imatrix_weights: &[f32], n_per_row: usize) {
