@@ -335,21 +335,26 @@ impl FullAttention {
 // Tensor layout from weights:
 //   in_proj_qkv:  [key_dim*2 + value_dim, hidden]  -- projects q+k in key space, v in value space
 //   in_proj_z:    [value_dim, hidden]               -- gate for output RMSNorm
-//   in_proj_a:    [n_heads, hidden]                 -- per-head decay input
-//   in_proj_b:    [n_heads, hidden]                 -- per-head beta (write strength)
+//   in_proj_a:    [n_value_heads, hidden]           -- per-value-head decay input
+//   in_proj_b:    [n_value_heads, hidden]           -- per-value-head beta (write strength)
 //   conv1d:       [key_dim*2+value_dim, 1, kernel]  -- depthwise causal conv on qkv
-//   A_log:        [n_heads]                         -- log(A), stored as F32
-//   dt_bias:      [n_heads]                         -- bias for decay gate, F32
+//   A_log:        [n_value_heads]                   -- log(A), stored as F32
+//   dt_bias:      [n_value_heads]                   -- bias for decay gate, F32
 //   norm:         [head_v_dim]                      -- weight for gated RMSNorm, F32
 //   out_proj:     [hidden, value_dim]
 //
-// dim breakdown for 0.8B:
-//   n_heads     = linear_num_k_heads = linear_num_v_heads = 16
+// GQA-like asymmetric heads (4B model):
+//   n_key_heads   = linear_num_key_heads   = 16
+//   n_value_heads = linear_num_value_heads = 32   (kv_group_ratio = 2)
 //   head_k_dim  = linear_key_head_dim   = 128
 //   head_v_dim  = linear_value_head_dim = 128
-//   key_dim     = n_heads * head_k_dim  = 2048
-//   value_dim   = n_heads * head_v_dim  = 2048
-//   conv_dim    = key_dim*2 + value_dim = 6144
+//   key_dim     = n_key_heads   * head_k_dim = 2048
+//   value_dim   = n_value_heads * head_v_dim = 4096
+//   conv_dim    = key_dim*2 + value_dim      = 8192
+//
+// Symmetric heads (0.8B and 2B, kv_group_ratio = 1):
+//   n_key_heads = n_value_heads = 16
+//   key_dim = value_dim = 2048,  conv_dim = 6144
 //
 // The recurrence (Gated Delta Rule):
 //   g_t  = exp( -A_log.exp() * softplus(a_t + dt_bias) )   [per-head decay]
@@ -375,12 +380,14 @@ struct LinearAttn {
     dt_bias: Tensor,
     norm_weight: Tensor,
     out_proj: QLinear,
-    n_heads: usize,
-    head_k_dim: usize, // = linear_key_head_dim
-    head_v_dim: usize, // = linear_value_head_dim
-    key_dim: usize,    // = n_heads * head_k_dim
-    value_dim: usize,  // = n_heads * head_v_dim
-    // Recurrent state: [b, n_heads, head_k_dim, head_v_dim], F32
+    n_key_heads: usize,
+    n_value_heads: usize,
+    kv_group_ratio: usize, // = n_value_heads / n_key_heads (1 for 0.8B/2B, 2 for 4B)
+    head_k_dim: usize,     // = linear_key_head_dim
+    head_v_dim: usize,     // = linear_value_head_dim
+    key_dim: usize,        // = n_key_heads   * head_k_dim
+    value_dim: usize,      // = n_value_heads * head_v_dim
+    // Recurrent state: [b, n_value_heads, head_k_dim, head_v_dim], F32
     recurrent_state: Option<Tensor>,
     // Conv state: [b, conv_dim, kernel-1], used for causal padding across calls
     conv_state: Option<Tensor>,
@@ -388,11 +395,13 @@ struct LinearAttn {
 
 impl LinearAttn {
     fn new(cfg: &Qwen35Config, vb: VarBuilder, qvb: Option<&QGgufVarBuilder>) -> Result<Self> {
-        let n_heads = cfg.linear_num_value_heads;
+        let n_key_heads = cfg.linear_num_key_heads;
+        let n_value_heads = cfg.linear_num_value_heads;
+        let kv_group_ratio = n_value_heads / n_key_heads;
         let head_k_dim = cfg.linear_key_head_dim;
         let head_v_dim = cfg.linear_value_head_dim;
-        let key_dim = n_heads * head_k_dim;
-        let value_dim = n_heads * head_v_dim;
+        let key_dim = n_key_heads * head_k_dim;
+        let value_dim = n_value_heads * head_v_dim;
         let conv_dim = key_dim * 2 + value_dim;
         let hidden = cfg.hidden_size;
         let kernel = cfg.linear_conv_kernel_dim;
@@ -413,14 +422,14 @@ impl LinearAttn {
         )?;
         let in_proj_a = qlinear_b(
             hidden,
-            n_heads,
+            n_value_heads,
             false,
             vb.pp("in_proj_a"),
             qvb.map(|q| q.pp("in_proj_a")).as_ref(),
         )?;
         let in_proj_b = qlinear_b(
             hidden,
-            n_heads,
+            n_value_heads,
             false,
             vb.pp("in_proj_b"),
             qvb.map(|q| q.pp("in_proj_b")).as_ref(),
@@ -433,9 +442,9 @@ impl LinearAttn {
 
         // A_log, dt_bias, and norm.weight must be kept in F32 for the SSM recurrence.
         let a_log = vb
-            .get_with_hints(n_heads, "A_log", candle_nn::Init::Const(0.0))?
+            .get_with_hints(n_value_heads, "A_log", candle_nn::Init::Const(0.0))?
             .to_dtype(DType::F32)?;
-        let dt_bias = vb.get((n_heads,), "dt_bias")?.to_dtype(DType::F32)?;
+        let dt_bias = vb.get((n_value_heads,), "dt_bias")?.to_dtype(DType::F32)?;
         let norm_weight = vb
             .get_with_hints(head_v_dim, "norm.weight", candle_nn::Init::Const(1.0))?
             .to_dtype(DType::F32)?;
@@ -458,7 +467,9 @@ impl LinearAttn {
             dt_bias,
             norm_weight,
             out_proj,
-            n_heads,
+            n_key_heads,
+            n_value_heads,
+            kv_group_ratio,
             head_k_dim,
             head_v_dim,
             key_dim,
@@ -494,8 +505,8 @@ impl LinearAttn {
         // ── Projections ───────────────────────────────────────────────────────
         let qkv = self.in_proj_qkv.forward(x)?; // [b, t, key_dim*2 + value_dim]
         let z = self.in_proj_z.forward(x)?; // [b, t, value_dim]
-        let a_input = self.in_proj_a.forward(x)?; // [b, t, n_heads]  (decay gate input)
-        let b_input = self.in_proj_b.forward(x)?; // [b, t, n_heads]  (beta input, before sigmoid)
+        let a_input = self.in_proj_a.forward(x)?; // [b, t, n_value_heads]  (decay gate input)
+        let b_input = self.in_proj_b.forward(x)?; // [b, t, n_value_heads]  (beta input, before sigmoid)
 
         // ── Depthwise causal conv1d on qkv, then SiLU ────────────────────────
         let qkv = self.apply_conv1d_silu(&qkv)?; // [b, t, key_dim*2 + value_dim]
@@ -505,10 +516,10 @@ impl LinearAttn {
         let k = qkv.narrow(2, self.key_dim, self.key_dim)?; // [b, t, key_dim]
         let v = qkv.narrow(2, self.key_dim * 2, self.value_dim)?; // [b, t, value_dim]
 
-        // Reshape to per-head: [b, t, n_heads, head_dim]
-        let q = q.reshape((b, t, self.n_heads, self.head_k_dim))?;
-        let k = k.reshape((b, t, self.n_heads, self.head_k_dim))?;
-        let v = v.reshape((b, t, self.n_heads, self.head_v_dim))?;
+        // Reshape to per-head: q/k use n_key_heads, v uses n_value_heads
+        let q = q.reshape((b, t, self.n_key_heads, self.head_k_dim))?;
+        let k = k.reshape((b, t, self.n_key_heads, self.head_k_dim))?;
+        let v = v.reshape((b, t, self.n_value_heads, self.head_v_dim))?;
 
         // ── L2-normalize q and k, then scale q ───────────────────────────────
         let q = Self::l2norm(&q)?;
@@ -516,34 +527,55 @@ impl LinearAttn {
         let scale = (self.head_k_dim as f64).sqrt().recip();
         let q = q.affine(scale, 0.0)?;
 
+        // ── Repeat q and k to n_value_heads (GQA-style expansion) ────────────
+        // Each key head serves `kv_group_ratio` value heads. Expand after L2norm
+        // so that each value-head slot gets the same normalized key vector.
+        let (q, k) = if self.kv_group_ratio > 1 {
+            let ratio = self.kv_group_ratio;
+            // [b, t, n_key_heads, head_k_dim] -> [b, t, n_key_heads, ratio, head_k_dim]
+            //                                  -> [b, t, n_value_heads, head_k_dim]
+            let q = q
+                .unsqueeze(3)?
+                .expand((b, t, self.n_key_heads, ratio, self.head_k_dim))?
+                .reshape((b, t, self.n_value_heads, self.head_k_dim))?;
+            let k = k
+                .unsqueeze(3)?
+                .expand((b, t, self.n_key_heads, ratio, self.head_k_dim))?
+                .reshape((b, t, self.n_value_heads, self.head_k_dim))?;
+            (q, k)
+        } else {
+            (q, k)
+        };
+        // After repeat: q, k, v all have n_value_heads as dim 2.
+
         // ── Compute per-head decay gate g  ────────────────────────────────────
         // g_t = exp( -A_log.exp() * softplus(a_t + dt_bias) )
         // All in F32.
-        let a_f32 = a_input.to_dtype(DType::F32)?; // [b, t, n_heads]
-        let dt_bias_bc = self.dt_bias.reshape((1, 1, self.n_heads))?; // broadcast
-        let sp_input = a_f32.broadcast_add(&dt_bias_bc)?; // [b, t, n_heads]
-        let sp = softplus(&sp_input)?; // [b, t, n_heads]
+        let a_f32 = a_input.to_dtype(DType::F32)?; // [b, t, n_value_heads]
+        let dt_bias_bc = self.dt_bias.reshape((1, 1, self.n_value_heads))?; // broadcast
+        let sp_input = a_f32.broadcast_add(&dt_bias_bc)?; // [b, t, n_value_heads]
+        let sp = softplus(&sp_input)?; // [b, t, n_value_heads]
                                        // g = exp( -A * sp )  where A = exp(A_log)
-        let a_exp = self.a_log.exp()?; // [n_heads], F32
-        let a_exp_bc = a_exp.reshape((1, 1, self.n_heads))?;
-        let log_g = a_exp_bc.broadcast_mul(&sp)?.neg()?; // [b, t, n_heads]
-        let g = log_g.exp()?; // [b, t, n_heads]  -- per-head decay per token
+        let a_exp = self.a_log.exp()?; // [n_value_heads], F32
+        let a_exp_bc = a_exp.reshape((1, 1, self.n_value_heads))?;
+        let log_g = a_exp_bc.broadcast_mul(&sp)?.neg()?; // [b, t, n_value_heads]
+        let g = log_g.exp()?; // [b, t, n_value_heads]  -- per-head decay per token
 
         // ── beta = sigmoid(b_input) ───────────────────────────────────────────
-        let b_f32 = b_input.to_dtype(DType::F32)?; // [b, t, n_heads]
+        let b_f32 = b_input.to_dtype(DType::F32)?; // [b, t, n_value_heads]
                                                    // sigmoid(x) = 1 / (1 + exp(-x))
         let beta = candle_nn::ops::sigmoid(&b_f32)?;
 
         // ── Cast q, k, v to F32 for the recurrence ────────────────────────────
-        let q_f32 = q.to_dtype(DType::F32)?; // [b, t, n_heads, head_k_dim]
-        let k_f32 = k.to_dtype(DType::F32)?; // [b, t, n_heads, head_k_dim]
-        let v_f32 = v.to_dtype(DType::F32)?; // [b, t, n_heads, head_v_dim]
+        let q_f32 = q.to_dtype(DType::F32)?; // [b, t, n_value_heads, head_k_dim]
+        let k_f32 = k.to_dtype(DType::F32)?; // [b, t, n_value_heads, head_k_dim]
+        let v_f32 = v.to_dtype(DType::F32)?; // [b, t, n_value_heads, head_v_dim]
 
         // ── Initialise recurrent state ────────────────────────────────────────
-        // state: [b, n_heads, head_k_dim, head_v_dim]  F32
+        // state: [b, n_value_heads, head_k_dim, head_v_dim]  F32
         let mut state = match &self.recurrent_state {
             None => Tensor::zeros(
-                (b, self.n_heads, self.head_k_dim, self.head_v_dim),
+                (b, self.n_value_heads, self.head_k_dim, self.head_v_dim),
                 DType::F32,
                 &device,
             )?,
@@ -571,23 +603,23 @@ impl LinearAttn {
         };
 
         // ── Gated RMSNorm: norm(out) * silu(z) ───────────────────────────────
-        // Reshape for norm: [b*t*n_heads, head_v_dim]
+        // Reshape for norm: [b*t*n_value_heads, head_v_dim]
         let out_flat = out_raw
             .contiguous()?
-            .reshape((b * t * self.n_heads, self.head_v_dim))?; // F32
+            .reshape((b * t * self.n_value_heads, self.head_v_dim))?; // F32
 
         // RMSNorm over head_v_dim
         let out_normed = candle_nn::ops::rms_norm(&out_flat, &self.norm_weight, 1e-6)?;
 
-        // z gate: [b, t, value_dim] -> [b*t*n_heads, head_v_dim], then silu
+        // z gate: [b, t, value_dim] -> [b*t*n_value_heads, head_v_dim], then silu
         // z is in model dtype; cast to F32 for the gate multiply
         let z_f32 = z.to_dtype(DType::F32)?;
         let z_flat = z_f32
             .contiguous()?
-            .reshape((b * t * self.n_heads, self.head_v_dim))?;
+            .reshape((b * t * self.n_value_heads, self.head_v_dim))?;
         let z_gate = z_flat.silu()?; // F32
 
-        // Gated output: [b*t*n_heads, head_v_dim]  F32
+        // Gated output: [b*t*n_value_heads, head_v_dim]  F32
         let out_gated = (out_normed * z_gate)?;
 
         // Reshape back: [b, t, value_dim] and cast to model dtype
@@ -958,8 +990,8 @@ impl Qwen35Model {
                 cfg,
                 embed_tokens.embeddings().clone(),
                 lm_head.clone(),
-                lm_vb.clone(),
-                lm_qvb.as_ref(),
+                vb.clone(),
+                qvb,
             ) {
                 Ok(m) => {
                     tracing::info!(
@@ -1139,36 +1171,46 @@ impl MtpModule {
         vb: VarBuilder,
         qvb: Option<&QGgufVarBuilder>,
     ) -> Result<Self> {
-        let mtp_vb = vb.pp("mtp").pp("0");
-        let mtp_qvb = qvb.map(|q| q.pp("mtp").pp("0"));
+        let mtp_vb = vb.pp("mtp");
+        let mtp_qvb = qvb.map(|q| q.pp("mtp"));
 
-        let hnorm =
-            rms_norm_with_offset(cfg.hidden_size, cfg.rms_norm_eps, mtp_vb.pp("hnorm"), 1.0)?;
-        let enorm =
-            rms_norm_with_offset(cfg.hidden_size, cfg.rms_norm_eps, mtp_vb.pp("enorm"), 1.0)?;
+        let hnorm = rms_norm_with_offset(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            mtp_vb.pp("pre_fc_norm_hidden"),
+            1.0,
+        )?;
+        let enorm = rms_norm_with_offset(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            mtp_vb.pp("pre_fc_norm_embedding"),
+            1.0,
+        )?;
 
         let eh_proj = qlinear_b(
             cfg.hidden_size * 2,
             cfg.hidden_size,
             false,
-            mtp_vb.pp("eh_proj"),
-            mtp_qvb.as_ref().map(|q| q.pp("eh_proj")).as_ref(),
+            mtp_vb.pp("fc"),
+            mtp_qvb.as_ref().map(|q| q.pp("fc")).as_ref(),
         )?;
 
-        // The MTP block is always a full-attention layer.
+        // The MTP block is always a full-attention layer, under mtp.layers.0.*
+        let layer_vb = mtp_vb.pp("layers").pp("0");
+        let layer_qvb = mtp_qvb.as_ref().map(|q| q.pp("layers").pp("0"));
         let block = DecoderLayer::new(
             cfg,
-            mtp_vb.clone(),
-            mtp_qvb.as_ref(),
+            layer_vb,
+            layer_qvb.as_ref(),
             true, // is_full_attention
             None, // no TurboQuant for MTP block
         )?;
 
         let _ = embed_tokens_weight; // weight is already in lm_head
 
-        // Shared final norm from the main model trunk (model.language_model.norm).
-        // Applied after the MTP block, before lm_head — same role as in forward().
-        let norm = rms_norm_with_offset(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("norm"), 1.0)?;
+        // MTP has its own copy of the final norm (mtp.norm.weight).
+        let norm =
+            rms_norm_with_offset(cfg.hidden_size, cfg.rms_norm_eps, mtp_vb.pp("norm"), 1.0)?;
 
         let (cos, sin) = precompute_rope(
             cfg.head_dim,
