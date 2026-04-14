@@ -79,15 +79,13 @@ impl Module for QLinear {
         match &self.inner {
             QMatMul::QTensor(_) => {
                 let orig_dtype = xs.dtype();
-                // On CUDA with BF16 activations, the patched `dequantize_matmul_vec`
-                // has a BF16 fast path that fuses BF16→Q8_1 in one kernel dispatch
-                // (vs the old two-dispatch BF16→F32 + F32→Q8_1 path).
-                // Pass BF16 input directly and save one kernel launch per GEMV.
-                // Non-CUDA or non-BF16: keep the standard F32 conversion path.
+                // Metal + BF16 fast path: use kernel_mul_mv_q4_K_bf16i_f32 which
+                // converts BF16 input inline, eliminating a separate to_dtype dispatch.
+                // CUDA + BF16: patched dequantize_matmul_vec fuses BF16→Q8_1 internally.
+                // Other: standard F32 conversion path.
                 let r = if matches!(xs.device(), candle_core::Device::Cuda(_))
                     && orig_dtype == DType::BF16
                 {
-                    // Direct BF16 path: skip the BF16→F32 conversion kernel.
                     self.inner.forward(xs)?
                 } else {
                     let xs_f32 = if orig_dtype == DType::F32 {
@@ -150,7 +148,79 @@ impl QLinear {
     ///
     /// For the Dense path (QMatMul::Tensor), this falls through to a
     /// standard matmul and then converts the result to F32 if needed.
-    #[allow(dead_code)]
+    #[cfg(feature = "metal")]
+    /// Fused QKV triple Q4K GEMV on Metal: compute `(self @ xs, kw @ xs, vw @ xs)`
+    /// in a single Metal kernel dispatch.  Q and K/V may have different output
+    /// sizes (GQA).  Returns `None` when the fused path is unavailable.
+    /// BF16-input Q4K GEMV: eliminates per-GEMV BF16->F32 conversion dispatch.
+    /// Returns None when unavailable (non-Metal, non-Q4K, or non-BF16 input).
+    #[cfg(feature = "metal")]
+    pub fn forward_bf16i(&self, xs: &Tensor) -> Option<Result<Tensor>> {
+        if self.bias.is_some() {
+            return None;
+        }
+        let qt = match &self.inner {
+            QMatMul::QTensor(q) => q,
+            _ => return None,
+        };
+        match qt.fwd_mv_bf16i(xs) {
+            Ok(Some(out)) => Some(Ok(out)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    pub fn forward_triple_q4k(
+        &self,
+        kw: &QLinear,
+        vw: &QLinear,
+        xs_f32: &Tensor,
+    ) -> Option<Result<(Tensor, Tensor, Tensor)>> {
+        if self.bias.is_some() || kw.bias.is_some() || vw.bias.is_some() {
+            return None;
+        }
+        let (qt_q, qt_k, qt_v) = match (&self.inner, &kw.inner, &vw.inner) {
+            (QMatMul::QTensor(q), QMatMul::QTensor(k), QMatMul::QTensor(v)) => (q, k, v),
+            _ => return None,
+        };
+        match qt_q.fwd_mv3_q4k(qt_k, qt_v, xs_f32) {
+            Ok(Some(triple)) => Some(Ok(triple)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    /// Fused double Q4K GEMV on Metal: compute `(self @ xs, other @ xs)` in a
+    /// single Metal kernel dispatch.
+    ///
+    /// Returns `None` when the fused path is unavailable (non-Metal device,
+    /// non-Q4K dtype, or either layer has a bias), so the caller can fall back
+    /// to two sequential `forward` calls.
+    ///
+    /// Both `self` and `other` must be bias-free Q4K layers; `xs` must be a
+    /// contiguous F32 Metal tensor.  The outputs are both F32.
+    pub fn forward_paired_q4k(
+        &self,
+        other: &QLinear,
+        xs_f32: &Tensor,
+    ) -> Option<Result<(Tensor, Tensor)>> {
+        // Only the Metal Q4K quantized path is supported.
+        if self.bias.is_some() || other.bias.is_some() {
+            return None;
+        }
+        let (qt_self, qt_other) = match (&self.inner, &other.inner) {
+            (QMatMul::QTensor(a), QMatMul::QTensor(b)) => (a, b),
+            _ => return None,
+        };
+        match qt_self.fwd_mv2_q4k(qt_other, xs_f32) {
+            Ok(Some(pair)) => Some(Ok(pair)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
     pub fn forward_f32(&self, xs_f32: &Tensor) -> Result<Tensor> {
         debug_assert_eq!(xs_f32.dtype(), DType::F32, "forward_f32 requires F32 input");
         match &self.inner {

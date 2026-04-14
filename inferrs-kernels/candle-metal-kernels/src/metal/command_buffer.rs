@@ -87,6 +87,17 @@ impl CommandBuffer {
             .unwrap()
     }
 
+    /// Creates a compute encoder that does NOT call `endEncoding` on drop.
+    ///
+    /// Used by the persistent-encoder fast path: the encoder is kept open across
+    /// many dispatches and ended explicitly (via `end_encoding()`) at commit time.
+    pub fn compute_command_encoder_persistent(&self) -> ComputeCommandEncoder {
+        self.as_ref()
+            .computeCommandEncoder()
+            .map(|raw| ComputeCommandEncoder::new_non_owning(raw, Arc::clone(&self.semaphore)))
+            .unwrap()
+    }
+
     pub fn blit_command_encoder(&self) -> BlitCommandEncoder {
         self.as_ref()
             .blitCommandEncoder()

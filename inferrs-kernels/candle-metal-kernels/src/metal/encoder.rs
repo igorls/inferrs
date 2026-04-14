@@ -9,6 +9,10 @@ use std::{ffi::c_void, ptr, sync::Arc};
 pub struct ComputeCommandEncoder {
     raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
     semaphore: Arc<CommandSemaphore>,
+    /// When `false`, `Drop` does NOT call `endEncoding`.  Used for the
+    /// persistent-encoder fast path where the encoder is shared across many
+    /// dispatches and ended explicitly at commit time.
+    owned: bool,
 }
 
 impl AsRef<ComputeCommandEncoder> for ComputeCommandEncoder {
@@ -21,7 +25,37 @@ impl ComputeCommandEncoder {
         raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
         semaphore: Arc<CommandSemaphore>,
     ) -> ComputeCommandEncoder {
-        ComputeCommandEncoder { raw, semaphore }
+        ComputeCommandEncoder {
+            raw,
+            semaphore,
+            owned: true,
+        }
+    }
+
+    /// Create a non-owning alias that encodes dispatches into the same underlying
+    /// `MTLComputeCommandEncoder` without calling `endEncoding` on drop.
+    ///
+    /// Used by the persistent-encoder path in `Commands::command_encoder` so
+    /// that callers can dispatch kernels through the encoder without ending it.
+    /// Create a non-owning encoder from raw parts: does NOT call `endEncoding` on drop.
+    pub fn new_non_owning(
+        raw: Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>,
+        semaphore: Arc<CommandSemaphore>,
+    ) -> ComputeCommandEncoder {
+        ComputeCommandEncoder {
+            raw,
+            semaphore,
+            owned: false,
+        }
+    }
+
+    /// Create a non-owning alias that shares the underlying `MTLComputeCommandEncoder`.
+    pub fn non_owning_alias(&self) -> ComputeCommandEncoder {
+        ComputeCommandEncoder {
+            raw: self.raw.clone(),
+            semaphore: Arc::clone(&self.semaphore),
+            owned: false,
+        }
     }
 
     pub(crate) fn signal_encoding_ended(&self) {
@@ -96,7 +130,11 @@ impl ComputeCommandEncoder {
 
 impl Drop for ComputeCommandEncoder {
     fn drop(&mut self) {
-        self.end_encoding();
+        if self.owned {
+            self.end_encoding();
+        }
+        // Non-owning aliases (owned=false) do nothing on drop — the persistent
+        // encoder in EntryState is ended explicitly by commit_swap_locked.
     }
 }
 

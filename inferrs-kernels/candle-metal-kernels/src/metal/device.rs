@@ -88,6 +88,24 @@ impl Device {
         }
     }
 
+    /// Zero-copy buffer wrapping existing memory. Pointer must be page-aligned.
+    pub fn new_buffer_with_bytes_no_copy(
+        &self,
+        pointer: *const c_void,
+        length: usize,
+        options: MTLResourceOptions,
+    ) -> Result<Buffer, MetalKernelError> {
+        let nonnull = ptr::NonNull::new(pointer as *mut c_void).ok_or_else(|| {
+            MetalKernelError::FailedToCreateResource("null ptr".to_string())
+        })?;
+        unsafe {
+            self.as_ref()
+                .newBufferWithBytesNoCopy_length_options_deallocator(nonnull, length, options, None)
+                .map(Buffer::new)
+                .ok_or(MetalKernelError::FailedToCreateResource("NoCopyBuffer".to_string()))
+        }
+    }
+
     pub fn new_library_with_source(
         &self,
         source: &str,

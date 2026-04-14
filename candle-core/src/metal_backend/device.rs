@@ -17,6 +17,10 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use super::MetalError;
 
+/// A contiguous Metal buffer holding all GGUF model weights (not yet implemented).
+/// Placeholder for future shared-buffer optimization.
+pub struct WeightArena;
+
 /// Unique identifier for metal devices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct DeviceId(usize);
@@ -59,6 +63,10 @@ pub struct MetalDevice {
     /// Simple keeper struct to keep track of the already compiled kernels so we can reuse them.
     /// Heavily used by [`candle_metal_kernels`]
     pub(crate) kernels: Arc<Kernels>,
+    /// Weight arena: a single large Metal buffer holding all GGUF weight data.
+    /// During model loading, tensors are written here instead of getting individual buffers,
+    /// reducing Metal API overhead from O(N) allocations to O(1).
+
     /// Seed for random number generation.
     pub(crate) seed: Arc<Mutex<Buffer>>,
     /// Last seed value set on this device.
@@ -213,6 +221,45 @@ impl MetalDevice {
         let new_buffer = Arc::new(new_buffer);
         subbuffers.push(new_buffer.clone());
         Ok(new_buffer)
+    }
+
+    /// Like new_buffer_with_data but skips the pool (for permanent weight buffers).
+    pub fn new_buffer_with_data_untracked<T>(&self, data: &[T]) -> Result<Arc<Buffer>> {
+        let size = core::mem::size_of_val(data);
+        let new_buffer = self
+            .device
+            .new_buffer_with_data(data.as_ptr().cast(), size, RESOURCE_OPTIONS)
+            .map_err(MetalError::from)?;
+        Ok(Arc::new(new_buffer))
+    }
+
+    /// Returns (buffer, offset=0) for compatibility with arena-aware callers.
+    pub fn new_buffer_with_data_untracked_offset<T>(&self, data: &[T]) -> Result<(Arc<Buffer>, usize)> {
+        Ok((self.new_buffer_with_data_untracked(data)?, 0))
+    }
+
+    /// Placeholder for future batch weight-loading optimization.
+    pub fn begin_weight_arena(&self, _total_bytes: usize) -> Result<()> { Ok(()) }
+    pub fn end_weight_arena(&self) {}
+
+    /// Creates a Metal buffer wrapping existing memory WITHOUT copying.
+    /// The caller must ensure the data outlives the returned buffer.
+    /// Pointer must be page-aligned (4096 bytes). Ideal for mmap'd GGUF data.
+    ///
+    /// # Safety
+    /// The data slice must remain valid and unchanged for the lifetime of the returned buffer.
+    pub unsafe fn new_buffer_no_copy<T>(&self, data: &[T]) -> Result<Arc<Buffer>> {
+        let size = core::mem::size_of_val(data);
+        let ptr = data.as_ptr() as *mut std::ffi::c_void;
+        if ptr.is_null() || size == 0 {
+            return self.new_buffer_with_data_untracked(data);
+        }
+        let new_buffer = unsafe {
+            self.device
+                .new_buffer_with_bytes_no_copy(ptr, size, RESOURCE_OPTIONS)
+                .map_err(|e| MetalError::from(format!("{e:?}")))?
+        };
+        Ok(Arc::new(new_buffer))
     }
 
     pub fn allocate_zeros(&self, size_in_bytes: usize) -> Result<Arc<Buffer>> {

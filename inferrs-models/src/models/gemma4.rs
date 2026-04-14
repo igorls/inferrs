@@ -588,12 +588,53 @@ impl Mlp {
 
 impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        // The BF16-native GEMV kernel handles BF16 input directly, so no
-        // pre-conversion to F32 is needed. Each QLinear::forward call uses
-        // the fused BF16→Q8_1 path internally.
-        let lhs = xs.apply(&self.gate_proj)?.apply(&self.act_fn)?;
-        let rhs = xs.apply(&self.up_proj)?;
-        (lhs * rhs)?.apply(&self.down_proj)
+        // On the quantized (GGUF) path the Metal/CPU GEMV kernel requires F32
+        // input.  `gate_proj` and `up_proj` both read from `xs`, so we convert
+        // once and share the F32 tensor across both GEMVs, saving one
+        // `to_dtype(F32)` + one `to_dtype(orig)` kernel dispatch per MLP call.
+        //
+        // The CUDA BF16 fast-path (`QMatMul::forward` accepts BF16 directly)
+        // and the dense safetensors path are both handled by the regular
+        // `Module::forward` and do not benefit from pre-conversion, so we only
+        // take the pre-convert branch for quantized non-CUDA non-F32 inputs.
+        let need_pre_convert = self.gate_proj.is_quantized()
+            && !matches!(xs.device(), candle_core::Device::Cuda(_))
+            && xs.dtype() != DType::F32;
+
+        if need_pre_convert {
+            let orig_dtype = xs.dtype();
+            #[allow(unused_variables)]
+            let is_single_token = xs.rank() >= 2 && xs.dim(xs.rank() - 2).unwrap_or(0) == 1;
+
+            // Use the F32-fused path (gate+up in 1 dispatch) for Mlp.
+            // BF16 inline (2 separate dispatches) is slower; it applies to
+            // unfused GEMVs (o_proj, PLI) automatically via QLinear::forward.
+            let xs_f32 = xs.to_dtype(DType::F32)?;
+
+            // Fused double-GEMV (Q4K Metal) for single-token decode.
+            #[cfg(feature = "metal")]
+            if is_single_token {
+                if let Some(result) = self.gate_proj.forward_paired_q4k(&self.up_proj, &xs_f32) {
+                    let (gate_f32, up_f32) = result?;
+                    let lhs_f32 = gate_f32.apply(&self.act_fn)?;
+                    return self
+                        .down_proj
+                        .forward_f32(&(lhs_f32 * up_f32)?)?
+                        .to_dtype(orig_dtype);
+                }
+            }
+
+            // Fallback: two separate GEMVs sharing the same F32 input.
+            let lhs_f32 = self.gate_proj.forward_f32(&xs_f32)?.apply(&self.act_fn)?;
+            let rhs_f32 = self.up_proj.forward_f32(&xs_f32)?;
+            self.down_proj
+                .forward_f32(&(lhs_f32 * rhs_f32)?)?
+                .to_dtype(orig_dtype)
+        } else {
+            let lhs = xs.apply(&self.gate_proj)?.apply(&self.act_fn)?;
+            let rhs = xs.apply(&self.up_proj)?;
+            (lhs * rhs)?.apply(&self.down_proj)
+        }
     }
 }
 
@@ -937,9 +978,38 @@ struct Attention {
     /// Lazily allocated on the first decode step.
     partial_rope_q_out: Option<Tensor>,
     partial_rope_k_out: Option<Tensor>,
+
+    #[allow(dead_code)]
+    flash_attn_tmp: Option<candle_core::Tensor>,
+
+    #[allow(dead_code)]
+    /// Pre-allocated 2-pass SDPA buffers for KV-sharing layers.
+    sdpa_2pass_intermediate: Option<candle_core::Tensor>,
+    #[allow(dead_code)]
+    sdpa_2pass_sums: Option<candle_core::Tensor>,
+    #[allow(dead_code)]
+    sdpa_2pass_maxs: Option<candle_core::Tensor>,
+    #[allow(dead_code)]
+    sdpa_2pass_out: Option<candle_core::Tensor>,
 }
 
 impl Attention {
+    /// Apply o_proj using BF16-input inline GEMV when available (eliminates
+    /// a BF16->F32 to_dtype dispatch for single-token decode on Metal).
+    fn apply_o_proj(&self, xs: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if xs.rank() >= 2
+            && xs.dim(xs.rank().saturating_sub(2)).unwrap_or(0) == 1
+            && xs.dtype() == DType::BF16
+            && matches!(xs.device(), candle_core::Device::Metal(_))
+        {
+            if let Some(out) = self.o_proj.forward_bf16i(xs) {
+                return out?.to_dtype(xs.dtype());
+            }
+        }
+        xs.apply(&self.o_proj)
+    }
+
     fn new(
         rotary_emb: Arc<RotaryEmbedding>,
         is_sliding: bool,
@@ -1057,6 +1127,12 @@ impl Attention {
             // Lazily allocated on first decode step; None until then.
             partial_rope_q_out: None,
             partial_rope_k_out: None,
+
+            flash_attn_tmp: None,
+            sdpa_2pass_intermediate: None,
+            sdpa_2pass_sums: None,
+            sdpa_2pass_maxs: None,
+            sdpa_2pass_out: None,
         })
     }
 
@@ -1223,21 +1299,82 @@ impl Attention {
         // Layout before transpose: [b, q_len, n_heads, head_dim] — row-major ✓
         // Layout after  transpose: [b, n_heads, q_len, head_dim] — NOT contiguous ✗
         //
-        // The BF16-native GEMV kernel (quantize_q8_1_bf16) now handles BF16
-        // activations directly, so there is no need to pre-convert to F32.
-        // Each QLinear::forward call uses the fused BF16→Q8_1 path internally.
-        let q_raw =
-            self.q_proj
-                .forward(xs)?
-                .reshape((b_sz, q_len, self.num_heads, self.head_dim))?;
-        let k_raw =
-            self.k_proj
-                .forward(xs)?
-                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?;
-        let v_raw =
-            self.v_proj
-                .forward(xs)?
-                .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?;
+        // On the quantized (GGUF) Metal/CPU path, q/k/v_proj all read from `xs`.
+        // For single-token decode, use the fused triple-GEMV kernel which computes
+        // all three projections in one Metal dispatch.
+        let need_pre_convert = self.q_proj.is_quantized()
+            && !matches!(xs.device(), candle_core::Device::Cuda(_))
+            && xs.dtype() != DType::F32;
+        let orig_dtype = xs.dtype();
+        let is_single_token_decode = q_len == 1;
+
+        let (q_raw, k_raw, v_raw) = if need_pre_convert && is_single_token_decode {
+            let xs_f32 = xs.to_dtype(DType::F32)?;
+
+            // Try fused triple QKV GEMV (Q4K Metal only); fall back to 3 separate GEMVs.
+            #[cfg(feature = "metal")]
+            let qkv_fused = self.q_proj.forward_triple_q4k(&self.k_proj, &self.v_proj, &xs_f32);
+            #[cfg(not(feature = "metal"))]
+            let qkv_fused: Option<candle_core::Result<(candle_core::Tensor, candle_core::Tensor, candle_core::Tensor)>> = None;
+            if let Some(result) = qkv_fused {
+                let (q_f32, k_f32, v_f32) = result?;
+                (
+                    q_f32.to_dtype(orig_dtype)?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?,
+                    k_f32.to_dtype(orig_dtype)?.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
+                    v_f32.to_dtype(orig_dtype)?.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
+                )
+            } else {
+                // Fallback: three GEMVs sharing one F32 input copy.
+                (
+                    self.q_proj
+                        .forward_f32(&xs_f32)?
+                        .to_dtype(orig_dtype)?
+                        .reshape((b_sz, q_len, self.num_heads, self.head_dim))?,
+                    self.k_proj
+                        .forward_f32(&xs_f32)?
+                        .to_dtype(orig_dtype)?
+                        .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
+                    self.v_proj
+                        .forward_f32(&xs_f32)?
+                        .to_dtype(orig_dtype)?
+                        .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
+                )
+            }
+        } else if need_pre_convert {
+            let xs_f32 = xs.to_dtype(DType::F32)?;
+            (
+                self.q_proj
+                    .forward_f32(&xs_f32)?
+                    .to_dtype(orig_dtype)?
+                    .reshape((b_sz, q_len, self.num_heads, self.head_dim))?,
+                self.k_proj
+                    .forward_f32(&xs_f32)?
+                    .to_dtype(orig_dtype)?
+                    .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
+                self.v_proj
+                    .forward_f32(&xs_f32)?
+                    .to_dtype(orig_dtype)?
+                    .reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
+            )
+        } else {
+            (
+                self.q_proj
+                    .forward(xs)?
+                    .reshape((b_sz, q_len, self.num_heads, self.head_dim))?,
+                self.k_proj.forward(xs)?.reshape((
+                    b_sz,
+                    q_len,
+                    self.num_kv_heads,
+                    self.head_dim,
+                ))?,
+                self.v_proj.forward(xs)?.reshape((
+                    b_sz,
+                    q_len,
+                    self.num_kv_heads,
+                    self.head_dim,
+                ))?,
+            )
+        };
         // Apply norms on contiguous pre-transpose shape, then transpose.
         let query_states = self.q_norm.forward(&q_raw)?.transpose(1, 2)?;
         let key_states = self.k_norm.forward(&k_raw)?.transpose(1, 2)?;
@@ -1330,18 +1467,55 @@ impl Attention {
             //   - scale=1.0  matches the reference (no per-element scaling)
             //   - softcapping=sc if softcapping is set, else 1.0 (no-op)
             let softcapping = self.attn_logit_softcapping.unwrap_or(1.0) as f32;
-            candle_nn::ops::sdpa(
-                &query_states,
-                &key_states,
-                &value_states,
-                None,
-                false,
-                1.0_f32,
-                softcapping,
-            )?
-            .transpose(1, 2)?
-            .reshape((b_sz, q_len, ()))?
-            .apply(&self.o_proj)?
+
+            // Pre-allocated 2-pass SDPA (Metal only) for donor layers.
+            #[cfg(feature = "metal")]
+            if self.sdpa_2pass_intermediate.is_none()
+                && matches!(query_states.device(), candle_core::Device::Metal(_))
+                && query_states.dtype() == DType::BF16
+                && matches!(self.head_dim, 32 | 64 | 96 | 128 | 256 | 512)
+            {
+                const NBLOCKS: usize = 32;
+                let dev = query_states.device();
+                self.sdpa_2pass_intermediate = Some(Tensor::zeros(
+                    (self.num_heads, NBLOCKS, self.head_dim), DType::F32, dev,
+                )?);
+                self.sdpa_2pass_sums =
+                    Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
+                self.sdpa_2pass_maxs =
+                    Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
+            }
+            #[cfg(feature = "metal")]
+            let donor_attn = if let (Some(interm), Some(sums), Some(maxs)) = (
+                &self.sdpa_2pass_intermediate,
+                &self.sdpa_2pass_sums,
+                &self.sdpa_2pass_maxs,
+            ) {
+                candle_nn::ops::sdpa_2pass_prealloc(
+                    &query_states, &key_states, &value_states,
+                    1.0_f32, softcapping, interm, sums, maxs,
+                )?
+            } else { None };
+            #[cfg(not(feature = "metal"))]
+            let donor_attn: Option<candle_core::Tensor> = None;
+
+            let attn_result = if let Some(a) = donor_attn {
+                a
+            } else {
+                candle_nn::ops::sdpa(
+                    &query_states,
+                    &key_states,
+                    &value_states,
+                    None,
+                    false,
+                    1.0_f32,
+                    softcapping,
+                )?
+            };
+            attn_result
+                .transpose(1, 2)?
+                .reshape((b_sz, q_len, ()))?
+                .apply(&self.o_proj)?
         } else {
             // Manual GQA path: use Q-reshape to avoid materializing expanded K/V.
             //
@@ -1361,7 +1535,7 @@ impl Attention {
                 )?;
                 if q_len == 1 {
                     // Decode fast path: already [b, q_len, n_q*d] — apply o_proj directly.
-                    attn_out.apply(&self.o_proj)?
+                    self.apply_o_proj(&attn_out)?
                 } else {
                     // Prefill path: [b, n_q, q_len, d] → transpose → reshape → o_proj.
                     attn_out
@@ -1392,10 +1566,47 @@ impl Attention {
 
         // Compute Q only (K,V are shared from the donor layer).
         // Apply q_norm BEFORE transpose so the input is contiguous (avoids a GPU copy).
-        let q_raw =
+        //
+        // On the quantized Metal/CPU path, pre-convert xs to F32 so q_proj's GEMV
+        // kernel gets F32 input without an internal conversion dispatch.
+        let need_pre_convert = self.q_proj.is_quantized()
+            && !matches!(xs.device(), candle_core::Device::Cuda(_))
+            && xs.dtype() != DType::F32;
+        // BF16-input inline for q_proj: skips BF16->F32 dispatch on Metal decode.
+        #[cfg(feature = "metal")]
+        #[allow(unused_variables)]
+        let is_metal_bf16_decode = q_len == 1
+            && matches!(xs.device(), candle_core::Device::Metal(_))
+            && xs.dtype() == DType::BF16;
+        #[cfg(not(feature = "metal"))]
+        #[allow(unused_variables)]
+        let is_metal_bf16_decode = false;
+        #[cfg(feature = "metal")]
+        let q_raw_metal_opt = if need_pre_convert && is_metal_bf16_decode {
+            let orig_dtype = xs.dtype();
+            Some(if let Some(out) = self.q_proj.forward_bf16i(xs) {
+                out?.to_dtype(orig_dtype)?
+                    .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+            } else {
+                self.q_proj
+                    .forward_f32(&xs.to_dtype(DType::F32)?)?
+                    .to_dtype(orig_dtype)?
+                    .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+            })
+        } else { None };
+        #[cfg(not(feature = "metal"))]
+        let q_raw_metal_opt: Option<candle_core::Tensor> = None;
+        let q_raw = if let Some(q) = q_raw_metal_opt { q } else if need_pre_convert {
+            let orig_dtype = xs.dtype();
+            self.q_proj
+                .forward_f32(&xs.to_dtype(DType::F32)?)?
+                .to_dtype(orig_dtype)?
+                .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+        } else {
             self.q_proj
                 .forward(xs)?
-                .reshape((b_sz, q_len, self.num_heads, self.head_dim))?;
+                .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
+        };
         let query_states = self.q_norm.forward(&q_raw)?.transpose(1, 2)?;
 
         // RoPE — use buffer-based path for partial-RoPE global layers during decode.
@@ -1405,6 +1616,97 @@ impl Attention {
         // Use fused SDPA for decode (q_len=1) when available.
         if self.use_sdpa && q_len == 1 && attention_mask.is_none() {
             let softcapping = self.attn_logit_softcapping.unwrap_or(1.0) as f32;
+
+            // ── Flash attention (llama.cpp flash_attn_ext_vec) ─────────────────────
+            // 32 parallel workgroups, BF16 + head_dim=256, single-token decode.
+            // This matches llama.cpp's approach exactly and eliminates the SDPA gap.
+            #[cfg(feature = "metal")]
+            let use_flash = false; // flash_attn disabled: 2-pass overhead exceeds benefit vs sdpa_vector
+
+            #[cfg(feature = "metal")]
+            if use_flash {
+                if self.flash_attn_tmp.is_none() {
+                    // tmp: [n_q_heads * 32 * 258] F32
+                    let dev = query_states.device();
+                    self.flash_attn_tmp =
+                        Some(Tensor::zeros(self.num_heads * 32 * 258, DType::F32, dev)?);
+                }
+                if let Some(tmp) = &self.flash_attn_tmp {
+                    if let Some(attn_out) = candle_nn::ops::sdpa_flash_attn_vec(
+                        &query_states,
+                        shared_key,
+                        shared_value,
+                        1.0_f32,
+                        tmp,
+                    )? {
+                        return attn_out
+                            .transpose(1, 2)?
+                            .reshape((b_sz, q_len, ()))?
+                            .apply(&self.o_proj);
+                    }
+                }
+            }
+
+            // Use pre-allocated 2-pass SDPA buffers to avoid per-step Metal buffer
+            // allocation.  This matches llama.cpp's flash_attn_ext_vec with nwg=32.
+            // Only BF16 + head_dim ∈ {32,64,96,128,256,512} on Metal.
+            #[cfg(feature = "metal")]
+            let use_2pass = matches!(query_states.device(), candle_core::Device::Metal(_))
+                && query_states.dtype() == DType::BF16
+                && matches!(self.head_dim, 32 | 64 | 96 | 128 | 256 | 512);
+            #[cfg(not(feature = "metal"))]
+            #[allow(unused_variables)]
+            let use_2pass = false;
+
+            #[cfg(feature = "metal")]
+            if use_2pass {
+                const NBLOCKS: usize = 32; // matches candle_metal_kernels::SDPA_2PASS_BLOCKS
+                if self.sdpa_2pass_intermediate.is_none() {
+                    let dev = query_states.device();
+                    // [n_q_heads, NBLOCKS, head_dim] F32
+                    self.sdpa_2pass_intermediate = Some(Tensor::zeros(
+                        (self.num_heads, NBLOCKS, self.head_dim),
+                        DType::F32,
+                        dev,
+                    )?);
+                    // [n_q_heads, NBLOCKS] F32
+                    self.sdpa_2pass_sums =
+                        Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
+                    self.sdpa_2pass_maxs =
+                        Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
+                    // Pre-allocate output: [1, n_q_heads, 1, head_dim] BF16
+                    self.sdpa_2pass_out = Some(Tensor::zeros(
+                        (1usize, self.num_heads, 1usize, self.head_dim),
+                        DType::BF16,
+                        dev,
+                    )?);
+                }
+                if let (Some(interm), Some(sums), Some(maxs)) = (
+                    &self.sdpa_2pass_intermediate,
+                    &self.sdpa_2pass_sums,
+                    &self.sdpa_2pass_maxs,
+                ) {
+                    if let Some(attn_out) = candle_nn::ops::sdpa_2pass_prealloc(
+                        &query_states,
+                        shared_key,
+                        shared_value,
+                        1.0_f32,
+                        softcapping,
+                        interm,
+                        sums,
+                        maxs,
+                    )? {
+                        return attn_out
+                            .transpose(1, 2)?
+                            .reshape((b_sz, q_len, ()))?
+                            .apply(&self.o_proj);
+                    }
+                }
+            }
+
+            // GQA 1-pass disabled: 2-pass with pre-allocated BN=1 buffers is used below.
+
+            // Fallback to standard sdpa.
             return candle_nn::ops::sdpa(
                 &query_states,
                 shared_key,
@@ -2043,8 +2345,41 @@ impl DecoderLayer {
             // The BF16-native GEMV kernel handles BF16 input directly — no
             // explicit F32 conversion needed. Each QLinear::forward call uses
             // the fused BF16→Q8_1 path on CUDA.
-            let gate = xs.apply(&pli.gate)?.apply(&pli.act_fn)?;
+            // BF16-input inline GEMV for pli.gate (Metal decode only);
+            // on other platforms falls back to standard forward.
+            #[cfg(feature = "metal")]
+            let gate_f32 = if xs.dtype() == DType::BF16
+                && matches!(xs.device(), candle_core::Device::Metal(_))
+                && xs.rank() >= 2
+                && xs.dim(xs.rank().saturating_sub(2)).unwrap_or(0) == 1
+            {
+                if let Some(out) = pli.gate.forward_bf16i(&xs) {
+                    out?
+                } else {
+                    xs.apply(&pli.gate)?
+                }
+            } else {
+                xs.apply(&pli.gate)?
+            };
+            #[cfg(not(feature = "metal"))]
+            let gate_f32 = xs.apply(&pli.gate)?;
+            let gate = gate_f32.to_dtype(xs.dtype())?.apply(&pli.act_fn)?;
             let pli_out = gate.broadcast_mul(pli_input)?;
+            #[cfg(feature = "metal")]
+            let pli_out = if pli_out.dtype() == DType::BF16
+                && matches!(pli_out.device(), candle_core::Device::Metal(_))
+                && pli_out.rank() >= 2
+                && pli_out.dim(pli_out.rank().saturating_sub(2)).unwrap_or(0) == 1
+            {
+                if let Some(out) = pli.projection.forward_bf16i(&pli_out) {
+                    out?.to_dtype(pli_out.dtype())?
+                } else {
+                    pli_out.apply(&pli.projection)?
+                }
+            } else {
+                pli_out.apply(&pli.projection)?
+            };
+            #[cfg(not(feature = "metal"))]
             let pli_out = pli_out.apply(&pli.projection)?;
             let pli_out = pli.norm.forward(&pli_out)?;
             (residual + pli_out)?

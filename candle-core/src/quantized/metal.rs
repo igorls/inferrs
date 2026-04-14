@@ -8,6 +8,9 @@ pub struct QMetalStorage {
     dtype: GgmlDType,
     device: MetalDevice,
     buffer: Arc<Buffer>,
+    /// Byte offset within `buffer` where this tensor's data starts.
+    /// For standalone allocations (legacy path), this is always 0.
+    offset: usize,
 }
 
 impl QMetalStorage {
@@ -18,6 +21,7 @@ impl QMetalStorage {
             buffer,
             device: device.clone(),
             dtype,
+            offset: 0,
         })
     }
 
@@ -234,6 +238,7 @@ impl QMetalStorage {
                 storage.buffer(),
                 (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes(),
                 &self.buffer,
+                self.offset,
                 batch_id * n * DType::F32.size_in_bytes(),
                 &dst,
             )
@@ -241,6 +246,230 @@ impl QMetalStorage {
         }
         let dst_storage = crate::MetalStorage::new(dst, device, dst_shape.elem_count(), DType::F32);
         Ok((dst_storage, dst_shape))
+    }
+
+    /// GEMV with BF16 input: calls kernel_mul_mv_q4_K_bf16i_f32, avoiding a separate
+    /// BF16->F32 conversion dispatch.  Only valid for Q4K weights on Metal.
+    pub fn fwd_mv_bf16i(
+        &self,
+        self_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        use crate::MetalError;
+        if self.dtype != GgmlDType::Q4K {
+            crate::bail!("fwd_mv_bf16i only supports Q4K weights");
+        }
+        if storage.dtype() != DType::BF16 {
+            crate::bail!("fwd_mv_bf16i requires BF16 input");
+        }
+        if !layout.is_contiguous() {
+            crate::bail!("input tensor is not contiguous {layout:?}")
+        }
+        let src_shape = layout.shape();
+        if src_shape.rank() < 2 {
+            crate::bail!("input tensor has only one dimension {layout:?}")
+        }
+        let (n, k) = self_shape.dims2()?;
+        let mut dst_shape = src_shape.dims().to_vec();
+        let m = match dst_shape.len() {
+            3 => dst_shape[0] * dst_shape[1],
+            2 => dst_shape[0],
+            r => crate::bail!("Invalid rank {r} for quantized matmul metal"),
+        };
+        let last_k = dst_shape.pop().unwrap();
+        if last_k != k {
+            crate::bail!("input tensor {layout:?} incompatible with {:?}", self_shape)
+        }
+        dst_shape.push(n);
+        let dst_shape = Shape::from(dst_shape);
+        let device = storage.device().clone();
+        let dst = device.new_buffer(dst_shape.elem_count(), DType::F32, "qmatmul_bf16i")?;
+        let encoder = device.command_encoder()?;
+        for batch_id in 0..m {
+            candle_metal_kernels::call_quantized_matmul_mv_q4k_bf16i(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n, k),
+                storage.buffer(),
+                (layout.start_offset() + batch_id * k) * DType::BF16.size_in_bytes(),
+                &self.buffer,
+                self.offset,
+                batch_id * n * DType::F32.size_in_bytes(),
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+        }
+        let dst_storage = crate::MetalStorage::new(dst, device, dst_shape.elem_count(), DType::F32);
+        Ok((dst_storage, dst_shape))
+    }
+
+    /// Fused double GEMV for Q4K: compute `out_a = self @ xs` and `out_b = other @ xs`
+    /// in a single Metal dispatch, halving kernel-launch overhead and improving
+    /// input-vector cache reuse.  Only valid when both tensors are Q4K with the same shape.
+    pub fn fwd_mv2_q4k(
+        &self,
+        other: &QMetalStorage,
+        self_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+    ) -> Result<((MetalStorage, Shape), (MetalStorage, Shape))> {
+        use crate::MetalError;
+
+        if !layout.is_contiguous() {
+            crate::bail!("input tensor is not contiguous {layout:?}")
+        }
+        if self.dtype != GgmlDType::Q4K || other.dtype != GgmlDType::Q4K {
+            crate::bail!("fwd_mv2_q4k requires both tensors to be Q4K")
+        }
+        let src_shape = layout.shape();
+        if src_shape.rank() < 2 {
+            crate::bail!("input tensor has only one dimension {layout:?}")
+        }
+        let (n, k) = self_shape.dims2()?;
+        let mut dst_shape = src_shape.dims().to_vec();
+        let m = match dst_shape.len() {
+            3 => dst_shape[0] * dst_shape[1],
+            2 => dst_shape[0],
+            rank => crate::bail!("Invalid rank {rank} for fwd_mv2_q4k"),
+        };
+        let last_k = dst_shape.pop().unwrap();
+        if last_k != k {
+            crate::bail!("input tensor {layout:?} incompatible with {:?}", self_shape)
+        }
+        dst_shape.push(n);
+        let dst_shape = Shape::from(dst_shape);
+
+        let device = storage.device().clone();
+        let dst_a = device.new_buffer(dst_shape.elem_count(), DType::F32, "qmatmul_a")?;
+        let dst_b = device.new_buffer(dst_shape.elem_count(), DType::F32, "qmatmul_b")?;
+        let encoder = device.command_encoder()?;
+
+        for batch_id in 0..m {
+            let src1_offset =
+                (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes();
+            let dst_offset = batch_id * n * DType::F32.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv2_q4k(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n, k),
+                storage.buffer(),
+                src1_offset,
+                &self.buffer,
+                self.offset,
+                dst_offset,
+                &dst_a,
+                &other.buffer,
+                other.offset,
+                dst_offset,
+                &dst_b,
+            )
+            .map_err(MetalError::from)?;
+        }
+
+        let da_storage =
+            crate::MetalStorage::new(dst_a, device.clone(), dst_shape.elem_count(), DType::F32);
+        let db_storage =
+            crate::MetalStorage::new(dst_b, device, dst_shape.elem_count(), DType::F32);
+        Ok(((da_storage, dst_shape.clone()), (db_storage, dst_shape)))
+    }
+
+    /// Fused QKV triple Q4K GEMV on Metal.
+    /// `self`=q_weight, `kw`=k_weight, `vw`=v_weight; all must be Q4K.
+    pub fn fwd_mv3_q4k(
+        &self,
+        kw: &QMetalStorage,
+        vw: &QMetalStorage,
+        self_shape: &Shape,
+        kv_shape: &Shape,
+        storage: &MetalStorage,
+        layout: &crate::Layout,
+    ) -> Result<(
+        (MetalStorage, Shape),
+        (MetalStorage, Shape),
+        (MetalStorage, Shape),
+    )> {
+        use crate::MetalError;
+
+        if !layout.is_contiguous() {
+            crate::bail!("input tensor is not contiguous {layout:?}")
+        }
+        if self.dtype != GgmlDType::Q4K || kw.dtype != GgmlDType::Q4K || vw.dtype != GgmlDType::Q4K
+        {
+            crate::bail!("fwd_mv3_q4k requires all tensors to be Q4K")
+        }
+        let src_shape = layout.shape();
+        if src_shape.rank() < 2 {
+            crate::bail!("input tensor has only one dimension {layout:?}")
+        }
+        let (n_q, k) = self_shape.dims2()?;
+        let (n_kv, _) = kv_shape.dims2()?;
+
+        let mut dst_dims = src_shape.dims().to_vec();
+        let m = match dst_dims.len() {
+            3 => dst_dims[0] * dst_dims[1],
+            2 => dst_dims[0],
+            rank => crate::bail!("Invalid rank {rank} for fwd_mv3_q4k"),
+        };
+        let last_k = dst_dims.pop().unwrap();
+        if last_k != k {
+            crate::bail!(
+                "input tensor {layout:?} incompatible with q_shape {:?}",
+                self_shape
+            )
+        }
+        let mut dst_dims_kv = dst_dims.clone();
+        dst_dims.push(n_q);
+        dst_dims_kv.push(n_kv);
+        let dst_shape_q = Shape::from(dst_dims);
+        let dst_shape_kv = Shape::from(dst_dims_kv);
+
+        let device = storage.device().clone();
+        let dst_q = device.new_buffer(dst_shape_q.elem_count(), DType::F32, "qmatmul_q")?;
+        let dst_k = device.new_buffer(dst_shape_kv.elem_count(), DType::F32, "qmatmul_k")?;
+        let dst_v = device.new_buffer(dst_shape_kv.elem_count(), DType::F32, "qmatmul_v")?;
+        let encoder = device.command_encoder()?;
+
+        for batch_id in 0..m {
+            let src1_offset =
+                (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes();
+            let dst_q_offset = batch_id * n_q * DType::F32.size_in_bytes();
+            let dst_kv_offset = batch_id * n_kv * DType::F32.size_in_bytes();
+            candle_metal_kernels::call_quantized_matmul_mv3_q4k(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                (1, 1, n_q, n_kv, k),
+                storage.buffer(),
+                src1_offset,
+                &self.buffer,
+                self.offset,
+                dst_q_offset,
+                &dst_q,
+                &kw.buffer,
+                kw.offset,
+                dst_kv_offset,
+                &dst_k,
+                &vw.buffer,
+                vw.offset,
+                dst_kv_offset,
+                &dst_v,
+            )
+            .map_err(MetalError::from)?;
+        }
+
+        let dq =
+            crate::MetalStorage::new(dst_q, device.clone(), dst_shape_q.elem_count(), DType::F32);
+        let dk =
+            crate::MetalStorage::new(dst_k, device.clone(), dst_shape_kv.elem_count(), DType::F32);
+        let dv = crate::MetalStorage::new(dst_v, device, dst_shape_kv.elem_count(), DType::F32);
+        Ok((
+            (dq, dst_shape_q),
+            (dk, dst_shape_kv.clone()),
+            (dv, dst_shape_kv),
+        ))
     }
 
     pub fn fwd(
@@ -352,12 +581,15 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
     device: &MetalDevice,
     data: &[T],
 ) -> Result<QStorage> {
-    let buffer = device.new_buffer_with_data(data)?;
+    // Use arena allocation when available (batch mode): single Metal buffer for all weights.
+    // Returns the shared buffer + byte offset where this tensor's data starts.
+    let (buffer, offset) = device.new_buffer_with_data_untracked_offset(data)?;
     let device = device.clone();
     Ok(QStorage::Metal(QMetalStorage {
         dtype: T::DTYPE,
         device,
         buffer,
+        offset,
     }))
 }
 

@@ -349,10 +349,18 @@ template <typename T, int D>
   }
   out += head_idx * D + simd_gid * elem_per_thread;
 
-  // Read the query and 0 the output accumulator
-  for (int i = 0; i < elem_per_thread; i++) {
-    q[i] = static_cast<U>(scale) * queries[i];
+  // Read the query using vectorized bfloat4 loads (4x fewer memory transactions).
+  {
+    typedef __attribute__((ext_vector_type(4))) T T4;
+    device const T4* qv4 = (device const T4*)queries;
+    _Pragma("clang loop unroll(full)")
+    for (short j = 0; j < elem_per_thread/4; j++) {
+      float4 qf = (float4)qv4[j] * scale;
+      q[4*j+0] = qf[0]; q[4*j+1] = qf[1];
+      q[4*j+2] = qf[2]; q[4*j+3] = qf[3];
+    }
   }
+  _Pragma("clang loop unroll(full)")
   for (int i = 0; i < elem_per_thread; i++) {
     o[i] = 0;
   }
@@ -363,15 +371,20 @@ template <typename T, int D>
   // For each key
   for (int i = simd_gid; i < N; i += BN) {
     if (!sdpa_vector_has_mask || mask[0]) {
-      // Read the key
-      for (int j = 0; j < elem_per_thread; j++) {
-        k[j] = keys[j];
-      }
-
-      // Compute the i-th score
+      // Vectorized K read + score: bfloat4 loads (4 BF16 per transaction) and
+      // dot(float4, float4) hardware instruction.  4x fewer memory transactions
+      // vs scalar, matching llama.cpp's flash_attn_ext_vec memory access pattern.
       U score = 0;
-      for (int j = 0; j < elem_per_thread; j++) {
-        score += q[j] * k[j];
+      {
+        typedef __attribute__((ext_vector_type(4))) T T4;
+        device const T4* kv4 = (device const T4*)keys;
+        _Pragma("clang loop unroll(full)")
+        for (short j = 0; j < elem_per_thread/4; j++) {
+          float4 kf = (float4)kv4[j];
+          score += dot(kf, float4(q[4*j], q[4*j+1], q[4*j+2], q[4*j+3]));
+          k[4*j+0] = kf[0]; k[4*j+1] = kf[1];
+          k[4*j+2] = kf[2]; k[4*j+3] = kf[3];
+        }
       }
       score = simd_sum(score);
       if (softcapping != 1.) {
@@ -387,11 +400,21 @@ template <typename T, int D>
       max_score = new_max;
       sum_exp_score = sum_exp_score * factor + exp_score;
 
-      // Update the output accumulator
-      for (int j = 0; j < elem_per_thread; j++) {
-        o[j] = o[j] * factor + exp_score * values[j];
+      // Vectorized V accumulation: bfloat4 loads (4 BF16 per transaction).
+      {
+        typedef __attribute__((ext_vector_type(4))) T T4;
+        device const T4* vv4 = (device const T4*)values;
+        _Pragma("clang loop unroll(full)")
+        for (short j = 0; j < elem_per_thread/4; j++) {
+          float4 vf = (float4)vv4[j];
+          o[4*j+0] = o[4*j+0] * factor + exp_score * vf[0];
+          o[4*j+1] = o[4*j+1] * factor + exp_score * vf[1];
+          o[4*j+2] = o[4*j+2] * factor + exp_score * vf[2];
+          o[4*j+3] = o[4*j+3] * factor + exp_score * vf[3];
+        }
       }
     }
+
 
     // Move the pointers to the next kv
     keys += stride;
@@ -430,7 +453,7 @@ template <typename T, int D>
   }
 }
 
-template <typename T, int D>
+template <typename T, int D, int NBLOCKS = 32>
 [[kernel]] void sdpa_vector_2pass_1(
     const device T* queries [[buffer(0)]],
     const device T* keys [[buffer(1)]],
@@ -454,7 +477,7 @@ template <typename T, int D>
   constexpr int BD = 32;
   constexpr int elem_per_thread = D / BD;
   constexpr int stride = BN * D;
-  constexpr int blocks = 32;
+  constexpr int blocks = NBLOCKS;
 
   typedef float U;
 
@@ -624,6 +647,268 @@ template <typename T, int D>
     }
   }
 }
+
+// ============ "sdpa_vector_full_dot" — eliminates simd_sum for score computation
+//
+// Each of 32 threads (1 simdgroup) handles one KV token per step, computing the
+// FULL Q·K dot product without cross-lane simd_sum.  Reduces SIMD reduction ops
+// from O(N) to O(N/32) compared to sdpa_vector.
+//
+// Grid: {1, n_q_heads, 1}  Threadgroup: {32, 1, 1}  SMEM: D * sizeof(float)
+
+template <typename T, int D>
+[[kernel]] void sdpa_vector_full_dot(
+    const device T*    queries  [[buffer(0)]],
+    const device T*    keys     [[buffer(1)]],
+    const device T*    values   [[buffer(2)]],
+    device T*          out      [[buffer(3)]],
+    const constant int& gqa_factor,
+    const constant int& N,
+    const constant size_t& k_stride,
+    const constant size_t& v_stride,
+    const constant float& scale,
+    const constant float& softcapping,
+    threadgroup float* sq  [[threadgroup(0)]],
+    uint3  tid    [[threadgroup_position_in_grid]],
+    ushort tiisg  [[thread_index_in_simdgroup]]) {
+
+  constexpr int C   = 32;
+  constexpr int EPT = D / C;
+
+  const int head_idx    = tid.y;
+  const int kv_head_idx = head_idx / gqa_factor;
+
+  device const T* Qptr = queries + head_idx    * D;
+  device const T* Kptr = keys    + kv_head_idx * (int)k_stride;
+  device const T* Vptr = values  + kv_head_idx * (int)v_stride;
+  device       T* Optr = out     + head_idx    * D;
+
+  for (short i = tiisg; i < D; i += C) {
+    sq[i] = scale * (float)Qptr[i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  float o[EPT];
+  for (int d = 0; d < EPT; d++) o[d] = 0.0f;
+  float M = -INFINITY;
+  float S = 0.0f;
+
+  for (int ic = 0; ic < N; ic += C) {
+    const int tok = ic + tiisg;
+
+    float score = 0.0f;
+    if (tok < N) {
+      device const T* krow = Kptr + tok * D;
+      _Pragma("clang loop unroll(full)")
+      for (short d = 0; d < D; d++) {
+        score += sq[d] * (float)krow[d];
+      }
+      if (softcapping != 1.f) score = precise::tanh(score) * softcapping;
+    } else {
+      score = -INFINITY;
+    }
+
+    float new_M  = max(M, simd_max(score));
+    float fac    = fast::exp(M - new_M);
+    float exp_sc = (tok < N) ? fast::exp(score - new_M) : 0.0f;
+    float tile_S = simd_sum(exp_sc);
+
+    _Pragma("clang loop unroll(full)")
+    for (int d = 0; d < EPT; d++) o[d] *= fac;
+    M = new_M;
+    S = S * fac + tile_S;
+
+    _Pragma("clang loop unroll(full)")
+    for (short j = 0; j < C; j++) {
+      int tok_j = ic + j;
+      if (tok_j < N) {
+        float e_j = simd_shuffle(exp_sc, j);
+        device const T* vrow = Vptr + tok_j * D + tiisg * EPT;
+        _Pragma("clang loop unroll(full)")
+        for (int d = 0; d < EPT; d++) {
+          o[d] += e_j * (float)vrow[d];
+        }
+      }
+    }
+  }
+
+  _Pragma("clang loop unroll(full)")
+  for (int d = 0; d < EPT; d++) {
+    Optr[tiisg * EPT + d] = (T)(o[d] / S);
+  }
+}
+
+#define instantiate_sdpa_vector_full_dot(type, head_dim) \
+  template [[host_name("sdpa_vector_full_dot_" #type "_" #head_dim)]] \
+  [[kernel]] void sdpa_vector_full_dot<type, head_dim>( \
+      const device type*    queries  [[buffer(0)]], \
+      const device type*    keys     [[buffer(1)]], \
+      const device type*    values   [[buffer(2)]], \
+      device type*          out      [[buffer(3)]], \
+      const constant int&   gqa_factor, \
+      const constant int&   N, \
+      const constant size_t& k_stride, \
+      const constant size_t& v_stride, \
+      const constant float& scale, \
+      const constant float& softcapping, \
+      threadgroup float* sq [[threadgroup(0)]], \
+      uint3  tid    [[threadgroup_position_in_grid]], \
+      ushort tiisg  [[thread_index_in_simdgroup]]);
+
+instantiate_sdpa_vector_full_dot(bfloat16_t, 256)
+instantiate_sdpa_vector_full_dot(bfloat16_t, 512)
+
+// ============ "sdpa_vector_flash" — vectorized single-token flash attention
+//
+// Port of llama.cpp's kernel_flash_attn_ext_vec for the single-token decode path.
+// Key improvements over sdpa_vector:
+//   - Each lane handles ONE full KV token simultaneously (32 tokens per step)
+//   - Q is loaded to SMEM once; K/V use vectorized bfloat4 loads
+//   - No cross-lane simd_sum for Q·K — each lane computes the full dot product
+//     using dot(bfloat4, bfloat4) hardware instructions
+//
+// Template params: T=bfloat16_t, D=head_dim (256 or 512)
+// Grid: {1, n_q_heads, 1}  — one threadgroup per Q-head
+// Threadgroup: {32, 1, 1} = 32 threads = 1 simdgroup
+// SMEM: D * sizeof(float) for Q cache + 32 floats for score reduction
+//
+// Each thread (lane `tiisg`) in the single simdgroup:
+//   - Handles KV token index `tiisg` within the current C=32-token tile
+//   - Computes Q·K[tiisg] as dot products of bfloat4 vectors
+//   - Accumulates V[tiisg] weighted by softmax
+
+template <typename T, int D>
+[[kernel]] void sdpa_vector_flash(
+    const device T*    queries  [[buffer(0)]],
+    const device T*    keys     [[buffer(1)]],
+    const device T*    values   [[buffer(2)]],
+    device T*          out      [[buffer(3)]],
+    const constant int& gqa_factor,
+    const constant int& N,
+    const constant size_t& k_stride,
+    const constant size_t& v_stride,
+    const constant float& scale,
+    const constant float& softcapping,
+    threadgroup float* shmem    [[threadgroup(0)]],
+    uint3  tid    [[threadgroup_position_in_grid]],
+    ushort tiisg  [[thread_index_in_simdgroup]]) {
+
+  // SMEM layout: [D floats for Q] + [32 floats for score buffer]
+  threadgroup float* sq = shmem;               // Q cache: D floats
+  threadgroup float* ss = shmem + D;           // score buffer: 32 floats
+
+  const int head_idx    = tid.y;
+  const int kv_head_idx = head_idx / gqa_factor;
+
+  // Vectorized pointers (bfloat4 = 4 x bfloat16_t = 8 bytes)
+  constexpr int D4 = D / 4;                    // number of bfloat4 per row
+
+  device const T*     Qptr = queries + head_idx * D;
+  device const T*     Kptr = keys    + kv_head_idx * (int)k_stride;
+  device const T*     Vptr = values  + kv_head_idx * (int)v_stride;
+  device       T*     Optr = out     + head_idx * D;
+
+  // Load Q into SMEM cooperatively (32 lanes, each loads D/32 = 8 elements).
+  // Q stays in SMEM for the entire KV scan — avoids re-reading from global.
+  for (short i = tiisg; i < D; i += 32) {
+    sq[i] = scale * (float)Qptr[i];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Softmax state
+  float M = -INFINITY;
+  float S = 0.0f;
+
+  // Output accumulator: D floats distributed across 32 lanes (D/32 = 8 per lane)
+  constexpr int EPT = D / 32;
+  float o[EPT];
+  for (int i = 0; i < EPT; i++) o[i] = 0.0f;
+
+  // Scan KV in tiles of C=32 tokens (one token per lane).
+  for (int ic = 0; ic < N; ic += 32) {
+    const int tok = ic + tiisg;          // this lane's KV token index
+
+    float qk = 0.0f;
+
+    if (tok < N) {
+      // Q·K dot product: lane `tiisg` computes the full dot product for token `tok`
+      // using float arithmetic (Q is already F32 in SMEM, K is read as T→float).
+      device const T* krow = Kptr + tok * D;
+      for (short j = 0; j < D; j++) {
+        qk += sq[j] * (float)krow[j];
+      }
+      if (softcapping != 1.f) qk = precise::tanh(qk) * softcapping;
+    } else {
+      qk = -INFINITY;
+    }
+
+    // Store scores to SMEM for online softmax across the tile.
+    ss[tiisg] = qk;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Online softmax: compute new global max and unnormalized exp scores for this tile.
+    float tile_M = -INFINITY;
+    _Pragma("clang loop unroll(full)")
+    for (short j = 0; j < 32; j++) {
+      tile_M = max(tile_M, ss[j]);
+    }
+    float new_M = max(M, tile_M);
+    float fac   = fast::exp(M - new_M);    // rescale previous accumulation
+
+    // Rescale previous output with fac.
+    _Pragma("clang loop unroll(full)")
+    for (int d = 0; d < EPT; d++) {
+      o[d] *= fac;
+    }
+
+    // Compute per-token exp scores and accumulate V.
+    float new_S = S * fac;
+    _Pragma("clang loop unroll(full)")
+    for (short j = 0; j < 32; j++) {
+      int tok_j = ic + j;
+      float e = (tok_j < N) ? fast::exp(ss[j] - new_M) : 0.0f;
+      new_S += e;
+      if (tok_j < N) {
+        // Lane `tiisg` handles output dimensions [tiisg*EPT, (tiisg+1)*EPT).
+        device const T* vrow = Vptr + tok_j * D + tiisg * EPT;
+        _Pragma("clang loop unroll(full)")
+        for (int d = 0; d < EPT; d++) {
+          o[d] += e * (float)vrow[d];
+        }
+      }
+    }
+
+    M = new_M;
+    S = new_S;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // Normalize and write output.
+  for (int d = 0; d < EPT; d++) {
+    Optr[tiisg * EPT + d] = (T)(o[d] / S);
+  }
+}
+
+#define instantiate_sdpa_vector_flash(type, head_dim) \
+  template [[host_name("sdpa_vector_flash_" #type "_" #head_dim)]] \
+  [[kernel]] void sdpa_vector_flash<type, head_dim>( \
+      const device type*    queries  [[buffer(0)]], \
+      const device type*    keys     [[buffer(1)]], \
+      const device type*    values   [[buffer(2)]], \
+      device type*          out      [[buffer(3)]], \
+      const constant int&   gqa_factor, \
+      const constant int&   N, \
+      const constant size_t& k_stride, \
+      const constant size_t& v_stride, \
+      const constant float& scale, \
+      const constant float& softcapping, \
+      threadgroup float* shmem [[threadgroup(0)]], \
+      uint3  tid    [[threadgroup_position_in_grid]], \
+      ushort tiisg  [[thread_index_in_simdgroup]]);
+
+instantiate_sdpa_vector_flash(bfloat16_t, 256)
+instantiate_sdpa_vector_flash(bfloat16_t, 512)
 
 // ============ "mlx/backend/metal/kernels/utils.h"
 
@@ -2385,4 +2670,666 @@ instantiate_attn_mask_helper(float32, float);
 instantiate_sdpa_vector_heads(float)
 instantiate_sdpa_vector_heads(bfloat16_t)
 instantiate_sdpa_vector_heads(float16_t)
+
+// NBLOCKS=8 variant for shorter sequences (N<=512): each block handles 64 tokens
+// → 8 simdgroups × 8 iterations = good GPU utilization, fewer waves than NBLOCKS=32.
+template [[host_name("sdpa_vector_2pass_1_nb8_bfloat16_t_256")]]
+[[kernel]] void sdpa_vector_2pass_1<bfloat16_t, 256, 8>(
+    const device bfloat16_t* queries [[buffer(0)]],
+    const device bfloat16_t* keys [[buffer(1)]],
+    const device bfloat16_t* values [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    device float* sums [[buffer(4)]],
+    device float* maxs [[buffer(5)]],
+    const constant int& gqa_factor,
+    const constant int& N,
+    const constant size_t& k_stride,
+    const constant size_t& v_stride,
+    const constant float& scale,
+    const constant float& softcapping,
+    const device bool* mask [[function_constant(sdpa_vector_has_mask)]],
+    const constant int& mask_seq_stride [[function_constant(sdpa_vector_has_mask)]],
+    const constant int& mask_head_stride [[function_constant(sdpa_vector_has_mask)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]);
+
+template [[host_name("sdpa_vector_2pass_1_nb8_bfloat16_t_512")]]
+[[kernel]] void sdpa_vector_2pass_1<bfloat16_t, 512, 8>(
+    const device bfloat16_t* queries [[buffer(0)]],
+    const device bfloat16_t* keys [[buffer(1)]],
+    const device bfloat16_t* values [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    device float* sums [[buffer(4)]],
+    device float* maxs [[buffer(5)]],
+    const constant int& gqa_factor,
+    const constant int& N,
+    const constant size_t& k_stride,
+    const constant size_t& v_stride,
+    const constant float& scale,
+    const constant float& softcapping,
+    const device bool* mask [[function_constant(sdpa_vector_has_mask)]],
+    const constant int& mask_seq_stride [[function_constant(sdpa_vector_has_mask)]],
+    const constant int& mask_head_stride [[function_constant(sdpa_vector_has_mask)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]);
+
+// 2-pass pass-1 with BN=1 (1 simdgroup per threadgroup): no intra-block barriers.
+// This matches llama.cpp's flash_attn_ext_vec architecture with NSG=1:
+// 8 Q-heads * 32 blocks * 32 threads = 8192 total threads = 1 GPU wave.
+// Eliminates ALL intra-threadgroup synchronization overhead.
+template <typename T, int D, int NBLOCKS = 32>
+[[kernel]] void sdpa_vector_2pass_1_bn1(
+    const device T* queries [[buffer(0)]],
+    const device T* keys [[buffer(1)]],
+    const device T* values [[buffer(2)]],
+    device float* out [[buffer(3)]],
+    device float* sums [[buffer(4)]],
+    device float* maxs [[buffer(5)]],
+    const constant int& gqa_factor,
+    const constant int& N,
+    const constant size_t& k_stride,
+    const constant size_t& v_stride,
+    const constant float& scale,
+    const constant float& softcapping,
+    const device bool* mask [[function_constant(sdpa_vector_has_mask)]],
+    const constant int& mask_seq_stride [[function_constant(sdpa_vector_has_mask)]],
+    const constant int& mask_head_stride [[function_constant(sdpa_vector_has_mask)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint simd_gid [[simdgroup_index_in_threadgroup]],
+    uint simd_lid [[thread_index_in_simdgroup]]) {
+
+  // BN=1: single simdgroup per threadgroup — no cross-simdgroup reduction.
+  constexpr int BD = 32;
+  constexpr int elem_per_thread = D / BD;
+  constexpr int stride = D;  // BN=1
+
+  typedef float U;
+  thread U q[elem_per_thread];
+  thread U o[elem_per_thread];
+
+  const int block_idx = tid.z;
+  const int head_idx = tid.y;
+  const int kv_head_idx = head_idx / gqa_factor;
+
+  queries += head_idx * D + simd_lid * elem_per_thread;
+  keys    += kv_head_idx * k_stride + block_idx * D + simd_lid * elem_per_thread;
+  values  += kv_head_idx * v_stride + block_idx * D + simd_lid * elem_per_thread;
+  if (sdpa_vector_has_mask) {
+    mask += head_idx * mask_head_stride + block_idx * mask_seq_stride;
+  }
+  out  += head_idx * NBLOCKS * D + block_idx * D + simd_lid * elem_per_thread;
+  sums += head_idx * NBLOCKS + block_idx;
+  maxs += head_idx * NBLOCKS + block_idx;
+
+  // Load Q (vectorized bfloat4)
+  {
+    typedef __attribute__((ext_vector_type(4))) T T4;
+    device const T4* qv4 = (device const T4*)queries;
+    _Pragma("clang loop unroll(full)")
+    for (short j = 0; j < elem_per_thread/4; j++) {
+      float4 qf = (float4)qv4[j] * scale;
+      q[4*j+0]=qf[0]; q[4*j+1]=qf[1]; q[4*j+2]=qf[2]; q[4*j+3]=qf[3];
+    }
+  }
+  _Pragma("clang loop unroll(full)")
+  for (int i = 0; i < elem_per_thread; i++) o[i] = 0;
+
+  U max_score = -1e9;
+  U sum_exp_score = 0;
+
+  // Process tokens: this block handles tokens {block_idx, block_idx+NBLOCKS, ...}
+  for (int i = block_idx; i < N; i += NBLOCKS) {
+    if (!sdpa_vector_has_mask || mask[0]) {
+      // Q·K with vectorized reads
+      U score = 0;
+      {
+        typedef __attribute__((ext_vector_type(4))) T T4;
+        device const T4* kv4 = (device const T4*)keys;
+        _Pragma("clang loop unroll(full)")
+        for (short j = 0; j < elem_per_thread/4; j++) {
+          float4 kf = (float4)kv4[j];
+          score += dot(kf, float4(q[4*j], q[4*j+1], q[4*j+2], q[4*j+3]));
+        }
+      }
+      score = simd_sum(score);
+      if (softcapping != 1.) { score = precise::tanh(score) * softcapping; }
+
+      U new_max = max(max_score, score);
+      U factor = fast::exp(max_score - new_max);
+      U exp_score = fast::exp(score - new_max);
+      max_score = new_max;
+      sum_exp_score = sum_exp_score * factor + exp_score;
+
+      // V accumulation (vectorized)
+      {
+        typedef __attribute__((ext_vector_type(4))) T T4;
+        device const T4* vv4 = (device const T4*)values;
+        _Pragma("clang loop unroll(full)")
+        for (short j = 0; j < elem_per_thread/4; j++) {
+          float4 vf = (float4)vv4[j];
+          o[4*j+0]=o[4*j+0]*factor+exp_score*vf[0];
+          o[4*j+1]=o[4*j+1]*factor+exp_score*vf[1];
+          o[4*j+2]=o[4*j+2]*factor+exp_score*vf[2];
+          o[4*j+3]=o[4*j+3]*factor+exp_score*vf[3];
+        }
+      }
+    }
+    keys   += NBLOCKS * stride;
+    values += NBLOCKS * stride;
+    if (sdpa_vector_has_mask) mask += NBLOCKS * mask_seq_stride;
+  }
+
+  // Write directly — NO SMEM, NO BARRIERS (BN=1, single simdgroup).
+  // Pass-2 will normalize by sum_exp_score.
+  _Pragma("clang loop unroll(full)")
+  for (int i = 0; i < elem_per_thread; i++) {
+    out[i] = o[i];
+  }
+  if (simd_lid == 0) {
+    sums[0] = sum_exp_score;
+    maxs[0] = max_score;
+  }
+}
+
+#define instantiate_sdpa_2pass_bn1(type, head_dim, nblocks)                        template [[host_name("sdpa_vector_2pass_1_bn1_" #type "_" #head_dim "_nb" #nblocks)]]   [[kernel]] void sdpa_vector_2pass_1_bn1<type, head_dim, nblocks>(                    const device type* queries [[buffer(0)]],                                        const device type* keys [[buffer(1)]],                                           const device type* values [[buffer(2)]],                                         device float* out [[buffer(3)]],                                                 device float* sums [[buffer(4)]],                                                device float* maxs [[buffer(5)]],                                                const constant int& gqa_factor,                                                  const constant int& N,                                                           const constant size_t& k_stride,                                                 const constant size_t& v_stride,                                                 const constant float& scale,                                                     const constant float& softcapping,                                               const device bool* mask [[function_constant(sdpa_vector_has_mask)]],                      const constant int& mask_seq_stride [[function_constant(sdpa_vector_has_mask)]],          const constant int& mask_head_stride [[function_constant(sdpa_vector_has_mask)]],         uint3 tid [[threadgroup_position_in_grid]],                                      uint simd_gid [[simdgroup_index_in_threadgroup]],                                uint simd_lid [[thread_index_in_simdgroup]]);
+
+// BF16, head_dim=256/512, NBLOCKS=32: matches llama.cpp flash_attn_ext_vec timing
+instantiate_sdpa_2pass_bn1(bfloat16_t, 256, 32)
+instantiate_sdpa_2pass_bn1(bfloat16_t, 512, 32)
+
+// ============ GQA-fused 2-pass SDPA ===========================================
+//
+// Standard sdpa_vector dispatches one threadgroup per query head.  With GQA
+// factor=GF, GF threadgroups read the same KV head's data from device memory
+// independently — GF× bandwidth waste for K.
+//
+// This 2-pass variant dispatches one threadgroup per KV head per block, so
+// the SMEM K tile is loaded once and shared across all GF query heads.
+//
+// Pass 1 — sdpa_vector_gqa_p1:
+//   Grid:       { width=1, height=n_kv_heads, depth=NBLOCKS }
+//   Threadgroup: GF * BN * BD = 8 * 4 * 32 = 1024 threads  (BN=4 simdgroups/Q-head)
+//   SMEM:       BN * D * 4 = 4*256*4 = 4 KB for K tile
+//               + GF*BN*BD*4 = 8*4*32*4 = 4 KB for output staging
+//               + GF*BN*4*2 = 256 B for max/sum  →  ~8 KB total  (fits in 32 KB)
+//
+//   Each (kv_head, block_idx) threadgroup processes N/NBLOCKS tokens.
+//   Within the threadgroup: gf ∈ [0,GF) selects the query head;
+//   local_sg ∈ [0,BN) is the simdgroup within that Q-head's token window.
+//
+//   K is loaded into SMEM once per BN-token tile (by the first Q-head's simdgroups),
+//   then all GF Q-heads read from SMEM — GF× less K device reads per tile.
+//
+//   Writes:
+//     partials[n_q_heads, NBLOCKS, D] — F32 partial output per block per q-head
+//     sums    [n_q_heads, NBLOCKS]    — F32 sum_exp per block
+//     maxs    [n_q_heads, NBLOCKS]    — F32 max_score per block
+//
+// Pass 2 — reuses the existing sdpa_vector_2pass_2 kernel unchanged.
+
+template <typename T, int D, int GF, int BN, int NBLOCKS>
+[[kernel]] void sdpa_vector_gqa_p1(
+    const device T*    queries  [[buffer(0)]],  // [n_q_heads, D]
+    const device T*    keys     [[buffer(1)]],  // [n_kv_heads, N, D]
+    const device T*    values   [[buffer(2)]],  // [n_kv_heads, N, D]
+    device float*      partials [[buffer(3)]],  // [n_q_heads, NBLOCKS, D]
+    device float*      sums     [[buffer(4)]],  // [n_q_heads, NBLOCKS]
+    device float*      maxs     [[buffer(5)]],  // [n_q_heads, NBLOCKS]
+    const constant int& N,
+    const constant size_t& k_stride,            // elements per KV head = N*D
+    const constant size_t& v_stride,
+    const constant float& scale,
+    const constant float& softcapping,
+    uint3 tid   [[threadgroup_position_in_grid]],
+    uint  tid_x [[thread_index_in_threadgroup]]) {
+
+  // ── Constants ─────────────────────────────────────────────────────────────
+  constexpr int BD  = 32;             // simd width
+  constexpr int EPT = D / BD;         // elements per thread (D=256 → 8)
+  typedef float U;
+
+  // ── Thread decomposition ──────────────────────────────────────────────────
+  // Total threads = GF * BN * BD.
+  // gf        ∈ [0, GF)  — which Q-head within the KV group
+  // local_sg  ∈ [0, BN)  — simdgroup within this Q-head's token window
+  // simd_lid  ∈ [0, BD)  — lane within the simdgroup
+  const int gf        = (int)tid_x / (BN * BD);
+  const int local_sg  = ((int)tid_x / BD) % BN;
+  const int simd_lid  = (int)tid_x % BD;
+  const int kv_head   = (int)tid.y;
+  const int block_idx = (int)tid.z;
+  const int q_head    = kv_head * GF + gf;
+
+  // ── Threadgroup memory ────────────────────────────────────────────────────
+  // K tile: BN tokens × D dims.  Loaded once by gf=0, reused by all GF Q-heads.
+  // Size: BN * D * 4 = 4*256*4 = 4 KB.
+  threadgroup U k_tile[BN * D];
+
+  // Per-(gf, local_sg) max/sum for cross-simdgroup reduction.
+  // Size: GF * BN * 4 * 2 = 8*4*4*2 = 256 bytes.
+  threadgroup U tg_max[GF * BN];
+  threadgroup U tg_sum[GF * BN];
+
+  // Per-(gf, local_sg) partial output staging for cross-simdgroup sum.
+  // Indexed [gf * BN * BD + local_sg * BD + simd_lid].
+  // Size: GF * BN * BD * 4 = 8*4*32*4 = 4 KB.
+  threadgroup U tg_out[GF * BN * BD];
+
+  // ── Registers ─────────────────────────────────────────────────────────────
+  thread U q[EPT];
+  thread U o[EPT];
+  U max_score = -1e9f;
+  U sum_exp   = 0.0f;
+
+  // Load Q for this Q-head.
+  const device T* Qp = queries + q_head * D + simd_lid * EPT;
+  for (int i = 0; i < EPT; i++) q[i] = (U)scale * (U)Qp[i];
+  for (int i = 0; i < EPT; i++) o[i] = 0.0f;
+
+  // K/V pointers for this (kv_head, block, local_sg).
+  // This simdgroup processes tokens: block_idx*BN + local_sg, +NBLOCKS*BN, +2*NBLOCKS*BN, ...
+  const device T* K = keys   + kv_head * (int)k_stride
+                    + (block_idx * BN + local_sg) * D + simd_lid * EPT;
+  const device T* V = values + kv_head * (int)v_stride
+                    + (block_idx * BN + local_sg) * D + simd_lid * EPT;
+  constexpr int K_stride_block = NBLOCKS * BN * D;
+
+  // ── Main loop: process token tiles ───────────────────────────────────────
+  for (int i = block_idx * BN + local_sg; i < N; i += NBLOCKS * BN) {
+    // Load K[local_sg] into k_tile[local_sg * D] — only gf=0 loads to avoid
+    // races (all gf have the same local_sg → same k_tile slot).
+    if (gf == 0) {
+      for (int j = 0; j < EPT; j++) {
+        k_tile[local_sg * D + simd_lid * EPT + j] = (U)K[j];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // All GF Q-heads compute their dot product against the shared K tile.
+    U score = 0.0f;
+    for (int j = 0; j < EPT; j++) {
+      score += q[j] * k_tile[local_sg * D + simd_lid * EPT + j];
+    }
+    score = simd_sum(score);
+    if (softcapping != 1.0f) score = precise::tanh(score) * softcapping;
+
+    U new_max = max(max_score, score);
+    U fac     = fast::exp(max_score - new_max);
+    U exp_sc  = fast::exp(score - new_max);
+    max_score = new_max;
+    sum_exp   = sum_exp * fac + exp_sc;
+
+    for (int j = 0; j < EPT; j++) o[j] = o[j] * fac + exp_sc * (U)V[j];
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    K += K_stride_block;
+    V += K_stride_block;
+  }
+
+  // ── Cross-simdgroup reduction within each Q-head ──────────────────────────
+  const int red_idx = gf * BN + local_sg;
+  if (simd_lid == 0) {
+    tg_max[red_idx] = max_score;
+    tg_sum[red_idx] = sum_exp;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // Find global max/sum for this Q-head across its BN simdgroups.
+  U g_max = -1e9f;
+  for (int s = 0; s < BN; s++) g_max = max(g_max, tg_max[gf * BN + s]);
+  U g_sum = 0.0f;
+  for (int s = 0; s < BN; s++) {
+    g_sum += tg_sum[gf * BN + s] * fast::exp(tg_max[gf * BN + s] - g_max);
+  }
+
+  // Scale this simdgroup's partial output and stage it in tg_out.
+  U local_fac = fast::exp(max_score - g_max);
+
+  // Stage partial outputs for the BN-simdgroup sum.
+  // Each Q-head (gf) has its own slice: tg_out[gf * BN * BD + local_sg * BD + lane].
+  // We iterate EPT elements, storing/summing one element at a time.
+  device float* part_out = partials + q_head * NBLOCKS * D + block_idx * D + simd_lid * EPT;
+
+  for (int i = 0; i < EPT; i++) {
+    // Each gf's simdgroup writes its scaled partial.
+    tg_out[gf * BN * BD + local_sg * BD + simd_lid] = o[i] * local_fac;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Only local_sg=0 reduces and writes to device memory.
+    if (local_sg == 0) {
+      U acc = 0.0f;
+      for (int s = 0; s < BN; s++) {
+        acc += tg_out[gf * BN * BD + s * BD + simd_lid];
+      }
+      part_out[i] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Advance o[] pointer (we process EPT elements one at a time).
+    // o[i] was already used above; shift what we're staging.
+  }
+
+  // Write global max and sum for this (q_head, block).
+  if (local_sg == 0 && simd_lid == 0) {
+    sums[q_head * NBLOCKS + block_idx] = g_sum;
+    maxs[q_head * NBLOCKS + block_idx] = g_max;
+  }
+}
+
+#define instantiate_sdpa_vector_gqa_p1(type, head_dim, gqa_factor, bn, nblocks)          \
+  template [[host_name("sdpa_vector_gqa_p1_" #type "_" #head_dim "_gf" #gqa_factor "_bn" #bn "_nb" #nblocks)]] \
+  [[kernel]] void sdpa_vector_gqa_p1<type, head_dim, gqa_factor, bn, nblocks>(           \
+      const device type*  queries  [[buffer(0)]],                                         \
+      const device type*  keys     [[buffer(1)]],                                         \
+      const device type*  values   [[buffer(2)]],                                         \
+      device float*       partials [[buffer(3)]],                                         \
+      device float*       sums     [[buffer(4)]],                                         \
+      device float*       maxs     [[buffer(5)]],                                         \
+      const constant int& N,                                                              \
+      const constant size_t& k_stride,                                                    \
+      const constant size_t& v_stride,                                                    \
+      const constant float& scale,                                                        \
+      const constant float& softcapping,                                                   \
+      uint3 tid   [[threadgroup_position_in_grid]],                                       \
+      uint  tid_x [[thread_index_in_threadgroup]]);
+
+// GF=8, head_dim=256 (E2B: gqa_factor=8): 8*4*32=1024 threads, ~8.4KB SMEM
+instantiate_sdpa_vector_gqa_p1(bfloat16_t, 256, 8, 4, 32)
+// GF=4, head_dim=256 (E4B: gqa_factor=4): 4*4*32=512 threads, ~6.3KB SMEM
+instantiate_sdpa_vector_gqa_p1(bfloat16_t, 256, 4, 4, 32)
+
+// ============ GQA single-pass SDPA ============================================
+//
+// Single-pass variant: one threadgroup per KV head, all GF Q-heads processed
+// simultaneously, final output written directly to device memory.  No separate
+// pass-2 needed.
+//
+// Grid:       { width=1, height=n_kv_heads, depth=1 }
+// Threadgroup: GF * BN * BD threads  (GF=4, BN=8, BD=32 → 1024 threads)
+// SMEM:        k_tile (BN*D*4) + tg_out (GF*BN*BD*4) + tg_max/tg_sum (GF*BN*4*2)
+//              = 8*256*4 + 4*8*32*4 + 4*8*4*2 = 8192+4096+256 = ~12.5KB ✓
+//
+// Advantage over 2-pass: only n_kv_heads dispatches (2 for E4B) vs
+// n_kv_heads + n_q_heads (2+8=10) for the 2-pass variant.
+template <typename T, int D, int GF, int BN>
+[[kernel]] void sdpa_vector_gqa_1pass(
+    const device T* queries [[buffer(0)]],  // [n_q_heads, D]
+    const device T* keys    [[buffer(1)]],  // [n_kv_heads, N, D]
+    const device T* values  [[buffer(2)]],  // [n_kv_heads, N, D]
+    device T*       out     [[buffer(3)]],  // [n_q_heads, D]
+    const constant int& N,
+    const constant size_t& k_stride,
+    const constant size_t& v_stride,
+    const constant float& scale,
+    const constant float& softcapping,
+    uint3 tid   [[threadgroup_position_in_grid]],
+    uint  tid_x [[thread_index_in_threadgroup]]) {
+
+  constexpr int BD  = 32;
+  constexpr int EPT = D / BD;
+  typedef float U;
+
+  const int gf        = (int)tid_x / (BN * BD);
+  const int local_sg  = ((int)tid_x / BD) % BN;
+  const int simd_lid  = (int)tid_x % BD;
+  const int kv_head   = (int)tid.y;
+  const int q_head    = kv_head * GF + gf;
+
+  // K tile: BN × D (loaded once by gf=0, reused by all GF Q-heads).
+  threadgroup U k_tile[BN * D];
+
+  // Per-(gf, local_sg) reduction arrays.
+  threadgroup U tg_max[GF * BN];
+  threadgroup U tg_sum[GF * BN];
+
+  // Per-(gf, local_sg) partial output, staged one element at a time.
+  threadgroup U tg_out[GF * BN * BD];  // GF*BN*BD = 4*8*32 = 1024 floats = 4 KB
+
+  thread U q[EPT];
+  thread U o[EPT];
+  U max_score = -1e9f;
+  U sum_exp   = 0.0f;
+
+  // Load Q for this Q-head.
+  const device T* Qp = queries + q_head * D + simd_lid * EPT;
+  for (int i = 0; i < EPT; i++) q[i] = (U)scale * (U)Qp[i];
+  for (int i = 0; i < EPT; i++) o[i] = 0.0f;
+
+  const device T* K = keys   + kv_head * (int)k_stride + local_sg * D + simd_lid * EPT;
+  const device T* V = values + kv_head * (int)v_stride + local_sg * D + simd_lid * EPT;
+  constexpr int K_stride_iter = BN * D;
+
+  for (int i = local_sg; i < N; i += BN) {
+    // gf=0 loads K tile; all GF Q-heads reuse it.
+    if (gf == 0) {
+      for (int j = 0; j < EPT; j++) {
+        k_tile[local_sg * D + simd_lid * EPT + j] = (U)K[j];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    U score = 0.0f;
+    for (int j = 0; j < EPT; j++) {
+      score += q[j] * k_tile[local_sg * D + simd_lid * EPT + j];
+    }
+    score = simd_sum(score);
+    if (softcapping != 1.0f) score = precise::tanh(score) * softcapping;
+
+    U new_max = max(max_score, score);
+    U fac     = fast::exp(max_score - new_max);
+    U exp_sc  = fast::exp(score - new_max);
+    max_score = new_max;
+    sum_exp   = sum_exp * fac + exp_sc;
+
+    for (int j = 0; j < EPT; j++) o[j] = o[j] * fac + exp_sc * (U)V[j];
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    K += K_stride_iter;
+    V += K_stride_iter;
+  }
+
+  // Cross-simdgroup reduction within each Q-head.
+  // Use the simd_max/simd_sum pattern from sdpa_vector for the max/sum reduction,
+  // and the tg_out staging pattern for the output reduction.
+  const int red_idx = gf * BN + local_sg;
+  if (simd_lid == 0) {
+    tg_max[red_idx] = max_score;
+    tg_sum[red_idx] = sum_exp;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  // All BN simdgroups independently compute the same global max/sum for this Q-head.
+  // Each simdgroup uses simd_max/simd_sum to reduce over its 32 lanes, where lane j
+  // reads tg_max[gf * BN + j] (if j < BN) or -1e9 (if j >= BN).
+  // This mirrors the sdpa_vector reduction pattern exactly.
+  U m_val  = (simd_lid < BN) ? tg_max[gf * BN + simd_lid] : -1e9f;
+  U g_max  = simd_max(m_val);
+  U fac_m  = fast::exp(m_val - g_max);
+  U s_val  = (simd_lid < BN) ? tg_sum[gf * BN + simd_lid] : 0.0f;
+  U g_sum  = simd_sum(s_val * fac_m);
+  U local_fac = fast::exp(max_score - g_max);
+
+  // Output aggregation: stage partial outputs in tg_out, sum across BN simdgroups.
+  // All BN simdgroups write; local_sg=0 reads and writes the final output.
+  device T* Oh = out + q_head * D + simd_lid * EPT;
+
+  for (int i = 0; i < EPT; i++) {
+    tg_out[gf * BN * BD + local_sg * BD + simd_lid] = o[i] * local_fac;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (local_sg == 0) {
+      U acc = 0.0f;
+      for (int s = 0; s < BN; s++) {
+        acc += tg_out[gf * BN * BD + s * BD + simd_lid];
+      }
+      Oh[i] = (T)(acc / g_sum);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+}
+
+#define instantiate_sdpa_vector_gqa_1pass(type, head_dim, gqa_factor, bn)                    \
+  template [[host_name("sdpa_vector_gqa_1pass_" #type "_" #head_dim "_gf" #gqa_factor "_bn" #bn)]] \
+  [[kernel]] void sdpa_vector_gqa_1pass<type, head_dim, gqa_factor, bn>(                     \
+      const device type* queries [[buffer(0)]],                                               \
+      const device type* keys    [[buffer(1)]],                                               \
+      const device type* values  [[buffer(2)]],                                               \
+      device type*       out     [[buffer(3)]],                                               \
+      const constant int& N,                                                                  \
+      const constant size_t& k_stride,                                                        \
+      const constant size_t& v_stride,                                                        \
+      const constant float& scale,                                                            \
+      const constant float& softcapping,                                                       \
+      uint3 tid   [[threadgroup_position_in_grid]],                                           \
+      uint  tid_x [[thread_index_in_threadgroup]]);
+
+// E4B: GF=4, head_dim=256, BN=4: 4*4*32=512 threads, ~6.3KB SMEM
+instantiate_sdpa_vector_gqa_1pass(bfloat16_t, 256, 4, 4)
+// BN=2 variants for correctness testing
+instantiate_sdpa_vector_gqa_1pass(bfloat16_t, 256, 4, 2)
+instantiate_sdpa_vector_gqa_1pass(bfloat16_t, 256, 8, 2)
+// E2B: GF=8, head_dim=256, BN=4: 8*4*32=1024 threads, ~8.4KB SMEM
+instantiate_sdpa_vector_gqa_1pass(bfloat16_t, 256, 8, 4)
+
     // clang-format on
+// ============ flash_attn_ext_vec — port of llama.cpp's nwg=32 parallel SDPA
+//
+// For BF16 + head_dim=256, single-token decode:
+//   Grid:  (1, n_q_heads, NWG=32)   TG: (32, 1, 1)   SMEM: 1792 bytes
+//
+// Main kernel: 32 workgroups each handle N/32 KV tokens independently.
+// Q in SMEM (256 halves). K/V read from device per-iteration.
+// Writes partial outputs to tmp buffer.
+//
+// Reduce kernel: combines 32 partial outputs with online-softmax normalization.
+
+// flash_attn_ext_vec_bf16_256_main: 32 workgroups, each handling N/32 KV tokens.
+// Computes Q·K using same 8-MAC + simd_sum approach as sdpa_vector (correct, fast).
+// Key difference from sdpa_vector: 32× more independent threadgroups = better GPU util.
+// No cross-simdgroup barrier at end = eliminates 32-simdgroup reduction overhead.
+//
+// Grid: (1, n_q_heads, 32)  TG: (32, 1, 1)  SMEM: (256+32+256) floats = 2176B
+[[host_name("flash_attn_ext_vec_bf16_256_main")]]
+kernel void flash_attn_ext_vec_bf16_256_main(
+    const device bfloat16_t * Q_dev     [[buffer(0)]],
+    const device bfloat16_t * K_dev     [[buffer(1)]],
+    const device bfloat16_t * V_dev     [[buffer(2)]],
+    device float             * tmp      [[buffer(3)]],
+    const constant int        & N       [[buffer(4)]],
+    const constant size_t     & k_stride [[buffer(5)]],
+    const constant size_t     & v_stride [[buffer(6)]],
+    const constant float      & scale   [[buffer(7)]],
+    const constant int        & gqa_factor [[buffer(8)]],
+    threadgroup float         * shmem   [[threadgroup(0)]],
+    uint3   tgpig [[threadgroup_position_in_grid]],
+    ushort  tiisg [[thread_index_in_simdgroup]]) {
+
+    const int iwg     = (int)tgpig[2];
+    const int q_head  = (int)tgpig[1];
+    const int kv_head = q_head / gqa_factor;
+
+    // SMEM: sq[256 floats] + ss[32 floats] + so[256 floats] = 544 floats = 2176B
+    threadgroup float * sq = shmem;
+    threadgroup float * ss = shmem + 256;
+    threadgroup float * so = shmem + 256 + 32;
+
+    // Load Q into SMEM as F32 (scaled). 32 lanes × 8 elements each = 256 total.
+    const device bfloat16_t * Qptr = Q_dev + q_head * 256;
+    _Pragma("clang loop unroll(full)")
+    for (short i = 0; i < 8; i++) {
+        sq[tiisg * 8 + i] = scale * (float)Qptr[tiisg * 8 + i];
+    }
+    _Pragma("clang loop unroll(full)")
+    for (short i = 0; i < 8; i++) {
+        so[tiisg * 8 + i] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float S = 0.0f;
+    float M = -INFINITY;
+
+    const device bfloat16_t * Kptr = K_dev + kv_head * (int)k_stride;
+    const device bfloat16_t * Vptr = V_dev + kv_head * (int)v_stride;
+
+    // This workgroup handles tokens: iwg, iwg+NWG, iwg+2*NWG, ...
+    // NWG=32 workgroups divide the N tokens: workgroup j handles tokens j, j+32, j+64, ...
+    // For N=512: each workgroup processes 512/32=16 tokens. All 32 lanes work on each token.
+    // This matches sdpa_vector exactly but with 32× more independent threadgroups.
+    for (int i = iwg; i < N; i += 32) {  // stride = NWG = 32
+        // All 32 lanes work on the SAME token `i`, each handling 8 of 256 dims.
+        const device bfloat16_t * krow = Kptr + i * 256 + tiisg * 8;
+
+        // Q·K partial dot (8 MACs per lane, same as sdpa_vector)
+        float qk_part = 0.0f;
+        _Pragma("clang loop unroll(full)")
+        for (short d = 0; d < 8; d++) {
+            qk_part += sq[tiisg * 8 + d] * (float)krow[d];
+        }
+        // Complete dot via simd_sum (identical to sdpa_vector)
+        float qk = simd_sum(qk_part);
+
+        // Online softmax update (single token per step)
+        float new_M = max(M, qk);
+        float fac   = fast::exp(M - new_M);
+        float exp_q = fast::exp(qk - new_M);
+        M = new_M;
+        S = S * fac + exp_q;
+
+        // Rescale output and accumulate V (same as sdpa_vector's per-token update)
+        _Pragma("clang loop unroll(full)")
+        for (short d = 0; d < 8; d++) {
+            so[tiisg * 8 + d] = so[tiisg * 8 + d] * fac
+                + exp_q * (float)(Vptr + i * 256 + tiisg * 8)[d];
+        }
+    }
+
+    // Write partial results to tmp buffer
+    const int base = q_head * 32 * 258 + iwg * 258;
+    device float * out_p = tmp + base;
+    _Pragma("clang loop unroll(full)")
+    for (short d = 0; d < 8; d++) {
+        out_p[tiisg * 8 + d] = so[tiisg * 8 + d];
+    }
+    if (tiisg == 0) {
+        out_p[256] = S;
+        out_p[257] = M;
+    }
+}
+
+
+[[host_name("flash_attn_ext_vec_bf16_256_reduce")]]
+kernel void flash_attn_ext_vec_bf16_256_reduce(
+    const device float       * tmp    [[buffer(0)]],
+    device bfloat16_t        * dst    [[buffer(1)]],
+    uint   tgpig [[threadgroup_position_in_grid]],
+    ushort tiisg [[thread_index_in_simdgroup]]) {
+
+    // 32 threads (1 simdgroup). Thread tiisg = workgroup tiisg.
+    // For each output dim d (0..255): simd_sum across 32 lanes gives the
+    // weighted partial sum from all 32 workgroups at that dim.
+    const int q_head = (int)tgpig;
+    const int base_wg = q_head * 32 * 258 + tiisg * 258;  // tiisg = workgroup id
+
+    const float S_wg = tmp[base_wg + 256];
+    const float M_wg = tmp[base_wg + 257];
+
+    // Global max/sum across all 32 workgroups (32 lanes, one per workgroup)
+    const float M_global = simd_max(M_wg);
+    const float fac_wg   = fast::exp(M_wg - M_global);
+    const float S_total  = simd_sum(S_wg * fac_wg);
+    const float inv_S    = (S_total > 0.0f) ? (1.0f / S_total) : 0.0f;
+
+    // For each output dim, lane tiisg contributes its workgroup's partial.
+    // simd_sum aggregates across all 32 workgroups.
+    device bfloat16_t * out_ptr = dst + q_head * 256;
+    _Pragma("clang loop unroll(full)")
+    for (short d = 0; d < 256; d++) {
+        // Lane tiisg (= workgroup tiisg) reads dim d from its workgroup's partial
+        float val = simd_sum(tmp[base_wg + d] * fac_wg);
+        if (tiisg == 0) {
+            out_ptr[d] = (bfloat16_t)(val * inv_S);
+        }
+    }
+}

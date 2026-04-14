@@ -148,10 +148,15 @@ pub fn call_last_softmax(
         depth: 1,
     };
 
-    let width = std::cmp::min(
-        pipeline.max_total_threads_per_threadgroup(),
-        (work_per_threadgroup / 2).next_power_of_two(),
-    );
+    // Match llama.cpp's RMSNorm threadgroup sizing: start at 32, double while
+    // smaller than work_per_threadgroup/4 (float4 vectorized effective count).
+    // This prevents over-provisioning threads for small hidden sizes.
+    let ne00_t = work_per_threadgroup / 4; // effective float4 element count
+    let mut width = 32usize;
+    while width < ne00_t && width < pipeline.max_total_threads_per_threadgroup() {
+        width *= 2;
+    }
+    width = std::cmp::min(width, pipeline.max_total_threads_per_threadgroup());
 
     let thread_group_size = MTLSize {
         width,

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 // https://docs.rs/objc2/latest/objc2/rc/struct.Retained.html
 pub type CommandQueue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
 
-const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 50;
+const DEFAULT_CANDLE_METAL_COMPUTE_PER_BUFFER: usize = 64;
 const DEFAULT_CANDLE_METAL_COMMAND_POOL_SIZE: usize = 5;
 
 /// Creates a new command buffer from the queue with an attached semaphore for tracking its state.
@@ -29,7 +29,40 @@ pub fn create_command_buffer(
 
 struct EntryState {
     current: CommandBuffer,
+    /// Persistent compute encoder kept open across multiple dispatches.
+    ///
+    /// Metal allows a single `MTLComputeCommandEncoder` to encode arbitrarily
+    /// many `dispatchThreadgroups` calls before `endEncoding`.  By keeping one
+    /// encoder alive across all kernel dispatches that share the same command
+    /// buffer we eliminate the `endEncoding()` + `computeCommandEncoder()` pair
+    /// that was previously called for every single kernel — the dominant
+    /// per-dispatch CPU overhead on Apple Silicon.
+    ///
+    /// The encoder is ended (and `None`-d out) only when the command buffer is
+    /// committed via `commit_swap_locked` or `flush_and_wait`.
+    active_encoder: Option<ComputeCommandEncoder>,
     in_flight: Vec<CommandBuffer>,
+}
+
+impl EntryState {
+    /// Return a reference to the persistent encoder, creating it if not yet open.
+    /// Return a reference to the persistent encoder, creating it if not yet open.
+    ///
+    /// The stored encoder is non-owning (owned=false) so it does NOT call
+    /// `endEncoding` on drop.  `end_encoder()` calls `end_encoding()` explicitly.
+    fn get_or_create_encoder(&mut self) -> Result<&ComputeCommandEncoder, MetalKernelError> {
+        if self.active_encoder.is_none() {
+            self.active_encoder = Some(self.current.compute_command_encoder_persistent());
+        }
+        Ok(self.active_encoder.as_ref().unwrap())
+    }
+
+    /// End the active encoder (if any) before committing the command buffer.
+    fn end_encoder(&mut self) {
+        if let Some(enc) = self.active_encoder.take() {
+            enc.end_encoding();
+        }
+    }
 }
 
 /// A pool entry containing a command buffer, its usage count, and synchronization primitives.
@@ -88,9 +121,14 @@ impl Commands {
         let semaphore = Arc::new(CommandSemaphore::new());
         let cb = create_command_buffer(command_queue, Arc::clone(&semaphore))?;
 
+        // SAFETY: Commands is used from a single device thread; the unsafe Send/Sync
+        // impls on Commands ensure correct access. The Arc here is for interior sharing
+        // within the pool, not cross-thread transfer.
+        #[allow(clippy::arc_with_non_send_sync)]
         Ok(Arc::new(CommandBufferEntry {
             state: Mutex::new(EntryState {
                 current: cb,
+                active_encoder: None,
                 in_flight: Vec::new(),
             }),
             compute_count: AtomicUsize::new(0),
@@ -100,12 +138,38 @@ impl Commands {
 
     pub fn command_encoder(&self) -> Result<(bool, ComputeCommandEncoder), MetalKernelError> {
         let entry = self.select_entry()?;
-        self.finalize_entry(entry, |cb| cb.compute_command_encoder())
+        let flush = self.maybe_flush_entry(&entry)?;
+
+        // Return a non-owning alias of the persistent encoder.
+        // The underlying MTLComputeCommandEncoder stays open; `endEncoding` is
+        // only called at commit time (in `commit_swap_locked`).
+        //
+        // Signal Available immediately so subsequent calls to `select_entry`
+        // can reuse this pool entry without waiting.  The entry's command buffer
+        // is still being built; only `compute_count` tracks that.
+        //
+        // SAFETY: `Commands` is accessed exclusively from the single device thread
+        // (enforced by `unsafe impl Send/Sync for Commands`).  No other thread can
+        // acquire or use this pool entry concurrently, so signalling Available here
+        // is safe: the persistent encoder is accessed only from this thread.
+        entry.semaphore.set_status(CommandStatus::Available);
+        let mut state = entry.state.lock()?;
+        let encoder = state.get_or_create_encoder()?.non_owning_alias();
+        Ok((flush, encoder))
     }
 
     pub fn blit_command_encoder(&self) -> Result<(bool, BlitCommandEncoder), MetalKernelError> {
         let entry = self.select_entry()?;
-        self.finalize_entry(entry, |cb| cb.blit_command_encoder())
+        let flush = self.maybe_flush_entry(&entry)?;
+
+        // Blit encoders cannot coexist with an active compute encoder.
+        // End the compute encoder first, then create a blit encoder.
+        // The blit encoder manages its own semaphore via Drop.
+        let mut state = entry.state.lock()?;
+        state.end_encoder();
+        let blit = state.current.blit_command_encoder();
+        // Don't signal Available here — the blit encoder's Drop will do it.
+        Ok((flush, blit))
     }
 
     pub fn wait_until_completed(&self) -> Result<(), MetalKernelError> {
@@ -146,28 +210,16 @@ impl Commands {
         Ok(entry)
     }
 
-    /// Creates an encoder from the selected entry, recycling the buffer if needed.
-    /// When recycling, the old committed buffer is moved to `in_flight` so we can later wait on it.
-    fn finalize_entry<F, E>(
-        &self,
-        entry: Arc<CommandBufferEntry>,
-        create_encoder: F,
-    ) -> Result<(bool, E), MetalKernelError>
-    where
-        F: FnOnce(&mut CommandBuffer) -> E,
-    {
-        let mut state = entry.state.lock()?;
-
+    /// Increments the dispatch counter and flushes the command buffer if the limit is reached.
+    /// Returns `true` when a flush occurred.
+    fn maybe_flush_entry(&self, entry: &Arc<CommandBufferEntry>) -> Result<bool, MetalKernelError> {
         let count = entry.compute_count.fetch_add(1, Ordering::Relaxed);
         let flush = count >= self.compute_per_buffer;
-
         if flush {
-            self.commit_swap_locked(&entry, &mut state, 1)?;
+            let mut state = entry.state.lock()?;
+            self.commit_swap_locked(entry, &mut state, 1)?;
         }
-
-        let encoder = create_encoder(&mut state.current);
-
-        Ok((flush, encoder))
+        Ok(flush)
     }
 
     /// Flushes all buffers and waits for their completion.
@@ -185,7 +237,7 @@ impl Commands {
                 let mut state = entry.state.lock()?;
 
                 if entry.compute_count.load(Ordering::Acquire) > 0 {
-                    self.commit_swap_locked(&entry, &mut state, 0)?;
+                    self.commit_swap_locked(entry, &mut state, 0)?;
                 }
 
                 // Drain `in_flight` into a local vec to wait without holding the lock.
@@ -212,7 +264,7 @@ impl Commands {
             let mut state = entry.state.lock()?;
 
             if entry.compute_count.load(Ordering::Acquire) > 0 {
-                self.commit_swap_locked(&entry, &mut state, 0)?;
+                self.commit_swap_locked(entry, &mut state, 0)?;
             }
         }
 
@@ -227,6 +279,8 @@ impl Commands {
         state: &mut EntryState,
         reset_to: usize,
     ) -> Result<(), MetalKernelError> {
+        // End the persistent encoder before committing.
+        state.end_encoder();
         state.current.commit();
         let new_cb = create_command_buffer(&self.command_queue, Arc::clone(&entry.semaphore))?;
         let old_cb = std::mem::replace(&mut state.current, new_cb);

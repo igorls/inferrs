@@ -4884,6 +4884,15 @@ kernel void kernel_mul_mv_q3_K_f32(
     kernel_mul_mv_q3_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
 }
 
+// Match llama.cpp's Q4K kernel layout:
+//   N_DST_Q4K = 2  rows per simdgroup  (was 4)
+//   N_SG_Q4K  = 2  simdgroups per threadgroup
+//   → 4 rows per threadgroup (same as before), but 2 simdgroups run them in parallel.
+// Threadgroup size: (32, 2, 1) = 64 threads.  Grid: ceil(ne01/4) × ne11 × batch.
+// Each simdgroup owns 2 consecutive rows; sgitg selects which 2.
+#define N_DST_Q4K 2
+#define N_SG_Q4K  2
+
 void kernel_mul_mv_q4_K_f32_impl(
         device const  void * src0,
         device const float * src1,
@@ -4902,9 +4911,9 @@ void kernel_mul_mv_q4_K_f32_impl(
                    uint      tiisg,
                    uint      sgitg) {
 
-    const uint16_t kmask1 = 0x3f3f;
-    const uint16_t kmask2 = 0x0f0f;
-    const uint16_t kmask3 = 0xc0c0;
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
 
     const int ix = tiisg/8;  // 0...3
     const int it = tiisg%8;  // 0...7
@@ -4915,8 +4924,9 @@ void kernel_mul_mv_q4_K_f32_impl(
     const int r0 = tgpig.x;
     const int r1 = tgpig.y;
     const int im = tgpig.z;
-    //const int first_row = (r0 * N_SIMDGROUP + sgitg) * N_DST;
-    const int first_row = r0 * N_DST;
+    // Each threadgroup covers N_SG_Q4K * N_DST_Q4K = 4 rows total.
+    // sgitg=0 owns rows [first_row, first_row+1], sgitg=1 owns [first_row+2, first_row+3].
+    const int first_row = (r0 * N_SG_Q4K + sgitg) * N_DST_Q4K;
     const int ib_row = first_row * nb;
 
     const uint i12 = im%ne12;
@@ -4929,7 +4939,7 @@ void kernel_mul_mv_q4_K_f32_impl(
 
     float yl[16];
     float yh[16];
-    float sumf[N_DST]={0.f}, all_sum;
+    float sumf[N_DST_Q4K]={0.f}, all_sum;
 
     const int step = sizeof(block_q4_K) * nb / 2;
 
@@ -4952,7 +4962,7 @@ void kernel_mul_mv_q4_K_f32_impl(
         device const uint16_t * q1 = (device const uint16_t *)x[ib].qs + 16 * iq + 4 * ir;
         device const half     * dh = &x[ib].d;
 
-        for (int row = 0; row < N_DST; row++) {
+        for (int row = 0; row < N_DST_Q4K; row++) {
 
             sc16[0] = sc[0] & kmask1;
             sc16[1] = sc[2] & kmask1;
@@ -4963,24 +4973,24 @@ void kernel_mul_mv_q4_K_f32_impl(
 
             float4 acc1 = {0.f, 0.f, 0.f, 0.f};
             float4 acc2 = {0.f, 0.f, 0.f, 0.f};
-            for (int i = 0; i < 8; i += 2) {
-                acc1[0] += yl[i+0] * (q1[i/2] & 0x000F);
-                acc1[1] += yl[i+1] * (q1[i/2] & 0x0F00);
-                acc1[2] += yl[i+8] * (q1[i/2] & 0x00F0);
-                acc1[3] += yl[i+9] * (q1[i/2] & 0xF000);
-                acc2[0] += yh[i+0] * (q2[i/2] & 0x000F);
-                acc2[1] += yh[i+1] * (q2[i/2] & 0x0F00);
-                acc2[2] += yh[i+8] * (q2[i/2] & 0x00F0);
-                acc2[3] += yh[i+9] * (q2[i/2] & 0xF000);
+            // Full unroll of 4-iteration inner loop — matches llama.cpp FOR_UNROLL.
+            _Pragma("clang loop unroll(full)")
+            for (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2*i+0] * (q1[i] & 0x000F);
+                acc1[1] += yl[2*i+1] * (q1[i] & 0x0F00);
+                acc1[2] += yl[2*i+8] * (q1[i] & 0x00F0);
+                acc1[3] += yl[2*i+9] * (q1[i] & 0xF000);
+                acc2[0] += yh[2*i+0] * (q2[i] & 0x000F);
+                acc2[1] += yh[2*i+1] * (q2[i] & 0x0F00);
+                acc2[2] += yh[2*i+8] * (q2[i] & 0x00F0);
+                acc2[3] += yh[2*i+9] * (q2[i] & 0xF000);
             }
 
-            float dall = dh[0];
-            float dmin = dh[1];
-            sumf[row] += dall * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
-                                 (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
-                                 (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
-                                 (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
-                         dmin * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+            sumf[row] += dh[0] * ((acc1[0] + 1.f/256.f * acc1[1]) * sc8[0] +
+                                   (acc1[2] + 1.f/256.f * acc1[3]) * sc8[1] * 1.f/16.f +
+                                   (acc2[0] + 1.f/256.f * acc2[1]) * sc8[4] +
+                                   (acc2[2] + 1.f/256.f * acc2[3]) * sc8[5] * 1.f/16.f) -
+                         dh[1] * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
 
             q1 += step;
             sc += step;
@@ -4990,9 +5000,9 @@ void kernel_mul_mv_q4_K_f32_impl(
         y4 += 4 * QK_K;
     }
 
-    for (int row = 0; row < N_DST; ++row) {
+    for (int row = 0; row < N_DST_Q4K; ++row) {
         all_sum = simd_sum(sumf[row]);
-        if (tiisg == 0) {
+        if (tiisg == 0 && first_row + row < ne01) {
             dst[r1*ne0 + im*ne0*ne1 + first_row + row] = all_sum;
         }
     }
@@ -5024,6 +5034,184 @@ kernel void kernel_mul_mv_q4_K_f32(
         uint sgitg[[simdgroup_index_in_threadgroup]]) {
 
     kernel_mul_mv_q4_K_f32_impl(src0, src1, dst, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
+}
+
+// Fused double-GEMV for Q4K: computes gate_proj(x) and up_proj(x) in a single
+// dispatch.  Both weight matrices share the same shape [ne01, ne00] (Q4K) and
+// the same input vector src1 [ne10=ne00].  Outputs are written to dst_a and
+// dst_b respectively.
+//
+// This halves the number of Metal command-encoder dispatches and, more
+// importantly, lets the GPU schedule both GEMVs with the same wave of
+// threadgroups — the input vector is resident in L1/L2 cache for the second
+// GEMV because both runs are launched simultaneously rather than sequentially.
+//
+// Grid and threadgroup dimensions are identical to kernel_mul_mv_q4_K_f32:
+//   threadgroup: (4, 8, 1) = 32 threads = 1 SIMD group
+//   grid:        (ceil(ne01/4), ne11, ne12*ne13)
+// BF16-input Q4K GEMV: reads ushort (BF16 bits), converts inline via bit-shift.
+// Eliminates the separate BF16->F32 dispatch per GEMV call on Apple Silicon Metal.
+[[host_name("kernel_mul_mv_q4_K_bf16i_f32")]]
+kernel void kernel_mul_mv_q4_K_bf16i_f32(
+        device const  void * src0,
+        device const ushort * src1_bf16,
+        device       float * dst,
+        constant   int64_t & ne00, constant   int64_t & ne01, constant   int64_t & ne02,
+        constant  uint64_t & nb00, constant  uint64_t & nb01, constant  uint64_t & nb02,
+        constant   int64_t & ne10, constant   int64_t & ne11, constant   int64_t & ne12,
+        constant  uint64_t & nb10, constant  uint64_t & nb11, constant  uint64_t & nb12,
+        constant   int64_t & ne0,  constant   int64_t & ne1,
+        constant   uint    & r2,   constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint tiisg[[thread_index_in_simdgroup]],
+        uint sgitg[[simdgroup_index_in_threadgroup]]) {
+    constexpr uint16_t kmask1 = 0x3f3f, kmask2 = 0x0f0f, kmask3 = 0xc0c0;
+    const int ix = tiisg/8, it = tiisg%8, iq = it/4, ir = it%4;
+    const int nb = ne00/QK_K, r0 = tgpig.x, r1 = tgpig.y, im = tgpig.z;
+    const int first_row = (r0 * N_SG_Q4K + sgitg) * N_DST_Q4K;
+    const uint i12 = im%ne12, i13 = im/ne12;
+    const uint off0 = (i12/r2)*(nb*ne01) + (i13/r3)*(nb*ne01*ne02);
+    device const block_q4_K * x = (device const block_q4_K *)src0 + first_row*nb + off0;
+    device const ushort * y4u = src1_bf16 + r1*ne10 + im*ne00*ne1 + ix*QK_K + 64*iq + 8*ir;
+    float yl[16], yh[16], sumf[N_DST_Q4K]={0.f}, all_sum;
+    const int step = sizeof(block_q4_K) * nb / 2;
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f,0.f,0.f,0.f};
+        for (int i = 0; i < 8; ++i) {
+            yl[i+0]=as_type<float>(uint(y4u[i+  0])<<16); sumy[0]+=yl[i+0];
+            yl[i+8]=as_type<float>(uint(y4u[i+ 32])<<16); sumy[1]+=yl[i+8];
+            yh[i+0]=as_type<float>(uint(y4u[i+128])<<16); sumy[2]+=yh[i+0];
+            yh[i+8]=as_type<float>(uint(y4u[i+160])<<16); sumy[3]+=yh[i+8];
+        }
+        device const uint16_t * sc=(device const uint16_t *)x[ib].scales+iq;
+        device const uint16_t * q1=(device const uint16_t *)x[ib].qs+16*iq+4*ir;
+        device const half     * dh=&x[ib].d;
+        for (int row=0; row<N_DST_Q4K; row++) {
+            sc16[0]=sc[0]&kmask1; sc16[1]=sc[2]&kmask1;
+            sc16[2]=((sc[4]>>0)&kmask2)|((sc[0]&kmask3)>>2);
+            sc16[3]=((sc[4]>>4)&kmask2)|((sc[2]&kmask3)>>2);
+            device const uint16_t * q2=q1+32;
+            float4 acc1={0.f,0.f,0.f,0.f}, acc2={0.f,0.f,0.f,0.f};
+            _Pragma("clang loop unroll(full)")
+            for (short i=0; i<4; ++i) {
+                acc1[0]+=yl[2*i+0]*(q1[i]&0x000F); acc1[1]+=yl[2*i+1]*(q1[i]&0x0F00);
+                acc1[2]+=yl[2*i+8]*(q1[i]&0x00F0); acc1[3]+=yl[2*i+9]*(q1[i]&0xF000);
+                acc2[0]+=yh[2*i+0]*(q2[i]&0x000F); acc2[1]+=yh[2*i+1]*(q2[i]&0x0F00);
+                acc2[2]+=yh[2*i+8]*(q2[i]&0x00F0); acc2[3]+=yh[2*i+9]*(q2[i]&0xF000);
+            }
+            sumf[row]+=dh[0]*((acc1[0]+1.f/256.f*acc1[1])*sc8[0]+(acc1[2]+1.f/256.f*acc1[3])*sc8[1]*1.f/16.f+
+                              (acc2[0]+1.f/256.f*acc2[1])*sc8[4]+(acc2[2]+1.f/256.f*acc2[3])*sc8[5]*1.f/16.f)
+                      -dh[1]*(sumy[0]*sc8[2]+sumy[1]*sc8[3]+sumy[2]*sc8[6]+sumy[3]*sc8[7]);
+            q1+=step; sc+=step; dh+=step;
+        }
+        y4u+=4*QK_K;
+    }
+    for (int row=0; row<N_DST_Q4K; ++row) {
+        all_sum=simd_sum(sumf[row]);
+        if (tiisg==0 && first_row+row<ne01) dst[r1*ne0+im*ne0*ne1+first_row+row]=all_sum;
+    }
+}
+
+[[host_name("kernel_mul_mv2_q4_K_f32")]]
+kernel void kernel_mul_mv2_q4_K_f32(
+        device const  void * src0_a,
+        device const  void * src0_b,
+        device const float * src1,
+        device       float * dst_a,
+        device       float * dst_b,
+        constant   int64_t & ne00,
+        constant   int64_t & ne01,
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne0,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint tiisg[[thread_index_in_simdgroup]],
+        uint sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    kernel_mul_mv_q4_K_f32_impl(src0_a, src1, dst_a, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q4_K_f32_impl(src0_b, src1, dst_b, ne00, ne01, ne02, ne10, ne12, ne0, ne1, r2, r3, nullptr, tgpig, tiisg, sgitg);
+}
+
+// Fused QKV triple-GEMV for Q4K: computes q_proj(x), k_proj(x), v_proj(x)
+// in a single Metal dispatch.
+//
+// Q and KV may have different numbers of output rows (GQA: n_q > n_kv).
+// The grid covers all three weight matrices concatenated along the row axis:
+//   tgpig.x in [0,            ne01_q/4):          q_proj threadgroups
+//   tgpig.x in [ne01_q/4,     ne01_q/4+ne01_kv/4): k_proj threadgroups
+//   tgpig.x in [ne01_q/4+ne01_kv/4, total):        v_proj threadgroups
+// Each threadgroup steers itself to the right weight buffer and output buffer
+// based on its position in the grid.
+//
+// ne01_q_aligned = ceil(ne01_q / 4) * 4 (so boundary math works cleanly)
+[[host_name("kernel_mul_mv3_q4_K_f32")]]
+kernel void kernel_mul_mv3_q4_K_f32(
+        device const  void * src0_q,       // Q weight [ne01_q, ne00] Q4K
+        device const  void * src0_k,       // K weight [ne01_kv, ne00] Q4K
+        device const  void * src0_v,       // V weight [ne01_kv, ne00] Q4K
+        device const float * src1,         // input   [ne10=ne00] F32
+        device       float * dst_q,        // Q output [ne01_q] F32
+        device       float * dst_k,        // K output [ne01_kv] F32
+        device       float * dst_v,        // V output [ne01_kv] F32
+        constant   int64_t & ne00,         // hidden_size (input cols)
+        constant   int64_t & ne01_q,       // n_q_heads * head_dim (Q output rows)
+        constant   int64_t & ne01_kv,      // n_kv_heads * head_dim (K/V output rows)
+        constant   int64_t & ne02,
+        constant  uint64_t & nb00,
+        constant  uint64_t & nb01,
+        constant  uint64_t & nb02,
+        constant   int64_t & ne10,
+        constant   int64_t & ne11,
+        constant   int64_t & ne12,
+        constant  uint64_t & nb10,
+        constant  uint64_t & nb11,
+        constant  uint64_t & nb12,
+        constant   int64_t & ne1,
+        constant   uint    & r2,
+        constant   uint    & r3,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint tiisg[[thread_index_in_simdgroup]],
+        uint sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    // Determine which segment this threadgroup belongs to.
+    const int tg_q_count  = (int)((ne01_q  + 3) / 4);
+    const int tg_kv_count = (int)((ne01_kv + 3) / 4);
+
+    const int tg_x = (int)tgpig.x;
+
+    uint3 tgpig_local = tgpig;
+
+    if (tg_x < tg_q_count) {
+        // Q segment: threadgroup index within Q is tg_x (unchanged)
+        kernel_mul_mv_q4_K_f32_impl(src0_q, src1, dst_q,
+            ne00, ne01_q, ne02, ne10, ne12, ne01_q, ne1, r2, r3,
+            nullptr, tgpig_local, tiisg, sgitg);
+    } else if (tg_x < tg_q_count + tg_kv_count) {
+        // K segment: remap tgpig.x to start of K
+        tgpig_local.x = (uint)(tg_x - tg_q_count);
+        kernel_mul_mv_q4_K_f32_impl(src0_k, src1, dst_k,
+            ne00, ne01_kv, ne02, ne10, ne12, ne01_kv, ne1, r2, r3,
+            nullptr, tgpig_local, tiisg, sgitg);
+    } else {
+        // V segment: remap tgpig.x to start of V
+        tgpig_local.x = (uint)(tg_x - tg_q_count - tg_kv_count);
+        kernel_mul_mv_q4_K_f32_impl(src0_v, src1, dst_v,
+            ne00, ne01_kv, ne02, ne10, ne12, ne01_kv, ne1, r2, r3,
+            nullptr, tgpig_local, tiisg, sgitg);
+    }
 }
 
 void kernel_mul_mv_q5_K_f32_impl(

@@ -77,6 +77,41 @@ impl QMetalStorage {
     ) -> Result<(MetalStorage, crate::Shape)> {
         Err(Error::NotCompiledWithMetalSupport)
     }
+
+    pub fn fwd_mv_bf16i(
+        &self,
+        _self_shape: &crate::Shape,
+        _storage: &MetalStorage,
+        _layout: &crate::Layout,
+    ) -> Result<(MetalStorage, crate::Shape)> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
+    pub fn fwd_mv2_q4k(
+        &self,
+        _other: &QMetalStorage,
+        _self_shape: &crate::Shape,
+        _storage: &MetalStorage,
+        _layout: &crate::Layout,
+    ) -> Result<((MetalStorage, crate::Shape), (MetalStorage, crate::Shape))> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
+    pub fn fwd_mv3_q4k(
+        &self,
+        _kw: &QMetalStorage,
+        _vw: &QMetalStorage,
+        _self_shape: &crate::Shape,
+        _kv_shape: &crate::Shape,
+        _storage: &MetalStorage,
+        _layout: &crate::Layout,
+    ) -> Result<(
+        (MetalStorage, crate::Shape),
+        (MetalStorage, crate::Shape),
+        (MetalStorage, crate::Shape),
+    )> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
 }
 
 pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(

@@ -38,7 +38,7 @@ use clap::Parser;
 )]
 struct BenchmarkArgs {
     /// Number of timed benchmark runs per backend.
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 3)]
     runs: usize,
 
     /// Number of warm-up runs (results discarded).

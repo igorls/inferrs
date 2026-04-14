@@ -688,6 +688,122 @@ impl QTensor {
             }
         }
     }
+
+    /// Q4K GEMV with BF16 input on Metal — avoids separate BF16→F32 dispatch.
+    #[cfg(feature = "metal")]
+    pub fn fwd_mv_bf16i(&self, xs: &Tensor) -> Result<Option<Tensor>> {
+        let xs_storage_guard = xs.storage();
+        let (xs_storage, xs_layout) = match &*xs_storage_guard {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        if xs.dtype() != DType::BF16 {
+            return Ok(None);
+        }
+        match &self.storage {
+            QStorage::Metal(m) => {
+                if m.dtype() != GgmlDType::Q4K {
+                    return Ok(None);
+                }
+                let (dst_storage, dst_shape) =
+                    m.fwd_mv_bf16i(&self.shape, &xs_storage, &xs_layout)?;
+                let out = crate::tensor::from_storage(
+                    Storage::Metal(dst_storage),
+                    dst_shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                Ok(Some(out))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    /// Fused QKV triple Q4K GEMV on Metal: `(q, k, v) = (self@xs, kw@xs, vw@xs)`
+    /// in a single dispatch.  Q and K/V may differ in output size (GQA).
+    /// Returns `None` on non-Metal or non-Q4K inputs.
+    pub fn fwd_mv3_q4k(
+        &self,
+        kw: &QTensor,
+        vw: &QTensor,
+        xs: &Tensor,
+    ) -> Result<Option<(Tensor, Tensor, Tensor)>> {
+        let xs_storage_guard = xs.storage();
+        let (xs_storage, xs_layout) = match &*xs_storage_guard {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        match (&self.storage, &kw.storage, &vw.storage) {
+            (QStorage::Metal(qm), QStorage::Metal(km), QStorage::Metal(vm)) => {
+                if qm.dtype() != GgmlDType::Q4K
+                    || km.dtype() != GgmlDType::Q4K
+                    || vm.dtype() != GgmlDType::Q4K
+                {
+                    return Ok(None);
+                }
+                let ((dq_s, dq_sh), (dk_s, dk_sh), (dv_s, dv_sh)) =
+                    qm.fwd_mv3_q4k(km, vm, &self.shape, &kw.shape, &xs_storage, &xs_layout)?;
+                let out_q = crate::tensor::from_storage(
+                    Storage::Metal(dq_s),
+                    dq_sh,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                let out_k = crate::tensor::from_storage(
+                    Storage::Metal(dk_s),
+                    dk_sh,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                let out_v = crate::tensor::from_storage(
+                    Storage::Metal(dv_s),
+                    dv_sh,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                Ok(Some((out_q, out_k, out_v)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    /// Fused double Q4K GEMV on Metal: computes `out_a = self @ xs` and
+    /// `out_b = other @ xs` in a single kernel dispatch.
+    ///
+    /// Returns `None` on non-Metal devices or when either tensor is not Q4K,
+    /// so callers can fall back to two sequential `forward` calls.
+    pub fn fwd_mv2_q4k(&self, other: &QTensor, xs: &Tensor) -> Result<Option<(Tensor, Tensor)>> {
+        let xs_storage_guard = xs.storage();
+        let (xs_storage, xs_layout) = match &*xs_storage_guard {
+            Storage::Metal(s) => (s.clone(), xs.layout().clone()),
+            _ => return Ok(None),
+        };
+        match (&self.storage, &other.storage) {
+            (QStorage::Metal(self_m), QStorage::Metal(other_m)) => {
+                if self_m.dtype() != GgmlDType::Q4K || other_m.dtype() != GgmlDType::Q4K {
+                    return Ok(None);
+                }
+                let ((da_storage, da_shape), (db_storage, db_shape)) =
+                    self_m.fwd_mv2_q4k(other_m, &self.shape, &xs_storage, &xs_layout)?;
+                let out_a = crate::tensor::from_storage(
+                    Storage::Metal(da_storage),
+                    da_shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                let out_b = crate::tensor::from_storage(
+                    Storage::Metal(db_storage),
+                    db_shape,
+                    crate::op::BackpropOp::none(),
+                    false,
+                );
+                Ok(Some((out_a, out_b)))
+            }
+            _ => Ok(None),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
