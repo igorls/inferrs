@@ -12,15 +12,19 @@
 //   s_a_row [S]     256 B   — scratch for one a_mat row during fwd subst
 //   s_log_g [S]     256 B
 //   s_gcsum [S]     256 B
-//   s_kbeta [S*HK]  up to 32 KB  — k*beta, read-only after load
+//   s_kbeta [S*HK]  up to 32 KB  — k*beta, read-only after load (always F32)
 //   s_vcorr [S*HV]  up to 32 KB  — v_delta (step 4), then output (step 6)
 //
 // Total for HK=HV=64:  ~49 KB   (needs cudaFuncAttributeMaxDynamicSharedMemorySize=96KB)
 // Total for HK=HV=128: ~81 KB   (same opt-in)
 //
+// Template parameter T: dtype of q, k, v inputs (float or __nv_bfloat16).
+// log_g, beta, state, out are always float.
+// All internal accumulators are float (F32) regardless of T.
+//
 // Algorithm order per chunk:
 //   1. Load log_g → compute g_cumsum (inclusive prefix sum)
-//   2. Load k_beta into s_kbeta
+//   2. Load k_beta into s_kbeta (cast to F32)
 //   3. Forward substitution → s_attn = (I − a_mat)^{-1}
 //   4. Compute v_delta[s2,hv] = beta[s2]*(v[s2,hv] − exp(gc[s2])*Σ_hk kbeta[s2,hk]*state[hk,hv])
 //      into s_vcorr; s_kbeta becomes free.
@@ -38,6 +42,40 @@
 
 #include <stdint.h>
 #include <float.h>
+#include <cuda_bf16.h>
+
+// ── Type helpers ─────────────────────────────────────────────────────────────
+
+// Scalar load of T → float.
+template<typename T>
+__device__ __forceinline__ float load_as_f32(const T* ptr, int i);
+
+template<>
+__device__ __forceinline__ float load_as_f32<float>(const float* ptr, int i) {
+    return ptr[i];
+}
+
+template<>
+__device__ __forceinline__ float load_as_f32<__nv_bfloat16>(const __nv_bfloat16* ptr, int i) {
+    return __bfloat162float(ptr[i]);
+}
+
+// Vectorised 2-element load of T → float2.
+// Caller must ensure `i` is even so that &ptr[i] is 4-byte aligned.
+// (Safe for all our uses: HK ∈ {64,128}, loops stride by 2.)
+template<typename T>
+__device__ __forceinline__ float2 load2_as_f32(const T* ptr, int i);
+
+template<>
+__device__ __forceinline__ float2 load2_as_f32<float>(const float* ptr, int i) {
+    return make_float2(ptr[i], ptr[i + 1]);
+}
+
+template<>
+__device__ __forceinline__ float2 load2_as_f32<__nv_bfloat16>(const __nv_bfloat16* ptr, int i) {
+    // &ptr[i] is 4-byte aligned when i is even — holds for HK ∈ {64,128}, hk += 2.
+    return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&ptr[i]));
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -58,19 +96,20 @@ __device__ __forceinline__ void prefix_sum_inplace(float* smem, int tid, int S) 
 
 // ── Main kernel ───────────────────────────────────────────────────────────────
 //
-// Inputs all have shape [B*NH, C, S, dim], contiguous (caller ensures this).
-// State has shape [B*NH, HK, HV].
-// Out   has shape [B*NH, C, S, HV].
+// q, k, v have shape [B*NH, C, S, dim], contiguous, dtype T.
+// log_g, beta have shape [B*NH, C, S], contiguous, float.
+// state has shape [B*NH, HK, HV], float.
+// out   has shape [B*NH, C, S, HV], float.
 
-template<int HK, int HV, int S = 64>
+template<int HK, int HV, int S = 64, typename T = float>
 static __device__ void gated_delta_net_scan_impl(
-    const float* __restrict__ q,
-    const float* __restrict__ k,
-    const float* __restrict__ v,
+    const T*     __restrict__ q,
+    const T*     __restrict__ k,
+    const T*     __restrict__ v,
     const float* __restrict__ log_g,
     const float* __restrict__ beta,
-    float* __restrict__ state,
-    float* __restrict__ out,
+    float*       __restrict__ state,
+    float*       __restrict__ out,
     int C
 ) {
     const int bh   = blockIdx.x;
@@ -82,21 +121,21 @@ static __device__ void gated_delta_net_scan_impl(
     float* const s_a_row = smem + S * S;                   // [S]
     float* const s_log_g = s_a_row + S;                    // [S]
     float* const s_gcsum = s_log_g + S;                    // [S]
-    float* const s_kbeta = s_gcsum + S;                    // [S, HK]
+    float* const s_kbeta = s_gcsum + S;                    // [S, HK]  (F32, cast on load)
     float* const s_vcorr = s_kbeta + S * HK;              // [S, HV]
 
-    float*       my_state  = state   + (long)bh * HK * HV;
-    const float* q_bh      = q       + (long)bh * C * S * HK;
-    const float* k_bh      = k       + (long)bh * C * S * HK;
-    const float* v_bh      = v       + (long)bh * C * S * HV;
+    float*    my_state  = state   + (long)bh * HK * HV;
+    const T*  q_bh      = q       + (long)bh * C * S * HK;
+    const T*  k_bh      = k       + (long)bh * C * S * HK;
+    const T*  v_bh      = v       + (long)bh * C * S * HV;
     const float* logg_bh   = log_g   + (long)bh * C * S;
     const float* beta_bh   = beta    + (long)bh * C * S;
     float*       out_bh    = out     + (long)bh * C * S * HV;
 
     for (int ci = 0; ci < C; ci++) {
-        const float* q_c    = q_bh    + ci * S * HK;
-        const float* k_c    = k_bh    + ci * S * HK;
-        const float* v_c    = v_bh    + ci * S * HV;
+        const T*     q_c    = q_bh    + ci * S * HK;
+        const T*     k_c    = k_bh    + ci * S * HK;
+        const T*     v_c    = v_bh    + ci * S * HV;
         const float* logg_c = logg_bh + ci * S;
         const float* beta_c = beta_bh + ci * S;
         float*       out_c  = out_bh  + ci * S * HV;
@@ -109,11 +148,11 @@ static __device__ void gated_delta_net_scan_impl(
         __syncthreads();
         prefix_sum_inplace(s_gcsum, tid, S); // all threads must call — no if(tid<S) guard
 
-        // ── Step 2: Load k_beta ───────────────────────────────────────────────
+        // ── Step 2: Load k_beta (cast T → F32, store in s_kbeta) ─────────────
         for (int idx = tid; idx < S * HK; idx += NTHR) {
             int s  = idx / HK;
             int hk = idx % HK;
-            s_kbeta[idx] = k_c[s * HK + hk] * beta_c[s];
+            s_kbeta[idx] = load_as_f32(k_c, s * HK + hk) * beta_c[s];
         }
         __syncthreads();
 
@@ -136,10 +175,14 @@ static __device__ void gated_delta_net_scan_impl(
 
         for (int i = 1; i < S; i++) {
             // Phase A: thread j (= tid, for tid < i) computes s_a_row[j].
+            // Dot: Σ_hk s_kbeta[i*HK+hk] * k_c[tid*HK+hk]
+            // s_kbeta is F32; k_c is T — use load2 on k_c (HK always even).
             if (tid < i) {
                 float dot_val = 0.0f;
-                for (int hk = 0; hk < HK; hk++) {
-                    dot_val += s_kbeta[i * HK + hk] * k_c[tid * HK + hk];
+                for (int hk = 0; hk < HK; hk += 2) {
+                    float2 kb = load2_as_f32<float>(s_kbeta + i * HK, hk);
+                    float2 kc = load2_as_f32<T>(k_c + tid * HK, hk);
+                    dot_val += kb.x * kc.x + kb.y * kc.y;
                 }
                 float decay   = __expf(s_gcsum[i] - s_gcsum[tid]);
                 s_a_row[tid] = -dot_val * decay;
@@ -166,6 +209,7 @@ static __device__ void gated_delta_net_scan_impl(
         // v_delta[s2, hv] = beta[s2] * (v[s2,hv] − exp(gc[s2]) * Σ_hk kbeta[s2,hk]*state[hk,hv])
         //
         // This fuses value_new and the w@state correction into a single [S,HV] buffer.
+        // v_c is T; scalar load per element (no vectorisation opportunity: different hv per thread).
         for (int idx = tid; idx < S * HV; idx += NTHR) {
             int s2 = idx / HV;
             int hv = idx % HV;
@@ -173,8 +217,8 @@ static __device__ void gated_delta_net_scan_impl(
             for (int hk = 0; hk < HK; hk++) {
                 ws += s_kbeta[s2 * HK + hk] * my_state[hk * HV + hv];
             }
-            float g_exp_s2    = __expf(s_gcsum[s2]);
-            float v_beta_s2   = v_c[s2 * HV + hv] * beta_c[s2];
+            float g_exp_s2  = __expf(s_gcsum[s2]);
+            float v_beta_s2 = load_as_f32(v_c + s2 * HV, hv) * beta_c[s2];
             s_vcorr[idx] = v_beta_s2 - g_exp_s2 * ws;
         }
         __syncthreads();
@@ -203,29 +247,35 @@ static __device__ void gated_delta_net_scan_impl(
         // intra[s1,hv] = Σ_{s2≤s1} exp(gc[s1]−gc[s2]) * dot(q[s1],k[s2]) * v_corr[s2,hv]
         //   where v_corr is in out_c.
         //
-        // Reads: q_c, k_c, s_gcsum, my_state, out_c (v_corrected, global)
-        // Writes: s_vcorr
+        // q_c and k_c are T.
+        // inter: q_c pair-loaded, state stride-HV so scalar (non-contiguous hk axis).
+        // intra dot: both q_c and k_c pair-loaded (contiguous within a row).
         for (int idx = tid; idx < S * HV; idx += NTHR) {
             int s1 = idx / HV;
             int hv = idx % HV;
 
-            float gc_s1 = s_gcsum[s1];
+            float gc_s1     = s_gcsum[s1];
             float exp_gc_s1 = __expf(gc_s1);
 
             // Inter-chunk: q_exp[s1] @ state[:, hv]
+            // state[hk*HV+hv]: stride HV between consecutive hk → non-contiguous, scalar.
             float inter = 0.0f;
-            for (int hk = 0; hk < HK; hk++) {
-                inter += q_c[s1 * HK + hk] * exp_gc_s1 * my_state[hk * HV + hv];
+            for (int hk = 0; hk < HK; hk += 2) {
+                float2 qv = load2_as_f32<T>(q_c + s1 * HK, hk);
+                inter += qv.x * exp_gc_s1 * my_state[(hk    ) * HV + hv];
+                inter += qv.y * exp_gc_s1 * my_state[(hk + 1) * HV + hv];
             }
 
             // Intra-chunk: decay_full[s1,s2] * dot(q[s1],k[s2]) * v_corr[s2,hv]
             float intra = 0.0f;
             for (int s2 = 0; s2 <= s1; s2++) {
-                float gc_s2  = s_gcsum[s2];
-                float decay  = __expf(gc_s1 - gc_s2); // s2 <= s1 → exponent ≤ 0, safe
+                float gc_s2 = s_gcsum[s2];
+                float decay = __expf(gc_s1 - gc_s2); // s2 <= s1 → exponent ≤ 0, safe
                 float dot_qk = 0.0f;
-                for (int hk = 0; hk < HK; hk++) {
-                    dot_qk += q_c[s1 * HK + hk] * k_c[s2 * HK + hk];
+                for (int hk = 0; hk < HK; hk += 2) {
+                    float2 qv = load2_as_f32<T>(q_c + s1 * HK, hk);
+                    float2 kv = load2_as_f32<T>(k_c + s2 * HK, hk);
+                    dot_qk += qv.x * kv.x + qv.y * kv.y;
                 }
                 intra += dot_qk * decay * out_c[s2 * HV + hv];
             }
@@ -240,8 +290,7 @@ static __device__ void gated_delta_net_scan_impl(
         //   (beta already absorbed in v_corrected via v_beta in step 4)
         //   g_end = exp(gc[S-1]);  decay_to_end[s2] = exp(gc[S-1]−gc[s2])
         //
-        // Reads: k_c (global), beta_c (global), s_gcsum, out_c (v_corrected, global)
-        // Writes: my_state (global)
+        // k_c is T; scalar load per (s2, hk) element (each thread owns one hk, loops S).
         {
             float gc_last = s_gcsum[S - 1];
             float g_end   = __expf(gc_last);
@@ -252,7 +301,7 @@ static __device__ void gated_delta_net_scan_impl(
                 float acc = my_state[idx] * g_end;
                 for (int s2 = 0; s2 < S; s2++) {
                     float decay_to_end = __expf(gc_last - s_gcsum[s2]);
-                    float k_w = k_c[s2 * HK + hk] * decay_to_end;  // k original, not k*beta
+                    float k_w = load_as_f32(k_c + s2 * HK, hk) * decay_to_end;
                     acc += k_w * out_c[s2 * HV + hv];
                 }
                 my_state[idx] = acc;
@@ -270,21 +319,24 @@ static __device__ void gated_delta_net_scan_impl(
 
 // ── Kernel entry points (extern "C") ─────────────────────────────────────────
 
-#define DEF_SCAN_KERNEL(HK_VAL, HV_VAL)                                          \
+#define DEF_SCAN_KERNEL(DTYPE_NAME, HK_VAL, HV_VAL, T_TYPE)                      \
 extern "C" __global__                                                             \
 __launch_bounds__(256, 2)                                                         \
-void gated_delta_net_scan_f32_hk##HK_VAL##_hv##HV_VAL(                          \
-    const float* q,                                                               \
-    const float* k,                                                               \
-    const float* v,                                                               \
-    const float* log_g,                                                           \
-    const float* beta,                                                            \
-    float* state,                                                                 \
-    float* out,                                                                   \
+void gated_delta_net_scan_##DTYPE_NAME##_hk##HK_VAL##_hv##HV_VAL(               \
+    const T_TYPE* q,                                                              \
+    const T_TYPE* k,                                                              \
+    const T_TYPE* v,                                                              \
+    const float*  log_g,                                                          \
+    const float*  beta,                                                           \
+    float*        state,                                                          \
+    float*        out,                                                            \
     int C                                                                         \
 ) {                                                                               \
-    gated_delta_net_scan_impl<HK_VAL, HV_VAL>(q, k, v, log_g, beta, state, out, C); \
+    gated_delta_net_scan_impl<HK_VAL, HV_VAL, 64, T_TYPE>(                       \
+        q, k, v, log_g, beta, state, out, C);                                    \
 }
 
-DEF_SCAN_KERNEL(64,  64)
-DEF_SCAN_KERNEL(128, 128)
+DEF_SCAN_KERNEL(f32,  64,  64,  float)
+DEF_SCAN_KERNEL(f32,  128, 128, float)
+DEF_SCAN_KERNEL(bf16, 64,  64,  __nv_bfloat16)
+DEF_SCAN_KERNEL(bf16, 128, 128, __nv_bfloat16)

@@ -645,11 +645,6 @@ impl LinearAttn {
                                                    // sigmoid(x) = 1 / (1 + exp(-x))
         let beta = candle_nn::ops::sigmoid(&b_f32)?;
 
-        // ── Cast q, k, v to F32 for the recurrence ────────────────────────────
-        let q_f32 = q.to_dtype(DType::F32)?; // [b, t, n_value_heads, head_k_dim]
-        let k_f32 = k.to_dtype(DType::F32)?; // [b, t, n_value_heads, head_k_dim]
-        let v_f32 = v.to_dtype(DType::F32)?; // [b, t, n_value_heads, head_v_dim]
-
         // ── Initialise recurrent state ────────────────────────────────────────
         // state: [b, n_value_heads, head_k_dim, head_v_dim]  F32
         let mut state = match &self.recurrent_state {
@@ -663,11 +658,7 @@ impl LinearAttn {
 
         // ── Gated Delta Rule recurrence ───────────────────────────────────────
         let out_raw = if t == 1 {
-            // Decode path — compute g via fused Metal kernel when available.
-            // g = exp(-a_exp * softplus(a_input + dt_bias))
-            // Metal: fused kernel replaces 14 dispatches with 1.
-            // Fallback: Rust reference — same numerically stable softplus form as the
-            // Metal kernel (exp(-|x|) avoids overflow for large positive x).
+            // Decode path: single-token sequential step (F32 required).
             let g = if let Some(result) =
                 candle_nn::ops::compute_decay_gate(&a_input, &self.dt_bias, &self.a_exp)
             {
@@ -679,6 +670,9 @@ impl LinearAttn {
                 let a_exp_bc = self.a_exp.reshape((1, 1, self.n_value_heads))?;
                 a_exp_bc.broadcast_mul(&sp)?.neg()?.exp()?
             };
+            let q_f32 = q.to_dtype(DType::F32)?;
+            let k_f32 = k.to_dtype(DType::F32)?;
+            let v_f32 = v.to_dtype(DType::F32)?;
             let g_t = g.narrow(1, 0, 1)?.squeeze(1)?;
             let beta_t = beta.narrow(1, 0, 1)?.squeeze(1)?;
             let q_t = q_f32.narrow(1, 0, 1)?.squeeze(1)?;
@@ -689,10 +683,7 @@ impl LinearAttn {
             out.unsqueeze(1)? // [b, 1, n_h, hv]
         } else {
             // Prefill path: chunked WY parallel scan.
-            // Metal: fused kernel → g, then log(g) — 2 dispatches instead of 13.
-            //   g = exp(-a_exp * sp) ∈ (0, 1] so log is safe without FTZ risk.
-            // CPU/CUDA: compute log_g directly as -(a_exp * sp), avoiding the
-            //   exp+log round-trip that would give -inf under CUDA FTZ subnormals.
+            // Compute log_g directly to avoid exp+log round-trip on CUDA (FTZ subnormals).
             let log_g = if let Some(g) =
                 candle_nn::ops::compute_decay_gate(&a_input, &self.dt_bias, &self.a_exp)
             {
@@ -704,7 +695,10 @@ impl LinearAttn {
                 let a_exp_bc = self.a_exp.reshape((1, 1, self.n_value_heads))?;
                 a_exp_bc.broadcast_mul(&sp)?.neg()? // log_g = -(a_exp * sp), finite
             };
-            let out = gated_delta_rule_chunked(&q_f32, &k_f32, &v_f32, &log_g, &beta, &mut state)?;
+            // Pass q/k/v in native dtype — gated_delta_rule_chunked dispatches the
+            // CUDA kernel directly for BF16/F32, and casts to F32 on the CPU path.
+            // Pass log_g directly (not &g) to avoid log(0)=-inf on CUDA (FTZ mode).
+            let out = gated_delta_rule_chunked(&q, &k, &v, &log_g, &beta, &mut state)?;
             self.recurrent_state = Some(state.detach());
             out // already [b, t, n_h, hv]
         };
