@@ -16,7 +16,7 @@ use std::sync::Arc;
 use crate::kv_cache::{BlockTable, PagedKvStore};
 use crate::models::attention_utils::{
     append_kv_tq, apply_output_gate, apply_rms_norm_heads, apply_rope, causal_mask,
-    paged_write_gather_sdpa, precompute_rope, repeat_kv, AttnDims, PagedCtx, PagedPassCache,
+    paged_write_gather_sdpa, precompute_rope, AttnDims, PagedCtx, PagedPassCache,
 };
 use crate::models::quantized_linear::{qlinear_b, QGgufVarBuilder, QLinear};
 use crate::models::qwen3_5_linear_attn_scan::{gated_delta_rule_chunked, sequential_step};
@@ -85,6 +85,8 @@ struct FullAttention {
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
+    // True when Metal SDPA vector kernel supports this head_dim (single-token decode).
+    use_sdpa: bool,
     // KV cache: Option<(k_cache, v_cache)> accumulated across calls
     kv_cache: Option<(Tensor, Tensor)>,
     tq_cache: Option<TurboQuantKvCache>,
@@ -136,6 +138,10 @@ impl FullAttention {
             TurboQuantKvCache::new(c, cfg.num_key_value_heads, cfg.dtype, cfg.device.clone())
         });
 
+        // SDPA vector kernel supports a fixed set of head_dim values on Metal.
+        let use_sdpa = matches!(cfg.device, Device::Metal(_))
+            && matches!(cfg.head_dim, 32 | 64 | 96 | 128 | 256 | 512);
+
         Ok(Self {
             q_proj,
             k_proj,
@@ -146,9 +152,110 @@ impl FullAttention {
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
+            use_sdpa,
             kv_cache: None,
             tq_cache,
         })
+    }
+
+    /// Apply o_proj using BF16-input inline GEMV when available (eliminates
+    /// a BF16→F32 to_dtype dispatch for single-token decode on Metal).
+    fn apply_o_proj(&self, xs: &Tensor) -> Result<Tensor> {
+        #[cfg(feature = "metal")]
+        if xs.rank() >= 2
+            && xs.dim(xs.rank().saturating_sub(2)).unwrap_or(0) == 1
+            && xs.dtype() == DType::BF16
+            && matches!(xs.device(), candle_core::Device::Metal(_))
+        {
+            if let Some(out) = self.o_proj.forward_bf16i(xs) {
+                return out?.to_dtype(xs.dtype()).map_err(Into::into);
+            }
+        }
+        xs.apply(&self.o_proj).map_err(Into::into)
+    }
+
+    /// Project x into Q, K, V and the output gate, applying fused kernels when available.
+    ///
+    /// Returns `(q, k, v, gate)` where q/k/v are shaped `[b, heads, t, head_dim]`
+    /// and gate is `[b, t, num_heads * head_dim]`.
+    ///
+    /// q_proj has an interleaved layout `[h0_query, h0_gate, h1_query, h1_gate, ...]`
+    /// so we split it before returning.
+    fn project_qkv(&self, x: &Tensor) -> Result<(Tensor, Tensor, Tensor, Tensor)> {
+        let (b, t, _) = x.dims3()?;
+
+        // On the quantized (GGUF) Metal/CPU path, pre-convert x to F32 once and
+        // share it across q/k/v_proj (saves 3 BF16→F32 dispatches per call).
+        // For single-token decode, try the fused triple-GEMV kernel (1 dispatch).
+        let need_pre_convert = self.q_proj.is_quantized()
+            && !matches!(x.device(), candle_core::Device::Cuda(_))
+            && x.dtype() != DType::F32;
+        let orig_dtype = x.dtype();
+
+        let (q_full, k_raw, v_raw) = if need_pre_convert && t == 1 {
+            let xs_f32 = x.to_dtype(DType::F32)?;
+
+            // Try fused triple QKV GEMV (Q4K Metal only).
+            #[cfg(feature = "metal")]
+            let qkv_fused = self
+                .q_proj
+                .forward_triple_q4k(&self.k_proj, &self.v_proj, &xs_f32);
+            #[cfg(not(feature = "metal"))]
+            let qkv_fused: Option<
+                candle_core::Result<(
+                    candle_core::Tensor,
+                    candle_core::Tensor,
+                    candle_core::Tensor,
+                )>,
+            > = None;
+
+            if let Some(result) = qkv_fused {
+                let (q_f32, k_f32, v_f32) = result?;
+                (
+                    q_f32.to_dtype(orig_dtype)?,
+                    k_f32.to_dtype(orig_dtype)?,
+                    v_f32.to_dtype(orig_dtype)?,
+                )
+            } else {
+                // Fallback: three GEMVs sharing one F32 input copy.
+                (
+                    self.q_proj.forward_f32(&xs_f32)?.to_dtype(orig_dtype)?,
+                    self.k_proj.forward_f32(&xs_f32)?.to_dtype(orig_dtype)?,
+                    self.v_proj.forward_f32(&xs_f32)?.to_dtype(orig_dtype)?,
+                )
+            }
+        } else if need_pre_convert {
+            let xs_f32 = x.to_dtype(DType::F32)?;
+            (
+                self.q_proj.forward_f32(&xs_f32)?.to_dtype(orig_dtype)?,
+                self.k_proj.forward_f32(&xs_f32)?.to_dtype(orig_dtype)?,
+                self.v_proj.forward_f32(&xs_f32)?.to_dtype(orig_dtype)?,
+            )
+        } else {
+            (
+                self.q_proj.forward(x)?,
+                self.k_proj.forward(x)?,
+                self.v_proj.forward(x)?,
+            )
+        };
+
+        // Split query and output-gate from q_proj's interleaved layout.
+        let q_full_heads = q_full.reshape((b, t, self.num_heads, self.head_dim * 2))?;
+        let q_raw = q_full_heads.narrow(3, 0, self.head_dim)?;
+        let gate = q_full_heads
+            .narrow(3, self.head_dim, self.head_dim)?
+            .reshape((b, t, self.num_heads * self.head_dim))?;
+
+        // Reshape to [b, heads, t, head_dim]
+        let q = q_raw.transpose(1, 2)?;
+        let k = k_raw
+            .reshape((b, t, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v_raw
+            .reshape((b, t, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        Ok((q, k, v, gate))
     }
 
     fn forward(
@@ -159,34 +266,10 @@ impl FullAttention {
         sin: &Tensor,
     ) -> Result<Tensor> {
         let (b, t, _) = x.dims3()?;
-
-        // Project
-        // q_proj outputs [b, t, num_heads * head_dim * 2].
-        // The weight layout is interleaved per-head: [h0_query, h0_gate, h1_query, h1_gate, ...]
-        // so we must reshape to [b, t, num_heads, head_dim * 2] BEFORE splitting query vs gate.
-        let q_full = self.q_proj.forward(x)?; // [b, t, num_heads * head_dim * 2]
-        let q_full_heads = q_full.reshape((b, t, self.num_heads, self.head_dim * 2))?;
-        let q_raw = q_full_heads.narrow(3, 0, self.head_dim)?; // [b, t, num_heads, head_dim]
-        let gate = q_full_heads
-            .narrow(3, self.head_dim, self.head_dim)? // [b, t, num_heads, head_dim]
-            .reshape((b, t, self.num_heads * self.head_dim))?; // [b, t, num_heads * head_dim]
-
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
-
-        // Reshape to [b, heads, t, head_dim]
-        let q = q_raw
-            .reshape((b, t, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k
-            .reshape((b, t, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v
-            .reshape((b, t, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
+        let orig_dtype = x.dtype();
+        let (q, k, v, gate) = self.project_qkv(x)?;
 
         // QK norms (per-head, on head_dim)
-        // q_norm expects [..., head_dim]; apply on last dim
         let q = apply_rms_norm_heads(&q, &self.q_norm)?;
         let k = apply_rms_norm_heads(&k, &self.k_norm)?;
 
@@ -207,41 +290,37 @@ impl FullAttention {
         )?;
 
         let kv_len = k.dim(2)?;
-
-        // GQA: repeat k/v heads so each query head has a corresponding k/v head.
         let groups = self.num_heads / self.num_kv_heads;
-        let k = repeat_kv(k, groups)?;
-        let v = repeat_kv(v, groups)?;
 
-        // Scaled dot-product attention — matmul requires contiguous on Metal
-        let scale = (self.head_dim as f64).sqrt();
-        let attn = q
-            .contiguous()?
-            .matmul(&k.transpose(2, 3)?.contiguous()?)?
-            .affine(1.0 / scale, 0.0)?;
-
-        // Causal mask
-        let attn = if t > 1 {
-            // Build causal mask [t, kv_len]
-            let mask = causal_mask(t, kv_len, seqlen_offset, attn.device(), attn.dtype())?;
-            attn.broadcast_add(&mask)?
+        // ── Attention ────────────────────────────────────────────────────────
+        // Decode (t=1, Metal, supported head_dim): fused SDPA vector kernel —
+        // QK^T + scale + softmax + @V in one dispatch; handles GQA internally.
+        // Prefill or fallback: gqa_attention_no_expand avoids materialising the
+        // expanded KV by reshaping Q instead (no repeat_kv data duplication).
+        let out = if self.use_sdpa && t == 1 {
+            let scale = 1.0_f32 / (self.head_dim as f32).sqrt();
+            candle_nn::ops::sdpa(&q, &k, &v, None, false, scale, 1.0_f32)
+                .map_err(anyhow::Error::from)?
+                .transpose(1, 2)?
+                .reshape((b, t, self.num_heads * self.head_dim))?
         } else {
-            attn
+            let mask = if t > 1 {
+                Some(causal_mask(
+                    t,
+                    kv_len,
+                    seqlen_offset,
+                    x.device(),
+                    orig_dtype,
+                )?)
+            } else {
+                None
+            };
+            gqa_attention_no_expand(&q, &k, &v, groups, mask.as_ref())?
         };
-
-        let attn = candle_nn::ops::softmax_last_dim(&attn)?;
-        let out = attn.matmul(&v.contiguous()?)?; // [b, heads, t, head_dim]
-
-        // Reshape back: [b, t, heads*head_dim]
-        let out = out
-            .transpose(1, 2)?
-            .reshape((b, t, self.num_heads * self.head_dim))?;
 
         // Apply output gate: sigmoid(gate) * out
         let out = apply_output_gate(&out, &gate)?;
-
-        let out = self.o_proj.forward(&out)?;
-        Ok(out)
+        self.apply_o_proj(&out)
     }
 
     fn clear_kv_cache(&mut self) {
@@ -268,31 +347,8 @@ impl FullAttention {
         seqlen_offset: usize,
         ctx: &mut PagedCtx,
     ) -> Result<Tensor> {
-        let (b, t, _) = x.dims3()?;
-
-        // ── Project ──────────────────────────────────────────────────────────
-        // q_proj weight layout is interleaved per-head: [h0_query, h0_gate, h1_query, h1_gate, ...]
-        // reshape to [b, t, num_heads, head_dim * 2] before splitting.
-        let q_full = self.q_proj.forward(x)?; // [b, t, num_heads * head_dim * 2]
-        let q_full_heads = q_full.reshape((b, t, self.num_heads, self.head_dim * 2))?;
-        let q_raw = q_full_heads.narrow(3, 0, self.head_dim)?; // [b, t, num_heads, head_dim]
-        let gate = q_full_heads
-            .narrow(3, self.head_dim, self.head_dim)? // [b, t, num_heads, head_dim]
-            .reshape((b, t, self.num_heads * self.head_dim))?; // [b, t, num_heads * head_dim]
-
-        let k_proj_out = self.k_proj.forward(x)?; // [b, t, num_kv_heads * head_dim]
-        let v_proj_out = self.v_proj.forward(x)?;
-
-        // Reshape to [b, heads, t, head_dim]
-        let q = q_raw
-            .reshape((b, t, self.num_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let k = k_proj_out
-            .reshape((b, t, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
-        let v = v_proj_out
-            .reshape((b, t, self.num_kv_heads, self.head_dim))?
-            .transpose(1, 2)?;
+        let (_, t, _) = x.dims3()?;
+        let (q, k, v, gate) = self.project_qkv(x)?;
 
         // ── QK-norm ──────────────────────────────────────────────────────────
         let q = apply_rms_norm_heads(&q, &self.q_norm)?;
@@ -320,8 +376,7 @@ impl FullAttention {
 
         // ── Output gate ───────────────────────────────────────────────────────
         let out = apply_output_gate(&out, &gate)?;
-
-        self.o_proj.forward(&out).map_err(Into::into)
+        self.apply_o_proj(&out)
     }
 }
 
@@ -735,11 +790,119 @@ impl QMlp {
     }
 
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let gate = x.apply(&self.gate_proj)?.silu()?;
-        let up = x.apply(&self.up_proj)?;
-        let hidden = (gate * up)?;
-        hidden.apply(&self.down_proj).map_err(Into::into)
+        // On the quantized (GGUF) Metal/CPU path, pre-convert x to F32 once and share
+        // the conversion across gate_proj and up_proj (saves 2 BF16→F32 dispatches/call).
+        // CUDA (BF16 fast-path) and dense safetensors fall through to the standard path.
+        let need_pre_convert = self.gate_proj.is_quantized()
+            && !matches!(x.device(), candle_core::Device::Cuda(_))
+            && x.dtype() != DType::F32;
+
+        if need_pre_convert {
+            let orig_dtype = x.dtype();
+            #[allow(unused_variables)]
+            let is_single_token = x.rank() >= 2 && x.dim(x.rank() - 2).unwrap_or(0) == 1;
+            let xs_f32 = x.to_dtype(DType::F32)?;
+
+            // Fused double-GEMV (Q4K Metal) for single-token decode.
+            #[cfg(feature = "metal")]
+            if is_single_token {
+                if let Some(result) = self.gate_proj.forward_paired_q4k(&self.up_proj, &xs_f32) {
+                    let (gate_f32, up_f32) = result?;
+                    let lhs_f32 = gate_f32.silu()?;
+                    return self
+                        .down_proj
+                        .forward_f32(&(lhs_f32 * up_f32)?)?
+                        .to_dtype(orig_dtype)
+                        .map_err(Into::into);
+                }
+            }
+
+            // Fallback: two separate GEMVs sharing the same F32 input.
+            let lhs_f32 = self.gate_proj.forward_f32(&xs_f32)?.silu()?;
+            let rhs_f32 = self.up_proj.forward_f32(&xs_f32)?;
+            self.down_proj
+                .forward_f32(&(lhs_f32 * rhs_f32)?)?
+                .to_dtype(orig_dtype)
+                .map_err(Into::into)
+        } else {
+            let gate = x.apply(&self.gate_proj)?.silu()?;
+            let up = x.apply(&self.up_proj)?;
+            let hidden = (gate * up)?;
+            hidden.apply(&self.down_proj).map_err(Into::into)
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// GQA attention without K/V head expansion
+//
+// Reshapes Q instead of expanding K/V, avoiding data duplication for GQA.
+// For decode (q_len=1) returns [b, q_len, n_q_heads * head_dim] directly
+// (skips the outer transpose, saves a GPU contiguous() copy before o_proj).
+// ---------------------------------------------------------------------------
+fn gqa_attention_no_expand(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    n_kv_groups: usize,
+    mask: Option<&Tensor>,
+) -> anyhow::Result<Tensor> {
+    let (b, n_q_heads, q_len, head_dim) = q.dims4()?;
+    let (_, n_kv_heads, kv_len, _) = k.dims4()?;
+    let scale = 1.0_f64 / (head_dim as f64).sqrt();
+
+    // k and v may be non-contiguous after append_kv_tq (cache slices on CUDA/Metal).
+    let kt = k.transpose(2, 3)?.contiguous()?;
+    let v = v.contiguous()?;
+
+    if n_kv_groups == 1 {
+        // No GQA: standard batched matmul.
+        let attn_w = (q.contiguous()?.matmul(&kt)?.affine(scale, 0.0))?;
+        let attn_w = match mask {
+            None => attn_w,
+            Some(m) => attn_w.broadcast_add(m)?,
+        };
+        let out = candle_nn::ops::softmax_last_dim(&attn_w)?.matmul(&v)?;
+        if q_len == 1 {
+            return out
+                .reshape((b, q_len, n_q_heads * head_dim))
+                .map_err(Into::into);
+        }
+        return out
+            .transpose(1, 2)?
+            .reshape((b, q_len, n_q_heads * head_dim))
+            .map_err(Into::into);
+    }
+
+    // Reshape Q: [b, n_q, q_len, d] → [b, n_kv, n_kv_groups * q_len, d]
+    // q must be contiguous before reshape on Metal/CUDA.
+    let q_r = q
+        .contiguous()?
+        .reshape((b, n_kv_heads, n_kv_groups * q_len, head_dim))?;
+    let attn_w = (q_r.matmul(&kt)?.affine(scale, 0.0))?;
+
+    // Reshape to [b, n_q_heads, q_len, kv_len] to apply per-head causal mask.
+    let attn_w = attn_w.reshape((b, n_q_heads, q_len, kv_len))?;
+    let attn_w = match mask {
+        None => attn_w,
+        Some(m) => attn_w.broadcast_add(m)?,
+    };
+    let attn = candle_nn::ops::softmax_last_dim(&attn_w)?;
+
+    // Reshape back for V matmul: [b, n_kv, n_kv_groups * q_len, kv_len]
+    let attn_r = attn.reshape((b, n_kv_heads, n_kv_groups * q_len, kv_len))?;
+    let out = attn_r.matmul(&v)?;
+
+    // For decode (q_len=1): already [b, n_kv, n_kv_groups, d] — contiguous reshape.
+    if q_len == 1 {
+        return out
+            .reshape((b, q_len, n_q_heads * head_dim))
+            .map_err(Into::into);
+    }
+    out.reshape((b, n_q_heads, q_len, head_dim))?
+        .transpose(1, 2)?
+        .reshape((b, q_len, n_q_heads * head_dim))
+        .map_err(Into::into)
 }
 
 struct DecoderLayer {

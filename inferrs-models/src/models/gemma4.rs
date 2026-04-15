@@ -1313,15 +1313,38 @@ impl Attention {
 
             // Try fused triple QKV GEMV (Q4K Metal only); fall back to 3 separate GEMVs.
             #[cfg(feature = "metal")]
-            let qkv_fused = self.q_proj.forward_triple_q4k(&self.k_proj, &self.v_proj, &xs_f32);
+            let qkv_fused = self
+                .q_proj
+                .forward_triple_q4k(&self.k_proj, &self.v_proj, &xs_f32);
             #[cfg(not(feature = "metal"))]
-            let qkv_fused: Option<candle_core::Result<(candle_core::Tensor, candle_core::Tensor, candle_core::Tensor)>> = None;
+            let qkv_fused: Option<
+                candle_core::Result<(
+                    candle_core::Tensor,
+                    candle_core::Tensor,
+                    candle_core::Tensor,
+                )>,
+            > = None;
             if let Some(result) = qkv_fused {
                 let (q_f32, k_f32, v_f32) = result?;
                 (
-                    q_f32.to_dtype(orig_dtype)?.reshape((b_sz, q_len, self.num_heads, self.head_dim))?,
-                    k_f32.to_dtype(orig_dtype)?.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
-                    v_f32.to_dtype(orig_dtype)?.reshape((b_sz, q_len, self.num_kv_heads, self.head_dim))?,
+                    q_f32.to_dtype(orig_dtype)?.reshape((
+                        b_sz,
+                        q_len,
+                        self.num_heads,
+                        self.head_dim,
+                    ))?,
+                    k_f32.to_dtype(orig_dtype)?.reshape((
+                        b_sz,
+                        q_len,
+                        self.num_kv_heads,
+                        self.head_dim,
+                    ))?,
+                    v_f32.to_dtype(orig_dtype)?.reshape((
+                        b_sz,
+                        q_len,
+                        self.num_kv_heads,
+                        self.head_dim,
+                    ))?,
                 )
             } else {
                 // Fallback: three GEMVs sharing one F32 input copy.
@@ -1478,7 +1501,9 @@ impl Attention {
                 const NBLOCKS: usize = 32;
                 let dev = query_states.device();
                 self.sdpa_2pass_intermediate = Some(Tensor::zeros(
-                    (self.num_heads, NBLOCKS, self.head_dim), DType::F32, dev,
+                    (self.num_heads, NBLOCKS, self.head_dim),
+                    DType::F32,
+                    dev,
                 )?);
                 self.sdpa_2pass_sums =
                     Some(Tensor::zeros((self.num_heads, NBLOCKS), DType::F32, dev)?);
@@ -1492,10 +1517,18 @@ impl Attention {
                 &self.sdpa_2pass_maxs,
             ) {
                 candle_nn::ops::sdpa_2pass_prealloc(
-                    &query_states, &key_states, &value_states,
-                    1.0_f32, softcapping, interm, sums, maxs,
+                    &query_states,
+                    &key_states,
+                    &value_states,
+                    1.0_f32,
+                    softcapping,
+                    interm,
+                    sums,
+                    maxs,
                 )?
-            } else { None };
+            } else {
+                None
+            };
             #[cfg(not(feature = "metal"))]
             let donor_attn: Option<candle_core::Tensor> = None;
 
@@ -1593,10 +1626,14 @@ impl Attention {
                     .to_dtype(orig_dtype)?
                     .reshape((b_sz, q_len, self.num_heads, self.head_dim))?
             })
-        } else { None };
+        } else {
+            None
+        };
         #[cfg(not(feature = "metal"))]
         let q_raw_metal_opt: Option<candle_core::Tensor> = None;
-        let q_raw = if let Some(q) = q_raw_metal_opt { q } else if need_pre_convert {
+        let q_raw = if let Some(q) = q_raw_metal_opt {
+            q
+        } else if need_pre_convert {
             let orig_dtype = xs.dtype();
             self.q_proj
                 .forward_f32(&xs.to_dtype(DType::F32)?)?
