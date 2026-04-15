@@ -38,7 +38,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Dynamic library loading (dlopen/LoadLibrary) — used by pull.rs to load the
-# Go OCI shared library (libocipull) on demand instead of linking at build time.
+# Go OCI shared library (libocimodels) on demand instead of linking at build time.
 libloading = "0.8"
 
 # ML / Tensor
