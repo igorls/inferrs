@@ -430,8 +430,13 @@ struct LinearAttn {
     in_proj_z: QLinear,
     in_proj_a: QLinear,
     in_proj_b: QLinear,
+    /// Fused weight for `in_proj_a` + `in_proj_b` when both are dense (non-quantized).
+    /// Shape `[2 * n_value_heads, hidden]`. Present only when the fast path is available;
+    /// otherwise `in_proj_a` / `in_proj_b` are used individually.
+    in_proj_ab_weight: Option<Tensor>,
     conv1d_weight: Tensor,
-    a_log: Tensor,
+    /// Precomputed `A_log.exp()` — constant weight, computed once at load time.
+    a_exp: Tensor,
     dt_bias: Tensor,
     norm_weight: Tensor,
     out_proj: QLinear,
@@ -496,9 +501,12 @@ impl LinearAttn {
             .to_dtype(DType::F32)?;
 
         // A_log, dt_bias, and norm.weight must be kept in F32 for the SSM recurrence.
-        let a_log = vb
+        // Load A_log and immediately compute its exp — it's a constant weight.
+        // Precomputing here eliminates one dispatch per SSM layer per decode token.
+        let a_exp = vb
             .get_with_hints(n_value_heads, "A_log", candle_nn::Init::Const(0.0))?
-            .to_dtype(DType::F32)?;
+            .to_dtype(DType::F32)?
+            .exp()?;
         let dt_bias = vb.get((n_value_heads,), "dt_bias")?.to_dtype(DType::F32)?;
         let norm_weight = vb
             .get_with_hints(head_v_dim, "norm.weight", candle_nn::Init::Const(1.0))?
@@ -512,13 +520,22 @@ impl LinearAttn {
             qvb.map(|q| q.pp("out_proj")).as_ref(),
         )?;
 
+        // If both in_proj_a and in_proj_b are dense (non-quantized), concatenate their
+        // weight matrices once at load time so forward can issue a single matmul.
+        // Saves 1 dispatch per SSM layer per decode token.
+        let in_proj_ab_weight = match (in_proj_a.dense_weight(), in_proj_b.dense_weight()) {
+            (Some(wa), Some(wb)) => Tensor::cat(&[wa, wb], 0).ok(),
+            _ => None,
+        };
+
         Ok(Self {
             in_proj_qkv,
             in_proj_z,
             in_proj_a,
             in_proj_b,
+            in_proj_ab_weight,
             conv1d_weight,
-            a_log,
+            a_exp,
             dt_bias,
             norm_weight,
             out_proj,
@@ -560,8 +577,28 @@ impl LinearAttn {
         // ── Projections ───────────────────────────────────────────────────────
         let qkv = self.in_proj_qkv.forward(x)?; // [b, t, key_dim*2 + value_dim]
         let z = self.in_proj_z.forward(x)?; // [b, t, value_dim]
-        let a_input = self.in_proj_a.forward(x)?; // [b, t, n_value_heads]  (decay gate input)
-        let b_input = self.in_proj_b.forward(x)?; // [b, t, n_value_heads]  (beta input, before sigmoid)
+                                            // P2: fuse in_proj_a + in_proj_b into a single dispatch.
+                                            // Priority order:
+                                            //   1. Dense path — both weights non-quantized: one broadcast_matmul (all devices).
+                                            //   2. Q4K path   — both weights Q4K on Metal, t==1: fwd_mv2_q4k (GGUF decode).
+                                            //   3. Fallback   — two separate forwards.
+        let (a_input, b_input) = 'proj: {
+            if let Some(ref ab_w) = self.in_proj_ab_weight {
+                let ab = x.broadcast_matmul(&ab_w.t()?)?;
+                let a = ab.narrow(2, 0, self.n_value_heads)?;
+                let b = ab.narrow(2, self.n_value_heads, self.n_value_heads)?;
+                break 'proj (a.contiguous()?, b.contiguous()?);
+            }
+            #[cfg(feature = "metal")]
+            if t == 1 {
+                let xs_f32 = x.to_dtype(DType::F32)?;
+                if let Some(result) = self.in_proj_a.forward_paired_q4k(&self.in_proj_b, &xs_f32) {
+                    let (a_f32, b_f32) = result?;
+                    break 'proj (a_f32, b_f32);
+                }
+            }
+            (self.in_proj_a.forward(x)?, self.in_proj_b.forward(x)?)
+        };
 
         // ── Depthwise causal conv1d on qkv, then SiLU ────────────────────────
         let qkv = self.apply_conv1d_silu(&qkv)?; // [b, t, key_dim*2 + value_dim]
@@ -603,19 +640,6 @@ impl LinearAttn {
         };
         // After repeat: q, k, v all have n_value_heads as dim 2.
 
-        // ── Compute per-head decay gate g  ────────────────────────────────────
-        // g_t = exp( -A_log.exp() * softplus(a_t + dt_bias) )
-        // All in F32.
-        let a_f32 = a_input.to_dtype(DType::F32)?; // [b, t, n_value_heads]
-        let dt_bias_bc = self.dt_bias.reshape((1, 1, self.n_value_heads))?; // broadcast
-        let sp_input = a_f32.broadcast_add(&dt_bias_bc)?; // [b, t, n_value_heads]
-        let sp = softplus(&sp_input)?; // [b, t, n_value_heads]
-                                       // g = exp( -A * sp )  where A = exp(A_log)
-        let a_exp = self.a_log.exp()?; // [n_value_heads], F32
-        let a_exp_bc = a_exp.reshape((1, 1, self.n_value_heads))?;
-        let log_g = a_exp_bc.broadcast_mul(&sp)?.neg()?; // [b, t, n_value_heads]
-        let g = log_g.exp()?; // [b, t, n_value_heads]  -- per-head decay per token
-
         // ── beta = sigmoid(b_input) ───────────────────────────────────────────
         let b_f32 = b_input.to_dtype(DType::F32)?; // [b, t, n_value_heads]
                                                    // sigmoid(x) = 1 / (1 + exp(-x))
@@ -639,7 +663,22 @@ impl LinearAttn {
 
         // ── Gated Delta Rule recurrence ───────────────────────────────────────
         let out_raw = if t == 1 {
-            // Decode path: single-token sequential step (unchanged)
+            // Decode path — compute g via fused Metal kernel when available.
+            // g = exp(-a_exp * softplus(a_input + dt_bias))
+            // Metal: fused kernel replaces 14 dispatches with 1.
+            // Fallback: Rust reference — same numerically stable softplus form as the
+            // Metal kernel (exp(-|x|) avoids overflow for large positive x).
+            let g = if let Some(result) =
+                candle_nn::ops::compute_decay_gate(&a_input, &self.dt_bias, &self.a_exp)
+            {
+                result? // [b, 1, n_value_heads] F32
+            } else {
+                let a_f32 = a_input.to_dtype(DType::F32)?;
+                let dt_bias_bc = self.dt_bias.reshape((1, 1, self.n_value_heads))?;
+                let sp = softplus(&a_f32.broadcast_add(&dt_bias_bc)?)?;
+                let a_exp_bc = self.a_exp.reshape((1, 1, self.n_value_heads))?;
+                a_exp_bc.broadcast_mul(&sp)?.neg()?.exp()?
+            };
             let g_t = g.narrow(1, 0, 1)?.squeeze(1)?;
             let beta_t = beta.narrow(1, 0, 1)?.squeeze(1)?;
             let q_t = q_f32.narrow(1, 0, 1)?.squeeze(1)?;
@@ -649,9 +688,22 @@ impl LinearAttn {
             self.recurrent_state = Some(state.detach());
             out.unsqueeze(1)? // [b, 1, n_h, hv]
         } else {
-            // Prefill path: chunked WY parallel scan
-            // Pass log_g directly (not &g) to avoid log(0)=-inf on CUDA where
-            // subnormal floats are flushed to zero (FTZ mode).
+            // Prefill path: chunked WY parallel scan.
+            // Metal: fused kernel → g, then log(g) — 2 dispatches instead of 13.
+            //   g = exp(-a_exp * sp) ∈ (0, 1] so log is safe without FTZ risk.
+            // CPU/CUDA: compute log_g directly as -(a_exp * sp), avoiding the
+            //   exp+log round-trip that would give -inf under CUDA FTZ subnormals.
+            let log_g = if let Some(g) =
+                candle_nn::ops::compute_decay_gate(&a_input, &self.dt_bias, &self.a_exp)
+            {
+                g?.log()? // [b, t, n_value_heads] F32
+            } else {
+                let a_f32 = a_input.to_dtype(DType::F32)?;
+                let dt_bias_bc = self.dt_bias.reshape((1, 1, self.n_value_heads))?;
+                let sp = softplus(&a_f32.broadcast_add(&dt_bias_bc)?)?;
+                let a_exp_bc = self.a_exp.reshape((1, 1, self.n_value_heads))?;
+                a_exp_bc.broadcast_mul(&sp)?.neg()? // log_g = -(a_exp * sp), finite
+            };
             let out = gated_delta_rule_chunked(&q_f32, &k_f32, &v_f32, &log_g, &beta, &mut state)?;
             self.recurrent_state = Some(state.detach());
             out // already [b, t, n_h, hv]
@@ -1063,75 +1115,95 @@ impl Qwen35Model {
 
         let norm_vb = lm_vb.pp("norm");
 
-        // Build layers and lm_head in parallel.
-        // lm_head depends only on embed_tokens (already loaded), not on layers.
-        let (layers_result, lm_head) = rayon::join(
-            || -> Result<Vec<DecoderLayer>> {
-                let layers: Vec<_> = layer_specs
-                    .into_par_iter()
-                    .enumerate()
-                    .map(|(i, (vb, qvb, is_full))| {
-                        DecoderLayer::new(cfg, vb, qvb.as_ref(), is_full, tq_cfg.as_ref())
-                            .with_context(|| format!("loading layer {i}"))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(layers)
-            },
-            || -> QLinear {
-                let dense = embed_tokens.embeddings().clone();
-                let built = lm_qvb
-                    .as_ref()
-                    .and_then(|q| q.pp("embed_tokens").try_qlinear_weight());
-                let ql = match built {
-                    Some(Ok(ql)) => {
-                        tracing::info!("lm_head: using quantized embed_tokens QTensor");
-                        ql
-                    }
-                    Some(Err(e)) => {
-                        tracing::warn!("lm_head: quantized build failed ({e}), using bf16");
-                        QLinear::from_tensor(dense, None)
-                    }
-                    None => {
-                        let weight = dense;
-                        let elem_count = weight.elem_count();
-                        let quant_dtype = if elem_count % 256 == 0 {
-                            Some(candle_core::quantized::GgmlDType::Q4K)
-                        } else if elem_count % 32 == 0 {
-                            Some(candle_core::quantized::GgmlDType::Q8_0)
-                        } else {
-                            None
-                        };
-                        let mut quantized = None;
-                        if let Some(dtype) = quant_dtype {
-                            match candle_core::quantized::QTensor::quantize(&weight, dtype) {
-                                Ok(qt) => {
-                                    tracing::info!(
-                                        "lm_head: online-quantized embed_tokens to {dtype:?} \
-                                         ({} elements, {:.1} MB BF16)",
-                                        elem_count,
-                                        elem_count as f64 * 2.0 / 1e6,
-                                    );
-                                    match QLinear::from_qtensor(Arc::new(qt), None) {
-                                        Ok(ql) => quantized = Some(ql),
-                                        Err(e) => tracing::debug!(
-                                            "lm_head: QLinear::from_qtensor failed ({e}), using bf16"
-                                        ),
-                                    }
-                                }
-                                Err(e) => tracing::debug!(
-                                    "lm_head: online quantization failed ({e}), using bf16"
-                                ),
-                            }
-                        }
-                        quantized.unwrap_or_else(|| {
-                            tracing::debug!("lm_head: using dense bf16");
-                            QLinear::from_tensor(weight, None)
-                        })
-                    }
-                };
-                ql
-            },
+        // Build layers and lm_head.
+        // Metal's command encoder is not thread-safe: concurrent rayon threads
+        // calling dequantize → wait_until_completed on the shared encoder corrupts
+        // the heap and causes a SIGSEGV.  On Metal, both closures run sequentially;
+        // on CPU/CUDA, rayon::join parallelizes them.
+        let on_metal = matches!(
+            embed_tokens.embeddings().device(),
+            candle_core::Device::Metal(_)
         );
+
+        let build_lm_head = || -> QLinear {
+            let dense = embed_tokens.embeddings().clone();
+            let built = lm_qvb
+                .as_ref()
+                .and_then(|q| q.pp("embed_tokens").try_qlinear_weight());
+            match built {
+                Some(Ok(ql)) => {
+                    tracing::info!("lm_head: using quantized embed_tokens QTensor");
+                    ql
+                }
+                Some(Err(e)) => {
+                    tracing::warn!("lm_head: quantized build failed ({e}), using bf16");
+                    QLinear::from_tensor(dense, None)
+                }
+                None => {
+                    let weight = dense;
+                    let elem_count = weight.elem_count();
+                    let quant_dtype = if elem_count % 256 == 0 {
+                        Some(candle_core::quantized::GgmlDType::Q4K)
+                    } else if elem_count % 32 == 0 {
+                        Some(candle_core::quantized::GgmlDType::Q8_0)
+                    } else {
+                        None
+                    };
+                    let mut quantized = None;
+                    if let Some(dtype) = quant_dtype {
+                        match candle_core::quantized::QTensor::quantize(&weight, dtype) {
+                            Ok(qt) => {
+                                tracing::info!(
+                                    "lm_head: online-quantized embed_tokens to {dtype:?} \
+                                     ({} elements, {:.1} MB BF16)",
+                                    elem_count,
+                                    elem_count as f64 * 2.0 / 1e6,
+                                );
+                                match QLinear::from_qtensor(Arc::new(qt), None) {
+                                    Ok(ql) => quantized = Some(ql),
+                                    Err(e) => tracing::debug!(
+                                        "lm_head: QLinear::from_qtensor failed ({e}), using bf16"
+                                    ),
+                                }
+                            }
+                            Err(e) => tracing::debug!(
+                                "lm_head: online quantization failed ({e}), using bf16"
+                            ),
+                        }
+                    }
+                    quantized.unwrap_or_else(|| {
+                        tracing::debug!("lm_head: using dense bf16");
+                        QLinear::from_tensor(weight, None)
+                    })
+                }
+            }
+        };
+
+        let (layers_result, lm_head) = if on_metal {
+            let layers: Vec<_> = layer_specs
+                .into_iter()
+                .enumerate()
+                .map(|(i, (vb, qvb, is_full))| {
+                    DecoderLayer::new(cfg, vb, qvb.as_ref(), is_full, tq_cfg.as_ref())
+                        .with_context(|| format!("loading layer {i}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            (Ok(layers), build_lm_head())
+        } else {
+            rayon::join(
+                || -> Result<Vec<DecoderLayer>> {
+                    layer_specs
+                        .into_par_iter()
+                        .enumerate()
+                        .map(|(i, (vb, qvb, is_full))| {
+                            DecoderLayer::new(cfg, vb, qvb.as_ref(), is_full, tq_cfg.as_ref())
+                                .with_context(|| format!("loading layer {i}"))
+                        })
+                        .collect::<Result<Vec<_>>>()
+                },
+                build_lm_head,
+            )
+        };
         let layers = layers_result?;
 
         let norm = rms_norm_with_offset(cfg.hidden_size, cfg.rms_norm_eps, norm_vb, 1.0)?;
@@ -1446,5 +1518,349 @@ impl MtpModule {
 
     pub fn clear_kv_cache(&mut self) {
         self.block.clear_cache();
+    }
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use candle_core::{DType, Device, Tensor};
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        let diff = (a - b).unwrap().abs().unwrap();
+        diff.flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .cloned()
+            .fold(0.0f32, f32::max)
+    }
+
+    /// Compute the decay gate in pure Rust (reference path, device-agnostic).
+    fn decay_gate_ref(a_input: &Tensor, dt_bias: &Tensor, a_exp: &Tensor) -> Result<Tensor> {
+        let n_heads = a_exp.elem_count();
+        let a_f32 = a_input.to_dtype(DType::F32)?;
+        let dt_bias_bc = dt_bias.reshape((1, 1, n_heads))?;
+        let sp_input = a_f32.broadcast_add(&dt_bias_bc)?;
+        let sp = softplus(&sp_input)?;
+        let a_exp_bc = a_exp.reshape((1, 1, n_heads))?;
+        a_exp_bc
+            .broadcast_mul(&sp)?
+            .neg()?
+            .exp()
+            .map_err(Into::into)
+    }
+
+    // ── P0: a_exp precomputed at load time ────────────────────────────────────
+
+    /// softplus reference for testing.
+    fn softplus_scalar(x: f32) -> f32 {
+        x.max(0.0) + (1.0 + (-x.abs()).exp()).ln()
+    }
+
+    fn decay_gate_scalar(a: f32, dt_b: f32, a_e: f32) -> f32 {
+        (-a_e * softplus_scalar(a + dt_b)).exp()
+    }
+
+    #[test]
+    fn p0_a_exp_precomputed_matches_a_log_exp_on_cpu() {
+        // Verify that precomputing a_exp = a_log.exp() at load time gives the
+        // same result as computing it on-the-fly inside forward().
+        let n_heads = 8;
+        let a_log_data: Vec<f32> = (0..n_heads).map(|h| (h as f32) * 0.3 - 1.0).collect();
+        let a_log = Tensor::new(a_log_data.as_slice(), &Device::Cpu).unwrap();
+        let a_exp = a_log.exp().unwrap();
+
+        let a_input_data: Vec<f32> = vec![-0.5, 0.2, 1.0, -1.5, 0.0, 0.8, -0.3, 0.6];
+        let dt_bias_data: Vec<f32> = (0..n_heads).map(|h| h as f32 * 0.1).collect();
+
+        let a_input = Tensor::new(a_input_data.as_slice(), &Device::Cpu)
+            .unwrap()
+            .reshape((1, 1, n_heads))
+            .unwrap();
+        let dt_bias = Tensor::new(dt_bias_data.as_slice(), &Device::Cpu).unwrap();
+
+        let g_via_a_exp = decay_gate_ref(&a_input, &dt_bias, &a_exp).unwrap();
+        let g_direct: Vec<f32> = (0..n_heads)
+            .map(|h| decay_gate_scalar(a_input_data[h], dt_bias_data[h], a_log_data[h].exp()))
+            .collect();
+        let g_direct_t = Tensor::new(g_direct.as_slice(), &Device::Cpu)
+            .unwrap()
+            .reshape((1, 1, n_heads))
+            .unwrap();
+
+        let diff = max_abs_diff(&g_via_a_exp, &g_direct_t);
+        assert!(diff < 1e-5, "p0: precomputed a_exp diff {diff:.2e}");
+    }
+
+    // ── P1: compute_decay_gate (Metal fast path via candle-nn ops) ────────────
+    // These tests use candle::Device::Metal when available, and fall back to
+    // the Rust reference if not.
+
+    fn maybe_metal_device() -> Device {
+        #[cfg(feature = "metal")]
+        {
+            Device::new_metal(0).unwrap_or(Device::Cpu)
+        }
+        #[cfg(not(feature = "metal"))]
+        Device::Cpu
+    }
+
+    /// Core correctness helper: compare `candle_nn::ops::compute_decay_gate`
+    /// output (Metal fast path when available) against the CPU reference.
+    fn check_compute_decay_gate(
+        b: usize,
+        t: usize,
+        n_heads: usize,
+        a_vals: &[f32],
+        dt_bias_vals: &[f32],
+        a_exp_vals: &[f32],
+        tol: f32,
+        label: &str,
+    ) {
+        let cpu = Device::Cpu;
+        let dev = maybe_metal_device();
+
+        let a_cpu = Tensor::new(a_vals, &cpu)
+            .unwrap()
+            .reshape((b, t, n_heads))
+            .unwrap();
+        let dt_bias_cpu = Tensor::new(dt_bias_vals, &cpu).unwrap();
+        let a_exp_cpu = Tensor::new(a_exp_vals, &cpu).unwrap();
+
+        // Reference output on CPU.
+        let g_ref = decay_gate_ref(&a_cpu, &dt_bias_cpu, &a_exp_cpu).unwrap();
+
+        // Fast-path (or Rust fallback) on target device.
+        let a_dev = a_cpu.to_device(&dev).unwrap();
+        let dt_bias_dev = dt_bias_cpu.to_device(&dev).unwrap();
+        let a_exp_dev = a_exp_cpu.to_device(&dev).unwrap();
+
+        let g_dev = match candle_nn::ops::compute_decay_gate(&a_dev, &dt_bias_dev, &a_exp_dev) {
+            Some(r) => r.unwrap().to_device(&Device::Cpu).unwrap(),
+            None => decay_gate_ref(&a_cpu, &dt_bias_cpu, &a_exp_cpu).unwrap(),
+        };
+
+        let diff = max_abs_diff(&g_dev, &g_ref);
+        assert!(
+            diff < tol,
+            "{label}: max abs diff {diff:.2e} (tol {tol:.2e})"
+        );
+    }
+
+    #[test]
+    fn p1_compute_decay_gate_basic() {
+        let n_heads = 4;
+        let a_vals: Vec<f32> = (0..n_heads).map(|i| i as f32 * 0.3 - 0.5).collect();
+        let dt_bias: Vec<f32> = (0..n_heads).map(|h| h as f32 * 0.1).collect();
+        let a_exp: Vec<f32> = vec![1.0, 0.5, 1.5, 2.0];
+        check_compute_decay_gate(1, 1, n_heads, &a_vals, &dt_bias, &a_exp, 1e-5, "basic");
+    }
+
+    #[test]
+    fn p1_compute_decay_gate_0_8b_shape() {
+        // Exact Qwen3.5-0.8B shape: b=1, t=1, n_value_heads=16
+        let n_heads = 16;
+        let a_vals: Vec<f32> = (0..n_heads).map(|i| (i as f32) * 0.15 - 1.0).collect();
+        let dt_bias: Vec<f32> = (0..n_heads).map(|h| h as f32 * 0.05 - 0.4).collect();
+        let a_exp: Vec<f32> = (0..n_heads).map(|h| (h + 1) as f32 * 0.3).collect();
+        check_compute_decay_gate(1, 1, n_heads, &a_vals, &dt_bias, &a_exp, 1e-5, "0_8b");
+    }
+
+    #[test]
+    fn p1_compute_decay_gate_4b_shape() {
+        // Exact Qwen3.5-4B shape: b=1, t=1, n_value_heads=32
+        let n_heads = 32;
+        let a_vals: Vec<f32> = (0..n_heads).map(|i| (i as f32) * 0.07 - 1.0).collect();
+        let dt_bias: Vec<f32> = (0..n_heads).map(|h| h as f32 * 0.03 - 0.5).collect();
+        let a_exp: Vec<f32> = (0..n_heads).map(|h| (h + 1) as f32 * 0.25).collect();
+        check_compute_decay_gate(1, 1, n_heads, &a_vals, &dt_bias, &a_exp, 1e-5, "4b");
+    }
+
+    #[test]
+    fn p1_compute_decay_gate_zero_a_input() {
+        // a=0 → g = exp(-a_exp * softplus(dt_bias)); output in (0,1]
+        let n_heads = 8;
+        let a_vals = vec![0.0f32; n_heads];
+        let dt_bias: Vec<f32> = (0..n_heads).map(|h| h as f32 * 0.5).collect();
+        let a_exp = vec![2.0f32; n_heads];
+        check_compute_decay_gate(1, 1, n_heads, &a_vals, &dt_bias, &a_exp, 1e-5, "zero_a");
+    }
+
+    #[test]
+    fn p1_compute_decay_gate_zero_a_exp() {
+        // a_exp=0 → g = 1 for all inputs
+        let n_heads = 8;
+        let a_vals: Vec<f32> = (0..n_heads).map(|i| i as f32).collect();
+        let dt_bias = vec![0.0f32; n_heads];
+        let a_exp = vec![0.0f32; n_heads];
+
+        let dev = maybe_metal_device();
+        let a = Tensor::new(a_vals.as_slice(), &dev)
+            .unwrap()
+            .reshape((1, 1, n_heads))
+            .unwrap();
+        let dt_b = Tensor::new(dt_bias.as_slice(), &dev).unwrap();
+        let ae = Tensor::new(a_exp.as_slice(), &dev).unwrap();
+
+        let g = match candle_nn::ops::compute_decay_gate(&a, &dt_b, &ae) {
+            Some(r) => r.unwrap().to_device(&Device::Cpu).unwrap(),
+            None => decay_gate_ref(
+                &a.to_device(&Device::Cpu).unwrap(),
+                &dt_b.to_device(&Device::Cpu).unwrap(),
+                &ae.to_device(&Device::Cpu).unwrap(),
+            )
+            .unwrap(),
+        };
+        let g_vals: Vec<f32> = g.flatten_all().unwrap().to_vec1().unwrap();
+        for &gv in &g_vals {
+            assert!(gv.is_finite(), "zero_a_exp: NaN/inf");
+            assert!(
+                (gv - 1.0).abs() < 1e-5,
+                "zero_a_exp: expected g=1, got {gv}"
+            );
+        }
+    }
+
+    #[test]
+    fn p1_compute_decay_gate_large_negative_a() {
+        // softplus(-50) ≈ 0 → g ≈ 1; no NaN/inf
+        let n_heads = 4;
+        let a_vals = vec![-50.0f32; n_heads];
+        let dt_bias = vec![0.0f32; n_heads];
+        let a_exp = vec![1.0f32; n_heads];
+
+        let dev = maybe_metal_device();
+        let a = Tensor::new(a_vals.as_slice(), &dev)
+            .unwrap()
+            .reshape((1, 1, n_heads))
+            .unwrap();
+        let dt_b = Tensor::new(dt_bias.as_slice(), &dev).unwrap();
+        let ae = Tensor::new(a_exp.as_slice(), &dev).unwrap();
+
+        let g = match candle_nn::ops::compute_decay_gate(&a, &dt_b, &ae) {
+            Some(r) => r.unwrap().to_device(&Device::Cpu).unwrap(),
+            None => decay_gate_ref(
+                &a.to_device(&Device::Cpu).unwrap(),
+                &dt_b.to_device(&Device::Cpu).unwrap(),
+                &ae.to_device(&Device::Cpu).unwrap(),
+            )
+            .unwrap(),
+        };
+        let g_vals: Vec<f32> = g.flatten_all().unwrap().to_vec1().unwrap();
+        for &gv in &g_vals {
+            assert!(gv.is_finite(), "large_neg_a: NaN/inf");
+            assert!((gv - 1.0).abs() < 1e-4, "large_neg_a: g={gv}");
+        }
+    }
+
+    #[test]
+    fn p1_compute_decay_gate_output_in_range() {
+        // g must always be in (0, 1] for any finite input
+        let n_heads = 16;
+        let n_elems = n_heads * 8;
+        let a_vals: Vec<f32> = (0..n_elems)
+            .map(|i| match i % 4 {
+                0 => i as f32 * 0.5,
+                1 => -(i as f32) * 0.5,
+                2 => 20.0,
+                _ => -20.0,
+            })
+            .collect();
+        let dt_bias = vec![0.1f32; n_heads];
+        let a_exp: Vec<f32> = (0..n_heads).map(|h| (h + 1) as f32 * 0.2).collect();
+
+        let dev = maybe_metal_device();
+        let a = Tensor::new(a_vals.as_slice(), &dev)
+            .unwrap()
+            .reshape((1, 8, n_heads))
+            .unwrap();
+        let dt_b = Tensor::new(dt_bias.as_slice(), &dev).unwrap();
+        let ae = Tensor::new(a_exp.as_slice(), &dev).unwrap();
+
+        let g = match candle_nn::ops::compute_decay_gate(&a, &dt_b, &ae) {
+            Some(r) => r.unwrap().to_device(&Device::Cpu).unwrap(),
+            None => decay_gate_ref(
+                &a.to_device(&Device::Cpu).unwrap(),
+                &dt_b.to_device(&Device::Cpu).unwrap(),
+                &ae.to_device(&Device::Cpu).unwrap(),
+            )
+            .unwrap(),
+        };
+        let g_vals: Vec<f32> = g.flatten_all().unwrap().to_vec1().unwrap();
+        for (i, &gv) in g_vals.iter().enumerate() {
+            assert!(gv.is_finite(), "range: NaN/inf at {i}");
+            assert!(gv >= 0.0, "range: g<0 at {i} ({gv})");
+            assert!(gv <= 1.0 + 1e-5, "range: g>1 at {i} ({gv})");
+        }
+    }
+
+    // ── P2: in_proj_ab fused weight ───────────────────────────────────────────
+
+    /// Verify that the fused [a, b] matmul + split produces identical results
+    /// to two separate matmuls when weights are dense (non-quantized).
+    #[test]
+    fn p2_in_proj_ab_fused_matches_separate() {
+        let hidden = 64;
+        let n_heads = 4;
+        let dev = Device::Cpu;
+
+        // Dense weight tensors (non-quantized path, like safetensors BF16 → F32).
+        let wa = Tensor::randn(0f32, 1.0, (n_heads, hidden), &dev).unwrap();
+        let wb = Tensor::randn(0f32, 1.0, (n_heads, hidden), &dev).unwrap();
+
+        // Input: [b=1, t=1, hidden]
+        let x = Tensor::randn(0f32, 1.0, (1, 1, hidden), &dev).unwrap();
+
+        // Separate matmuls (reference).
+        let a_sep = x.broadcast_matmul(&wa.t().unwrap()).unwrap(); // [1,1,n_heads]
+        let b_sep = x.broadcast_matmul(&wb.t().unwrap()).unwrap();
+
+        // Fused matmul + split.
+        let ab_w = Tensor::cat(&[&wa, &wb], 0).unwrap(); // [2*n_heads, hidden]
+        let ab = x.broadcast_matmul(&ab_w.t().unwrap()).unwrap(); // [1,1,2*n_heads]
+        let a_fused = ab.narrow(2, 0, n_heads).unwrap().contiguous().unwrap();
+        let b_fused = ab
+            .narrow(2, n_heads, n_heads)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+
+        let diff_a = max_abs_diff(&a_fused, &a_sep);
+        let diff_b = max_abs_diff(&b_fused, &b_sep);
+        assert!(diff_a < 1e-5, "p2 a_fused diff {diff_a:.2e}");
+        assert!(diff_b < 1e-5, "p2 b_fused diff {diff_b:.2e}");
+    }
+
+    /// Verify that fused and separate projections agree over multiple tokens.
+    #[test]
+    fn p2_in_proj_ab_fused_multi_token() {
+        let hidden = 32;
+        let n_heads = 8;
+        let t = 6;
+        let dev = Device::Cpu;
+
+        let wa = Tensor::randn(0f32, 0.5, (n_heads, hidden), &dev).unwrap();
+        let wb = Tensor::randn(0f32, 0.5, (n_heads, hidden), &dev).unwrap();
+        let x = Tensor::randn(0f32, 1.0, (1, t, hidden), &dev).unwrap();
+
+        let a_sep = x.broadcast_matmul(&wa.t().unwrap()).unwrap();
+        let b_sep = x.broadcast_matmul(&wb.t().unwrap()).unwrap();
+
+        let ab_w = Tensor::cat(&[&wa, &wb], 0).unwrap();
+        let ab = x.broadcast_matmul(&ab_w.t().unwrap()).unwrap();
+        let a_fused = ab.narrow(2, 0, n_heads).unwrap().contiguous().unwrap();
+        let b_fused = ab
+            .narrow(2, n_heads, n_heads)
+            .unwrap()
+            .contiguous()
+            .unwrap();
+
+        let diff_a = max_abs_diff(&a_fused, &a_sep);
+        let diff_b = max_abs_diff(&b_fused, &b_sep);
+        assert!(diff_a < 1e-5, "p2_multi_token a diff {diff_a:.2e}");
+        assert!(diff_b < 1e-5, "p2_multi_token b diff {diff_b:.2e}");
     }
 }

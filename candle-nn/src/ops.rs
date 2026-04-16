@@ -619,6 +619,119 @@ impl candle::CustomOp2 for RmsNorm {
     }
 }
 
+/// Fused decay gate for GatedDeltaNet SSM layers (Metal fast path).
+///
+/// Computes `g = exp(-a_exp[h] * softplus(a_input + dt_bias[h]))` element-wise
+/// in a single Metal kernel dispatch.
+///
+/// # Arguments
+/// * `a_input`  — `[b, t, n_heads]`, F32 **or** BF16, contiguous
+/// * `dt_bias`  — `[n_heads]`, F32, contiguous
+/// * `a_exp`    — `[n_heads]`, F32, contiguous  (`= A_log.exp()`, precomputed)
+///
+/// Returns `[b, t, n_heads]` F32.
+///
+/// Returns `None` when the Metal fast path is not applicable (non-Metal device,
+/// unsupported dtype, or non-contiguous layout) — caller must fall back.
+pub fn compute_decay_gate(
+    a_input: &candle::Tensor,
+    dt_bias: &candle::Tensor,
+    a_exp: &candle::Tensor,
+) -> Option<candle::Result<candle::Tensor>> {
+    #[cfg(feature = "metal")]
+    {
+        use candle::Storage;
+
+        // Only BF16 or F32 input is supported.
+        let bf16_input = match a_input.dtype() {
+            candle::DType::BF16 => true,
+            candle::DType::F32 => false,
+            _ => return None,
+        };
+
+        // All tensors must be contiguous.
+        if !a_input.is_contiguous() || !dt_bias.is_contiguous() || !a_exp.is_contiguous() {
+            return None;
+        }
+
+        let device = match a_input.device() {
+            candle::Device::Metal(d) => d.clone(),
+            _ => return None,
+        };
+
+        // dt_bias and a_exp must be F32.
+        if dt_bias.dtype() != candle::DType::F32 || a_exp.dtype() != candle::DType::F32 {
+            return None;
+        }
+
+        let n_total = a_input.elem_count();
+
+        // n_heads = last dim of a_input
+        let dims = a_input.dims();
+        if dims.is_empty() {
+            return None;
+        }
+        let n_heads = dims[dims.len() - 1];
+
+        // Offsets must be zero.
+        let (a_s, a_l) = a_input.storage_and_layout();
+        let (dt_s, dt_l) = dt_bias.storage_and_layout();
+        let (ae_s, ae_l) = a_exp.storage_and_layout();
+
+        if a_l.start_offset() != 0 || dt_l.start_offset() != 0 || ae_l.start_offset() != 0 {
+            drop((a_s, dt_s, ae_s));
+            return None;
+        }
+
+        let (a_m, dt_m, ae_m) = match (&*a_s, &*dt_s, &*ae_s) {
+            (Storage::Metal(am), Storage::Metal(dm), Storage::Metal(em)) => (am, dm, em),
+            _ => return None,
+        };
+
+        let out_buf = match device.new_buffer(n_total, candle::DType::F32, "decay_gate") {
+            Ok(b) => b,
+            Err(e) => return Some(Err(e)),
+        };
+        let encoder = match device.command_encoder() {
+            Ok(e) => e,
+            Err(e) => return Some(Err(e)),
+        };
+        encoder.set_label("compute_decay_gate");
+
+        if let Err(e) = candle_metal_kernels::call_compute_decay_gate(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            a_m.buffer(),
+            dt_m.buffer(),
+            ae_m.buffer(),
+            &out_buf,
+            n_heads,
+            n_total,
+            bf16_input,
+        )
+        .map_err(candle::Error::wrap)
+        {
+            return Some(Err(e));
+        }
+
+        drop((a_s, dt_s, ae_s));
+
+        let out_storage =
+            candle::MetalStorage::new(out_buf, device.clone(), n_total, candle::DType::F32);
+        let out = candle::Tensor::from_storage(
+            candle::Storage::Metal(out_storage),
+            a_input.shape().clone(),
+            candle::op::BackpropOp::none(),
+            false,
+        );
+        return Some(Ok(out));
+    }
+    #[allow(unused_variables, unreachable_code)]
+    let _ = (a_input, dt_bias, a_exp);
+    None
+}
+
 pub fn rms_norm_slow(x: &Tensor, alpha: &Tensor, eps: f32) -> Result<Tensor> {
     let x_dtype = x.dtype();
     let internal_dtype = match x_dtype {
