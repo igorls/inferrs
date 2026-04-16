@@ -23,6 +23,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 
-# Backend acceleration is opt-in via the `cuda` / `metal` Cargo features
-# above so this crate can be built on hosts without the corresponding
-# vendor toolchain.  The Makefile enables them on the right platforms.
+# On macOS always enable Metal: the framework is part of the system SDK, so
+# there is no external toolchain concern (unlike CUDA on Linux / Windows,
+# which stays opt-in via the `cuda` feature above).
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { workspace = true, features = ["metal"] }
+candle-nn = { workspace = true, features = ["metal"] }

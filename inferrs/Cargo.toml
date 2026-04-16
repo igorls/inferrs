@@ -29,10 +29,17 @@ metal = [
     "inferrs-models/metal",
 ]
 
-# On macOS: add libloading to probe for the Vulkan/MoltenVK and OpenVINO
-# plugins at runtime.  Metal itself is opt-in via `--features metal`.
+# On macOS: always enable Metal (the framework ships with every macOS install
+# so there is no toolchain concern like there is with CUDA) and add libloading
+# to probe for the Vulkan/MoltenVK and OpenVINO plugins at runtime.  The
+# `metal` Cargo feature above is still available for explicit opt-in on other
+# platforms that may gain Metal support later.
 [target.'cfg(target_os = "macos")'.dependencies]
 libloading = "0.8"
+candle-core = { workspace = true, features = ["metal"] }
+candle-nn = { workspace = true, features = ["metal"] }
+candle-transformers = { workspace = true, features = ["metal"] }
+inferrs-models = { path = "../inferrs-models", features = ["metal"] }
 
 
 [dependencies]
