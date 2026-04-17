@@ -1,10 +1,3 @@
-// clippy::collapsible_match was tightened in Rust 1.95 to flag
-// `KeyCode::X => { if cond { ... } }` patterns in this file's key-handling
-// match. The explicit inner `if` reads more clearly than a guard on each arm
-// here; silence the lint file-wide until a focused readability refactor is
-// done separately.
-#![allow(clippy::collapsible_match)]
-
 //! Interactive REPL for `inferrs run` — talks to a running `inferrs serve`
 //! daemon via the Ollama-compatible HTTP API, exactly as `ollama run` does.
 //!
@@ -1056,47 +1049,37 @@ fn read_line() -> Result<ReadResult> {
                     return Ok(ReadResult::Interrupt);
                 }
 
-                KeyCode::Backspace => {
-                    if cursor_pos > 0 {
-                        cursor_pos -= 1;
-                        buf.remove(cursor_pos);
-                        execute!(stdout, cursor::MoveLeft(1))?;
-                        redraw_from_cursor(&mut stdout, &buf, cursor_pos)?;
-                    }
+                KeyCode::Backspace if cursor_pos > 0 => {
+                    cursor_pos -= 1;
+                    buf.remove(cursor_pos);
+                    execute!(stdout, cursor::MoveLeft(1))?;
+                    redraw_from_cursor(&mut stdout, &buf, cursor_pos)?;
                 }
 
-                KeyCode::Delete => {
-                    if cursor_pos < buf.len() {
-                        buf.remove(cursor_pos);
-                        redraw_from_cursor(&mut stdout, &buf, cursor_pos)?;
-                    }
+                KeyCode::Delete if cursor_pos < buf.len() => {
+                    buf.remove(cursor_pos);
+                    redraw_from_cursor(&mut stdout, &buf, cursor_pos)?;
                 }
 
-                KeyCode::Left => {
-                    if cursor_pos > 0 {
-                        cursor_pos -= 1;
-                        execute!(stdout, cursor::MoveLeft(1))?;
-                    }
+                KeyCode::Left if cursor_pos > 0 => {
+                    cursor_pos -= 1;
+                    execute!(stdout, cursor::MoveLeft(1))?;
                 }
 
-                KeyCode::Right => {
-                    if cursor_pos < buf.len() {
-                        cursor_pos += 1;
-                        execute!(stdout, cursor::MoveRight(1))?;
-                    }
+                KeyCode::Right if cursor_pos < buf.len() => {
+                    cursor_pos += 1;
+                    execute!(stdout, cursor::MoveRight(1))?;
                 }
 
-                KeyCode::Home => {
-                    if cursor_pos > 0 {
-                        execute!(stdout, cursor::MoveLeft(cursor_pos as u16))?;
-                        cursor_pos = 0;
-                    }
+                KeyCode::Home if cursor_pos > 0 => {
+                    execute!(stdout, cursor::MoveLeft(cursor_pos as u16))?;
+                    cursor_pos = 0;
                 }
-                KeyCode::Char('a') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    if cursor_pos > 0 {
-                        execute!(stdout, cursor::MoveLeft(cursor_pos as u16))?;
-                        cursor_pos = 0;
-                    }
+                KeyCode::Char('a')
+                    if modifiers.contains(KeyModifiers::CONTROL) && cursor_pos > 0 =>
+                {
+                    execute!(stdout, cursor::MoveLeft(cursor_pos as u16))?;
+                    cursor_pos = 0;
                 }
 
                 KeyCode::End => {
@@ -1119,30 +1102,30 @@ fn read_line() -> Result<ReadResult> {
                     execute!(stdout, terminal::Clear(ClearType::UntilNewLine))?;
                 }
 
-                KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    if cursor_pos > 0 {
-                        execute!(stdout, cursor::MoveLeft(cursor_pos as u16))?;
-                        buf.drain(..cursor_pos);
-                        cursor_pos = 0;
-                        redraw_from_cursor(&mut stdout, &buf, 0)?;
-                    }
+                KeyCode::Char('u')
+                    if modifiers.contains(KeyModifiers::CONTROL) && cursor_pos > 0 =>
+                {
+                    execute!(stdout, cursor::MoveLeft(cursor_pos as u16))?;
+                    buf.drain(..cursor_pos);
+                    cursor_pos = 0;
+                    redraw_from_cursor(&mut stdout, &buf, 0)?;
                 }
 
-                KeyCode::Char('w') if modifiers.contains(KeyModifiers::CONTROL) => {
-                    if cursor_pos > 0 {
-                        let mut end = cursor_pos;
-                        while end > 0 && buf[end - 1] == ' ' {
-                            end -= 1;
-                        }
-                        while end > 0 && buf[end - 1] != ' ' {
-                            end -= 1;
-                        }
-                        let deleted = cursor_pos - end;
-                        execute!(stdout, cursor::MoveLeft(deleted as u16))?;
-                        buf.drain(end..cursor_pos);
-                        cursor_pos = end;
-                        redraw_from_cursor(&mut stdout, &buf, cursor_pos)?;
+                KeyCode::Char('w')
+                    if modifiers.contains(KeyModifiers::CONTROL) && cursor_pos > 0 =>
+                {
+                    let mut end = cursor_pos;
+                    while end > 0 && buf[end - 1] == ' ' {
+                        end -= 1;
                     }
+                    while end > 0 && buf[end - 1] != ' ' {
+                        end -= 1;
+                    }
+                    let deleted = cursor_pos - end;
+                    execute!(stdout, cursor::MoveLeft(deleted as u16))?;
+                    buf.drain(end..cursor_pos);
+                    cursor_pos = end;
+                    redraw_from_cursor(&mut stdout, &buf, cursor_pos)?;
                 }
 
                 KeyCode::Char(c) => {
