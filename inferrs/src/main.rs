@@ -52,7 +52,7 @@ impl std::fmt::Display for TurboQuantArg {
 }
 
 #[derive(Parser)]
-#[command(name = "inferrs", about = "A TurboQuant inference server")]
+#[command(name = "inferrs", about = "A TurboQuant inference server", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
