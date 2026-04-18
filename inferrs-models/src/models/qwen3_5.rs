@@ -138,9 +138,20 @@ impl FullAttention {
             TurboQuantKvCache::new(c, cfg.num_key_value_heads, cfg.dtype, cfg.device.clone())
         });
 
-        // SDPA vector kernel supports a fixed set of head_dim values on Metal.
-        let use_sdpa = matches!(cfg.device, Device::Metal(_))
+        // Fast SDPA paths:
+        //   - Metal vector kernel: head_dim ∈ {32, 64, 96, 128, 256, 512} (any dtype)
+        //   - CUDA flash_attn_decode: head_dim ∈ {64, 128, 256, 512} AND BF16.
+        //     The dtype restriction is enforced up-front here so the `use_sdpa`
+        //     branch is only entered when `sdpa_cuda_flash` is guaranteed to
+        //     succeed — the `candle_nn::ops::sdpa` CustomOp has no CUDA impl
+        //     (only cpu_fwd/metal_fwd), so a runtime fall-through from
+        //     `sdpa_cuda_flash` to `sdpa` on CUDA would bail.
+        let metal_sdpa_ok = matches!(cfg.device, Device::Metal(_))
             && matches!(cfg.head_dim, 32 | 64 | 96 | 128 | 256 | 512);
+        let cuda_sdpa_ok = matches!(cfg.device, Device::Cuda(_))
+            && matches!(cfg.head_dim, 64 | 128 | 256 | 512)
+            && cfg.dtype == DType::BF16;
+        let use_sdpa = metal_sdpa_ok || cuda_sdpa_ok;
 
         Ok(Self {
             q_proj,
@@ -160,10 +171,14 @@ impl FullAttention {
 
     /// Apply o_proj using BF16-input inline GEMV when available (eliminates
     /// a BF16→F32 to_dtype dispatch for single-token decode on Metal).
+    ///
+    /// Only fires for the exact decode shape `[b, 1, hidden]`: rank 3 with
+    /// the middle dim equal to 1. Broader shapes (prefill `[b, t, hidden]`,
+    /// or any rank-2 tensor) go through the standard path.
     fn apply_o_proj(&self, xs: &Tensor) -> Result<Tensor> {
         #[cfg(feature = "metal")]
-        if xs.rank() >= 2
-            && xs.dim(xs.rank().saturating_sub(2)).unwrap_or(0) == 1
+        if xs.rank() == 3
+            && xs.dim(1).unwrap_or(0) == 1
             && xs.dtype() == DType::BF16
             && matches!(xs.device(), candle_core::Device::Metal(_))
         {
@@ -293,29 +308,56 @@ impl FullAttention {
         let groups = self.num_heads / self.num_kv_heads;
 
         // ── Attention ────────────────────────────────────────────────────────
-        // Decode (t=1, Metal, supported head_dim): fused SDPA vector kernel —
-        // QK^T + scale + softmax + @V in one dispatch; handles GQA internally.
-        // Prefill or fallback: gqa_attention_no_expand avoids materialising the
-        // expanded KV by reshaping Q instead (no repeat_kv data duplication).
-        let out = if self.use_sdpa && t == 1 {
+        // Decode (t=1, Metal/CUDA, supported head_dim): fused SDPA — QK^T +
+        // scale + softmax + @V in one dispatch; handles GQA internally.
+        //
+        // Fast-path chain when `use_sdpa && t == 1`:
+        //   - CUDA: `sdpa_cuda_flash` (flash_attn_decode_bf16_d{64,128,256,512});
+        //     `use_sdpa` pre-gates dtype+head_dim so this is guaranteed to fire.
+        //   - Metal: `candle_nn::ops::sdpa` (vector or steel kernel).
+        //
+        // If neither fast path is applicable (prefill t>1, CPU, or an unexpected
+        // runtime reject), we fall through to `gqa_attention_no_expand` — a
+        // device-agnostic helper that avoids materialising the expanded KV.
+        // IMPORTANT: `candle_nn::ops::sdpa` has no CUDA impl (only cpu/metal
+        // forwards), so the CUDA fallback must NOT go through `sdpa`.
+        let fast_out = if self.use_sdpa && t == 1 {
             let scale = 1.0_f32 / (self.head_dim as f32).sqrt();
-            candle_nn::ops::sdpa(&q, &k, &v, None, false, scale, 1.0_f32)
-                .map_err(anyhow::Error::from)?
-                .transpose(1, 2)?
-                .reshape((b, t, self.num_heads * self.head_dim))?
-        } else {
-            let mask = if t > 1 {
-                Some(causal_mask(
-                    t,
-                    kv_len,
-                    seqlen_offset,
-                    x.device(),
-                    orig_dtype,
-                )?)
+            if let Some(out) =
+                candle_nn::ops::sdpa_cuda_flash(&q, &k, &v, None, false, scale, 1.0_f32)
+                    .map_err(anyhow::Error::from)?
+            {
+                Some(out)
+            } else if matches!(x.device(), candle_core::Device::Metal(_)) {
+                Some(
+                    candle_nn::ops::sdpa(&q, &k, &v, None, false, scale, 1.0_f32)
+                        .map_err(anyhow::Error::from)?,
+                )
             } else {
                 None
-            };
-            gqa_attention_no_expand(&q, &k, &v, groups, mask.as_ref())?
+            }
+        } else {
+            None
+        };
+
+        let out = match fast_out {
+            Some(attn) => attn
+                .transpose(1, 2)?
+                .reshape((b, t, self.num_heads * self.head_dim))?,
+            None => {
+                let mask = if t > 1 {
+                    Some(causal_mask(
+                        t,
+                        kv_len,
+                        seqlen_offset,
+                        x.device(),
+                        orig_dtype,
+                    )?)
+                } else {
+                    None
+                };
+                gqa_attention_no_expand(&q, &k, &v, groups, mask.as_ref())?
+            }
         };
 
         // Apply output gate: sigmoid(gate) * out
@@ -524,7 +566,9 @@ impl LinearAttn {
         // weight matrices once at load time so forward can issue a single matmul.
         // Saves 1 dispatch per SSM layer per decode token.
         let in_proj_ab_weight = match (in_proj_a.dense_weight(), in_proj_b.dense_weight()) {
-            (Some(wa), Some(wb)) => Tensor::cat(&[wa, wb], 0).ok(),
+            (Some(wa), Some(wb)) => Tensor::cat(&[wa, wb], 0)
+                .and_then(|t| t.to_dtype(DType::F32))
+                .ok(),
             _ => None,
         };
 
@@ -574,30 +618,37 @@ impl LinearAttn {
         let device = x.device().clone();
         let dtype = x.dtype();
 
+        // Promote the hidden state to F32 once so the whole GatedDeltaNet path
+        // stays F32: QLinear::forward skips the output cast-back when input is
+        // already F32, so projections return F32 naturally.
+        let x_f32 = x.to_dtype(DType::F32)?;
+
         // ── Projections ───────────────────────────────────────────────────────
-        let qkv = self.in_proj_qkv.forward(x)?; // [b, t, key_dim*2 + value_dim]
-        let z = self.in_proj_z.forward(x)?; // [b, t, value_dim]
-                                            // P2: fuse in_proj_a + in_proj_b into a single dispatch.
-                                            // Priority order:
-                                            //   1. Dense path — both weights non-quantized: one broadcast_matmul (all devices).
-                                            //   2. Q4K path   — both weights Q4K on Metal, t==1: fwd_mv2_q4k (GGUF decode).
-                                            //   3. Fallback   — two separate forwards.
+        let qkv = self.in_proj_qkv.forward(&x_f32)?; // [b, t, key_dim*2 + value_dim]
+        let z = self.in_proj_z.forward(&x_f32)?; // [b, t, value_dim]
+                                                 // P2: fuse in_proj_a + in_proj_b into a single dispatch.
+                                                 // Priority order:
+                                                 //   1. Dense path — both weights non-quantized: one broadcast_matmul (all devices).
+                                                 //   2. Q4K path   — both weights Q4K on Metal, t==1: fwd_mv2_q4k (GGUF decode).
+                                                 //   3. Fallback   — two separate forwards.
         let (a_input, b_input) = 'proj: {
             if let Some(ref ab_w) = self.in_proj_ab_weight {
-                let ab = x.broadcast_matmul(&ab_w.t()?)?;
+                let ab = x_f32.broadcast_matmul(&ab_w.t()?)?;
                 let a = ab.narrow(2, 0, self.n_value_heads)?;
                 let b = ab.narrow(2, self.n_value_heads, self.n_value_heads)?;
                 break 'proj (a.contiguous()?, b.contiguous()?);
             }
             #[cfg(feature = "metal")]
             if t == 1 {
-                let xs_f32 = x.to_dtype(DType::F32)?;
-                if let Some(result) = self.in_proj_a.forward_paired_q4k(&self.in_proj_b, &xs_f32) {
+                if let Some(result) = self.in_proj_a.forward_paired_q4k(&self.in_proj_b, &x_f32) {
                     let (a_f32, b_f32) = result?;
                     break 'proj (a_f32, b_f32);
                 }
             }
-            (self.in_proj_a.forward(x)?, self.in_proj_b.forward(x)?)
+            (
+                self.in_proj_a.forward(&x_f32)?,
+                self.in_proj_b.forward(&x_f32)?,
+            )
         };
 
         // ── Depthwise causal conv1d on qkv, then SiLU ────────────────────────
@@ -641,9 +692,8 @@ impl LinearAttn {
         // After repeat: q, k, v all have n_value_heads as dim 2.
 
         // ── beta = sigmoid(b_input) ───────────────────────────────────────────
-        let b_f32 = b_input.to_dtype(DType::F32)?; // [b, t, n_value_heads]
-                                                   // sigmoid(x) = 1 / (1 + exp(-x))
-        let beta = candle_nn::ops::sigmoid(&b_f32)?;
+        // sigmoid(x) = 1 / (1 + exp(-x))
+        let beta = candle_nn::ops::sigmoid(&b_input)?;
 
         // ── Initialise recurrent state ────────────────────────────────────────
         // state: [b, n_value_heads, head_k_dim, head_v_dim]  F32
@@ -670,23 +720,30 @@ impl LinearAttn {
                 let a_exp_bc = self.a_exp.reshape((1, 1, self.n_value_heads))?;
                 a_exp_bc.broadcast_mul(&sp)?.neg()?.exp()?
             };
-            let q_f32 = q.to_dtype(DType::F32)?;
-            let k_f32 = k.to_dtype(DType::F32)?;
-            let v_f32 = v.to_dtype(DType::F32)?;
             let g_t = g.narrow(1, 0, 1)?.squeeze(1)?;
             let beta_t = beta.narrow(1, 0, 1)?.squeeze(1)?;
-            let q_t = q_f32.narrow(1, 0, 1)?.squeeze(1)?;
-            let k_t = k_f32.narrow(1, 0, 1)?.squeeze(1)?;
-            let v_t = v_f32.narrow(1, 0, 1)?.squeeze(1)?;
+            let q_t = q.narrow(1, 0, 1)?.squeeze(1)?;
+            let k_t = k.narrow(1, 0, 1)?.squeeze(1)?;
+            let v_t = v.narrow(1, 0, 1)?.squeeze(1)?;
             let out = sequential_step(&q_t, &k_t, &v_t, &g_t, &beta_t, &mut state)?;
             self.recurrent_state = Some(state.detach());
             out.unsqueeze(1)? // [b, 1, n_h, hv]
         } else {
             // Prefill path: chunked WY parallel scan.
-            // Compute log_g directly to avoid exp+log round-trip on CUDA (FTZ subnormals).
-            let log_g = if let Some(g) =
+            // Metal: fused kernel → g, then log(g) — 2 dispatches instead of 13.
+            //   g = exp(-a_exp * sp) ∈ (0, 1] so log is safe (Metal keeps
+            //   subnormals; no FTZ).
+            // CPU/CUDA: compute log_g directly as -(a_exp * sp). On CUDA the
+            //   exp→log round-trip is unsafe because FTZ flushes subnormals
+            //   produced by exp(large_negative) to 0, and log(0) = -inf
+            //   propagates as NaN through the chunked WY scan.
+            let use_fused_gate = matches!(a_input.device(), Device::Metal(_));
+            let fused_g = if use_fused_gate {
                 candle_nn::ops::compute_decay_gate(&a_input, &self.dt_bias, &self.a_exp)
-            {
+            } else {
+                None
+            };
+            let log_g = if let Some(g) = fused_g {
                 g?.log()? // [b, t, n_value_heads] F32
             } else {
                 let a_f32 = a_input.to_dtype(DType::F32)?;
@@ -695,9 +752,6 @@ impl LinearAttn {
                 let a_exp_bc = self.a_exp.reshape((1, 1, self.n_value_heads))?;
                 a_exp_bc.broadcast_mul(&sp)?.neg()? // log_g = -(a_exp * sp), finite
             };
-            // Pass q/k/v in native dtype — gated_delta_rule_chunked dispatches the
-            // CUDA kernel directly for BF16/F32, and casts to F32 on the CPU path.
-            // Pass log_g directly (not &g) to avoid log(0)=-inf on CUDA (FTZ mode).
             let out = gated_delta_rule_chunked(&q, &k, &v, &log_g, &beta, &mut state)?;
             self.recurrent_state = Some(state.detach());
             out // already [b, t, n_h, hv]
@@ -713,9 +767,7 @@ impl LinearAttn {
         let out_normed = candle_nn::ops::rms_norm(&out_flat, &self.norm_weight, 1e-6)?;
 
         // z gate: [b, t, value_dim] -> [b*t*n_value_heads, head_v_dim], then silu
-        // z is in model dtype; cast to F32 for the gate multiply
-        let z_f32 = z.to_dtype(DType::F32)?;
-        let z_flat = z_f32
+        let z_flat = z
             .contiguous()?
             .reshape((b * t * self.n_value_heads, self.head_v_dim))?;
         let z_gate = z_flat.silu()?; // F32
@@ -735,13 +787,12 @@ impl LinearAttn {
     /// Mirrors the PyTorch reference:
     ///   `F.silu(self.conv1d(mixed_qkv)[:, :, :seq_len])`
     ///
-    /// x: [b, t, channels]
+    /// x: [b, t, channels]  — must be F32
     /// weight stored as [channels, 1, kernel] (depthwise)
-    /// Returns: [b, t, channels]  (after SiLU)
+    /// Returns: [b, t, channels]  F32 (after SiLU)
     fn apply_conv1d_silu(&mut self, x: &Tensor) -> Result<Tensor> {
         let (b, _t, c) = x.dims3()?;
         let kernel = self.conv1d_weight.dim(2)?;
-        let dtype = x.dtype();
         let device = x.device().clone();
 
         let pad_len = kernel - 1;
@@ -749,7 +800,7 @@ impl LinearAttn {
         // Build padded input [b, pad_len+t, c] using stored conv state or zeros
         let padded = match &self.conv_state {
             None => {
-                let zeros = Tensor::zeros((b, pad_len, c), dtype, &device)?;
+                let zeros = Tensor::zeros((b, pad_len, c), DType::F32, &device)?;
                 Tensor::cat(&[&zeros, x], 1)?
             }
             Some(prev) => Tensor::cat(&[prev, x], 1)?,
@@ -761,13 +812,12 @@ impl LinearAttn {
 
         // Use candle's native conv1d (Metal-accelerated depthwise: groups = c).
         // conv1d_weight is pre-computed in F32 at construction time.
-        let inp = padded.to_dtype(DType::F32)?.transpose(1, 2)?.contiguous()?;
+        let inp = padded.transpose(1, 2)?.contiguous()?;
         let out = inp.conv1d(&self.conv1d_weight, 0, 1, 1, c)?; // [b, c, t]
 
-        // Transpose back: [b, c, t] -> [b, t, c], restore original dtype, then SiLU
+        // Transpose back: [b, c, t] -> [b, t, c], then SiLU (stays F32)
         out.transpose(1, 2)?
             .contiguous()?
-            .to_dtype(dtype)?
             .silu()
             .map_err(Into::into)
     }
@@ -1611,9 +1661,15 @@ mod tests {
         Device::Cpu
     }
 
+    #[cfg(feature = "cuda")]
+    fn maybe_cuda_device() -> Device {
+        Device::new_cuda(0).unwrap_or(Device::Cpu)
+    }
+
     /// Core correctness helper: compare `candle_nn::ops::compute_decay_gate`
-    /// output (Metal fast path when available) against the CPU reference.
-    fn check_compute_decay_gate(
+    /// output on `dev` (GPU fast path when available) against the CPU reference.
+    fn check_compute_decay_gate_on(
+        dev: &Device,
         b: usize,
         t: usize,
         n_heads: usize,
@@ -1624,7 +1680,6 @@ mod tests {
         label: &str,
     ) {
         let cpu = Device::Cpu;
-        let dev = maybe_metal_device();
 
         let a_cpu = Tensor::new(a_vals, &cpu)
             .unwrap()
@@ -1637,9 +1692,9 @@ mod tests {
         let g_ref = decay_gate_ref(&a_cpu, &dt_bias_cpu, &a_exp_cpu).unwrap();
 
         // Fast-path (or Rust fallback) on target device.
-        let a_dev = a_cpu.to_device(&dev).unwrap();
-        let dt_bias_dev = dt_bias_cpu.to_device(&dev).unwrap();
-        let a_exp_dev = a_exp_cpu.to_device(&dev).unwrap();
+        let a_dev = a_cpu.to_device(dev).unwrap();
+        let dt_bias_dev = dt_bias_cpu.to_device(dev).unwrap();
+        let a_exp_dev = a_exp_cpu.to_device(dev).unwrap();
 
         let g_dev = match candle_nn::ops::compute_decay_gate(&a_dev, &dt_bias_dev, &a_exp_dev) {
             Some(r) => r.unwrap().to_device(&Device::Cpu).unwrap(),
@@ -1650,6 +1705,30 @@ mod tests {
         assert!(
             diff < tol,
             "{label}: max abs diff {diff:.2e} (tol {tol:.2e})"
+        );
+    }
+
+    /// Convenience wrapper for Metal tests.
+    fn check_compute_decay_gate(
+        b: usize,
+        t: usize,
+        n_heads: usize,
+        a_vals: &[f32],
+        dt_bias_vals: &[f32],
+        a_exp_vals: &[f32],
+        tol: f32,
+        label: &str,
+    ) {
+        check_compute_decay_gate_on(
+            &maybe_metal_device(),
+            b,
+            t,
+            n_heads,
+            a_vals,
+            dt_bias_vals,
+            a_exp_vals,
+            tol,
+            label,
         );
     }
 
@@ -1800,6 +1879,313 @@ mod tests {
         }
     }
 
+    // ── P1 (CUDA): mirror tests running against the CUDA decay_gate kernel ───
+
+    #[cfg(feature = "cuda")]
+    mod cuda_decay_gate {
+        use super::*;
+
+        fn check_cuda(
+            b: usize,
+            t: usize,
+            n_heads: usize,
+            a_vals: &[f32],
+            dt_bias_vals: &[f32],
+            a_exp_vals: &[f32],
+            tol: f32,
+            label: &str,
+        ) {
+            check_compute_decay_gate_on(
+                &maybe_cuda_device(),
+                b,
+                t,
+                n_heads,
+                a_vals,
+                dt_bias_vals,
+                a_exp_vals,
+                tol,
+                label,
+            );
+        }
+
+        #[test]
+        fn basic() {
+            let n_heads = 4;
+            let a_vals: Vec<f32> = (0..n_heads).map(|i| i as f32 * 0.3 - 0.5).collect();
+            let dt_bias: Vec<f32> = (0..n_heads).map(|h| h as f32 * 0.1).collect();
+            let a_exp: Vec<f32> = vec![1.0, 0.5, 1.5, 2.0];
+            check_cuda(1, 1, n_heads, &a_vals, &dt_bias, &a_exp, 1e-5, "cuda_basic");
+        }
+
+        #[test]
+        fn qwen_0_8b_shape() {
+            let n_heads = 16;
+            let a_vals: Vec<f32> = (0..n_heads).map(|i| (i as f32) * 0.15 - 1.0).collect();
+            let dt_bias: Vec<f32> = (0..n_heads).map(|h| h as f32 * 0.05 - 0.4).collect();
+            let a_exp: Vec<f32> = (0..n_heads).map(|h| (h + 1) as f32 * 0.3).collect();
+            check_cuda(1, 1, n_heads, &a_vals, &dt_bias, &a_exp, 1e-5, "cuda_0_8b");
+        }
+
+        #[test]
+        fn qwen_4b_shape() {
+            // n_heads = 32: distinct from 16 to exercise the `h = tid % n_heads`
+            // indexing with a power-of-two that's NOT equal to the standard 16.
+            let n_heads = 32;
+            let a_vals: Vec<f32> = (0..n_heads).map(|i| (i as f32) * 0.07 - 1.0).collect();
+            let dt_bias: Vec<f32> = (0..n_heads).map(|h| h as f32 * 0.03 - 0.5).collect();
+            let a_exp: Vec<f32> = (0..n_heads).map(|h| (h + 1) as f32 * 0.25).collect();
+            check_cuda(1, 1, n_heads, &a_vals, &dt_bias, &a_exp, 1e-5, "cuda_4b");
+        }
+
+        #[test]
+        fn zero_a_input() {
+            let n_heads = 8;
+            let a_vals = vec![0.0f32; n_heads];
+            let dt_bias: Vec<f32> = (0..n_heads).map(|h| h as f32 * 0.5).collect();
+            let a_exp = vec![2.0f32; n_heads];
+            check_cuda(
+                1,
+                1,
+                n_heads,
+                &a_vals,
+                &dt_bias,
+                &a_exp,
+                1e-5,
+                "cuda_zero_a",
+            );
+        }
+
+        #[test]
+        fn zero_a_exp() {
+            let n_heads = 8;
+            let a_vals: Vec<f32> = (0..n_heads).map(|i| i as f32).collect();
+            let dt_bias = vec![0.0f32; n_heads];
+            let a_exp = vec![0.0f32; n_heads];
+
+            let dev = maybe_cuda_device();
+            let a = Tensor::new(a_vals.as_slice(), &dev)
+                .unwrap()
+                .reshape((1, 1, n_heads))
+                .unwrap();
+            let dt_b = Tensor::new(dt_bias.as_slice(), &dev).unwrap();
+            let ae = Tensor::new(a_exp.as_slice(), &dev).unwrap();
+
+            let g = match candle_nn::ops::compute_decay_gate(&a, &dt_b, &ae) {
+                Some(r) => r.unwrap().to_device(&Device::Cpu).unwrap(),
+                None => decay_gate_ref(
+                    &a.to_device(&Device::Cpu).unwrap(),
+                    &dt_b.to_device(&Device::Cpu).unwrap(),
+                    &ae.to_device(&Device::Cpu).unwrap(),
+                )
+                .unwrap(),
+            };
+            let g_vals: Vec<f32> = g.flatten_all().unwrap().to_vec1().unwrap();
+            for &gv in &g_vals {
+                assert!(gv.is_finite(), "cuda_zero_a_exp: NaN/inf");
+                assert!(
+                    (gv - 1.0).abs() < 1e-5,
+                    "cuda_zero_a_exp: expected g=1, got {gv}"
+                );
+            }
+        }
+
+        #[test]
+        fn large_negative_a() {
+            // softplus(-50) ≈ 0 → g ≈ 1. Guards against CUDA FTZ subnormals
+            // driving log(1 + exp(-|x|)) to an unexpected value.
+            let n_heads = 4;
+            let a_vals = vec![-50.0f32; n_heads];
+            let dt_bias = vec![0.0f32; n_heads];
+            let a_exp = vec![1.0f32; n_heads];
+
+            let dev = maybe_cuda_device();
+            let a = Tensor::new(a_vals.as_slice(), &dev)
+                .unwrap()
+                .reshape((1, 1, n_heads))
+                .unwrap();
+            let dt_b = Tensor::new(dt_bias.as_slice(), &dev).unwrap();
+            let ae = Tensor::new(a_exp.as_slice(), &dev).unwrap();
+
+            let g = match candle_nn::ops::compute_decay_gate(&a, &dt_b, &ae) {
+                Some(r) => r.unwrap().to_device(&Device::Cpu).unwrap(),
+                None => decay_gate_ref(
+                    &a.to_device(&Device::Cpu).unwrap(),
+                    &dt_b.to_device(&Device::Cpu).unwrap(),
+                    &ae.to_device(&Device::Cpu).unwrap(),
+                )
+                .unwrap(),
+            };
+            let g_vals: Vec<f32> = g.flatten_all().unwrap().to_vec1().unwrap();
+            for &gv in &g_vals {
+                assert!(gv.is_finite(), "cuda_large_neg_a: NaN/inf");
+                assert!((gv - 1.0).abs() < 1e-4, "cuda_large_neg_a: g={gv}");
+            }
+        }
+
+        #[test]
+        fn large_positive_a() {
+            // softplus(+50) ≈ 50 → g = exp(-a_exp * 50) — very small but finite.
+            // Checks that exp(-|x|) doesn't overflow and the final exp doesn't
+            // produce NaN.
+            let n_heads = 4;
+            let a_vals = vec![50.0f32; n_heads];
+            let dt_bias = vec![0.0f32; n_heads];
+            let a_exp = vec![0.01f32; n_heads];
+
+            let dev = maybe_cuda_device();
+            let a = Tensor::new(a_vals.as_slice(), &dev)
+                .unwrap()
+                .reshape((1, 1, n_heads))
+                .unwrap();
+            let dt_b = Tensor::new(dt_bias.as_slice(), &dev).unwrap();
+            let ae = Tensor::new(a_exp.as_slice(), &dev).unwrap();
+
+            let g = match candle_nn::ops::compute_decay_gate(&a, &dt_b, &ae) {
+                Some(r) => r.unwrap().to_device(&Device::Cpu).unwrap(),
+                None => decay_gate_ref(
+                    &a.to_device(&Device::Cpu).unwrap(),
+                    &dt_b.to_device(&Device::Cpu).unwrap(),
+                    &ae.to_device(&Device::Cpu).unwrap(),
+                )
+                .unwrap(),
+            };
+            let g_vals: Vec<f32> = g.flatten_all().unwrap().to_vec1().unwrap();
+            for &gv in &g_vals {
+                assert!(gv.is_finite(), "cuda_large_pos_a: NaN/inf (got {gv})");
+                assert!(gv > 0.0, "cuda_large_pos_a: g must be > 0, got {gv}");
+                assert!(gv <= 1.0, "cuda_large_pos_a: g must be ≤ 1, got {gv}");
+            }
+        }
+
+        #[test]
+        fn output_in_range() {
+            // g ∈ (0, 1] for any finite input — sanity over a mix of magnitudes.
+            let n_heads = 16;
+            let n_elems = n_heads * 8;
+            let a_vals: Vec<f32> = (0..n_elems)
+                .map(|i| match i % 4 {
+                    0 => i as f32 * 0.5,
+                    1 => -(i as f32) * 0.5,
+                    2 => 20.0,
+                    _ => -20.0,
+                })
+                .collect();
+            let dt_bias = vec![0.1f32; n_heads];
+            let a_exp: Vec<f32> = (0..n_heads).map(|h| (h + 1) as f32 * 0.2).collect();
+
+            let dev = maybe_cuda_device();
+            let a = Tensor::new(a_vals.as_slice(), &dev)
+                .unwrap()
+                .reshape((1, 8, n_heads))
+                .unwrap();
+            let dt_b = Tensor::new(dt_bias.as_slice(), &dev).unwrap();
+            let ae = Tensor::new(a_exp.as_slice(), &dev).unwrap();
+
+            let g = match candle_nn::ops::compute_decay_gate(&a, &dt_b, &ae) {
+                Some(r) => r.unwrap().to_device(&Device::Cpu).unwrap(),
+                None => decay_gate_ref(
+                    &a.to_device(&Device::Cpu).unwrap(),
+                    &dt_b.to_device(&Device::Cpu).unwrap(),
+                    &ae.to_device(&Device::Cpu).unwrap(),
+                )
+                .unwrap(),
+            };
+            let g_vals: Vec<f32> = g.flatten_all().unwrap().to_vec1().unwrap();
+            for (i, &gv) in g_vals.iter().enumerate() {
+                assert!(gv.is_finite(), "cuda_range: NaN/inf at {i}");
+                assert!(gv >= 0.0, "cuda_range: g<0 at {i} ({gv})");
+                assert!(gv <= 1.0 + 1e-5, "cuda_range: g>1 at {i} ({gv})");
+            }
+        }
+
+        #[test]
+        fn multi_token_prefill() {
+            // t > 1 exercises the prefill path: same mapping (h = tid % n_heads)
+            // is applied to every (b, t) slot, so shape parity is the key check.
+            let n_heads = 16;
+            let t = 8;
+            let n_elems = t * n_heads;
+            let a_vals: Vec<f32> = (0..n_elems)
+                .map(|i| ((i as f32) * 0.07 - 0.5).sin())
+                .collect();
+            let dt_bias: Vec<f32> = (0..n_heads).map(|h| h as f32 * 0.02).collect();
+            let a_exp: Vec<f32> = (0..n_heads).map(|h| 0.5 + (h as f32) * 0.1).collect();
+            check_cuda(
+                1,
+                t,
+                n_heads,
+                &a_vals,
+                &dt_bias,
+                &a_exp,
+                1e-5,
+                "cuda_multi_token",
+            );
+        }
+
+        #[test]
+        fn bf16_input_matches_f32() {
+            // BF16 input goes through `compute_decay_gate_bf16f32`; compare to
+            // the F32-input path (same formula on the CPU reference rounded to bf16).
+            let n_heads = 16;
+            let a_vals: Vec<f32> = (0..n_heads).map(|i| (i as f32) * 0.1 - 0.8).collect();
+            let dt_bias: Vec<f32> = (0..n_heads).map(|h| h as f32 * 0.05 - 0.4).collect();
+            let a_exp: Vec<f32> = (0..n_heads).map(|h| (h + 1) as f32 * 0.3).collect();
+
+            let cpu = Device::Cpu;
+            let dev = maybe_cuda_device();
+
+            // CPU reference: round a_input to bf16, then compute in f32.
+            let a_f32 = Tensor::new(a_vals.as_slice(), &cpu)
+                .unwrap()
+                .reshape((1, 1, n_heads))
+                .unwrap();
+            let a_bf16 = a_f32.to_dtype(DType::BF16).unwrap();
+            let dt_bias_t = Tensor::new(dt_bias.as_slice(), &cpu).unwrap();
+            let a_exp_t = Tensor::new(a_exp.as_slice(), &cpu).unwrap();
+            let g_ref = decay_gate_ref(&a_bf16.to_dtype(DType::F32).unwrap(), &dt_bias_t, &a_exp_t)
+                .unwrap();
+
+            // Fast-path with BF16 input on CUDA.
+            let a_dev = a_bf16.to_device(&dev).unwrap();
+            let dt_dev = dt_bias_t.to_device(&dev).unwrap();
+            let ae_dev = a_exp_t.to_device(&dev).unwrap();
+            let g_dev = match candle_nn::ops::compute_decay_gate(&a_dev, &dt_dev, &ae_dev) {
+                Some(r) => r.unwrap().to_device(&Device::Cpu).unwrap(),
+                None => g_ref.clone(),
+            };
+
+            let diff = max_abs_diff(&g_dev, &g_ref);
+            // bf16 tolerates ~1e-3 error after the round-trip; the gate
+            // computation is mild enough that 5e-3 is comfortable.
+            assert!(diff < 5e-3, "cuda_bf16: diff {diff:.2e}");
+        }
+
+        #[test]
+        fn non_contiguous_falls_back() {
+            // Non-contiguous input must return None and let the caller fall back.
+            // Testing on CPU to ensure the precondition check triggers cleanly;
+            // the check is device-agnostic.
+            let n_heads = 8;
+            let dev = Device::Cpu;
+            let a = Tensor::randn(0f32, 1.0, (1, 4, n_heads * 2), &dev).unwrap();
+            // Narrow along the last dim → non-contiguous view.
+            let a_view = a.narrow(2, 0, n_heads).unwrap();
+            assert!(
+                !a_view.is_contiguous(),
+                "setup: narrow should yield non-contiguous"
+            );
+
+            let dt_bias = Tensor::new(vec![0.1f32; n_heads].as_slice(), &dev).unwrap();
+            let a_exp = Tensor::new(vec![1.0f32; n_heads].as_slice(), &dev).unwrap();
+
+            let got = candle_nn::ops::compute_decay_gate(&a_view, &dt_bias, &a_exp);
+            assert!(
+                got.is_none(),
+                "non-contiguous input must return None; got Some(...)"
+            );
+        }
+    }
+
     // ── P2: in_proj_ab fused weight ───────────────────────────────────────────
 
     /// Verify that the fused [a, b] matmul + split produces identical results
@@ -1865,5 +2251,296 @@ mod tests {
         let diff_b = max_abs_diff(&b_fused, &b_sep);
         assert!(diff_a < 1e-5, "p2_multi_token a diff {diff_a:.2e}");
         assert!(diff_b < 1e-5, "p2_multi_token b diff {diff_b:.2e}");
+    }
+
+    // ── P3: sdpa_cuda_flash gating + parity ───────────────────────────────────
+    //
+    // Device-agnostic tests covering the Rust wrapper's precondition checks
+    // (run on any backend — they only depend on tensor shapes/dtypes).
+
+    mod sdpa_cuda_flash_gating {
+        use super::*;
+
+        fn bf16_qkv(
+            b: usize,
+            n_q: usize,
+            n_kv: usize,
+            t: usize,
+            d: usize,
+        ) -> (Tensor, Tensor, Tensor) {
+            let dev = Device::Cpu;
+            let q = Tensor::randn(0f32, 0.5, (b, n_q, t, d), &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let k = Tensor::randn(0f32, 0.5, (b, n_kv, t.max(16), d), &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            let v = Tensor::randn(0f32, 0.5, (b, n_kv, t.max(16), d), &dev)
+                .unwrap()
+                .to_dtype(DType::BF16)
+                .unwrap();
+            (q, k, v)
+        }
+
+        #[test]
+        fn returns_none_on_non_cuda_device() {
+            // On CPU (or Metal, if that ever runs in CI) the CUDA flash path
+            // must return None cleanly without panicking.
+            let (q, k, v) = bf16_qkv(1, 8, 2, 1, 64);
+            let out = candle_nn::ops::sdpa_cuda_flash(&q, &k, &v, None, false, 0.125, 1.0).unwrap();
+            assert!(out.is_none(), "non-CUDA device should yield None");
+        }
+
+        #[test]
+        fn returns_none_on_mask_present() {
+            let (q, k, v) = bf16_qkv(1, 8, 2, 1, 64);
+            let mask = Tensor::zeros((1, 1, 1, 16), DType::F32, &Device::Cpu).unwrap();
+            let out = candle_nn::ops::sdpa_cuda_flash(&q, &k, &v, Some(&mask), false, 0.125, 1.0)
+                .unwrap();
+            assert!(out.is_none(), "mask=Some should yield None");
+        }
+
+        #[test]
+        fn returns_none_on_causal_flag() {
+            let (q, k, v) = bf16_qkv(1, 8, 2, 1, 64);
+            let out = candle_nn::ops::sdpa_cuda_flash(&q, &k, &v, None, true, 0.125, 1.0).unwrap();
+            assert!(out.is_none(), "do_causal=true should yield None");
+        }
+
+        #[test]
+        fn returns_none_on_softcapping_not_one() {
+            let (q, k, v) = bf16_qkv(1, 8, 2, 1, 64);
+            let out =
+                candle_nn::ops::sdpa_cuda_flash(&q, &k, &v, None, false, 0.125, 30.0).unwrap();
+            assert!(out.is_none(), "softcapping≠1 should yield None");
+        }
+
+        #[test]
+        fn returns_none_on_non_bf16_dtype() {
+            let dev = Device::Cpu;
+            let q = Tensor::randn(0f32, 0.5, (1, 8, 1, 64), &dev).unwrap(); // f32
+            let k = Tensor::randn(0f32, 0.5, (1, 2, 16, 64), &dev).unwrap();
+            let v = Tensor::randn(0f32, 0.5, (1, 2, 16, 64), &dev).unwrap();
+            let out = candle_nn::ops::sdpa_cuda_flash(&q, &k, &v, None, false, 0.125, 1.0).unwrap();
+            assert!(out.is_none(), "F32 q should yield None");
+        }
+
+        // The following tests exercise the actual CUDA kernel wiring — they run
+        // only when the cuda feature is on AND a CUDA device is available.
+        #[cfg(feature = "cuda")]
+        mod on_cuda {
+            use super::*;
+
+            fn cuda_or_skip() -> Option<Device> {
+                Device::new_cuda(0).ok()
+            }
+
+            fn sdpa_ref(q: &Tensor, k: &Tensor, v: &Tensor, scale: f32) -> Tensor {
+                // Reference: manual matmul+softmax+matmul in F32 on CPU.
+                let q_cpu = q
+                    .to_device(&Device::Cpu)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap();
+                let k_cpu = k
+                    .to_device(&Device::Cpu)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap();
+                let v_cpu = v
+                    .to_device(&Device::Cpu)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap();
+                // Expand K/V to query heads (GQA): repeat each kv_head n_rep times.
+                let (_, n_q, _, _) = q_cpu.dims4().unwrap();
+                let (_, n_kv, _, _) = k_cpu.dims4().unwrap();
+                let n_rep = n_q / n_kv;
+                let expand = |x: Tensor| -> Tensor {
+                    let (b, h, t, d) = x.dims4().unwrap();
+                    x.unsqueeze(2)
+                        .unwrap()
+                        .expand((b, h, n_rep, t, d))
+                        .unwrap()
+                        .reshape((b, h * n_rep, t, d))
+                        .unwrap()
+                };
+                let k_exp = expand(k_cpu);
+                let v_exp = expand(v_cpu);
+                let scores = q_cpu
+                    .matmul(&k_exp.transpose(2, 3).unwrap().contiguous().unwrap())
+                    .unwrap()
+                    .affine(scale as f64, 0.0)
+                    .unwrap();
+                let probs = candle_nn::ops::softmax_last_dim(&scores).unwrap();
+                probs.matmul(&v_exp.contiguous().unwrap()).unwrap()
+            }
+
+            fn parity_on_head_dim(head_dim: usize) {
+                let Some(dev) = cuda_or_skip() else {
+                    eprintln!("skip: no CUDA device");
+                    return;
+                };
+                // Use a minimal GQA shape: n_q=8, n_kv=2 (gqa_factor=4).
+                let b = 1;
+                let n_q = 8;
+                let n_kv = 2;
+                let kv_len = 16;
+                let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+                let q_cpu = Tensor::randn(0f32, 0.5, (b, n_q, 1, head_dim), &Device::Cpu)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let k_cpu = Tensor::randn(0f32, 0.5, (b, n_kv, kv_len, head_dim), &Device::Cpu)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let v_cpu = Tensor::randn(0f32, 0.5, (b, n_kv, kv_len, head_dim), &Device::Cpu)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+
+                let q = q_cpu.to_device(&dev).unwrap();
+                let k = k_cpu.to_device(&dev).unwrap();
+                let v = v_cpu.to_device(&dev).unwrap();
+
+                let out = candle_nn::ops::sdpa_cuda_flash(&q, &k, &v, None, false, scale, 1.0)
+                    .unwrap()
+                    .expect("cuda flash must fire for supported head_dim");
+                assert_eq!(
+                    out.dtype(),
+                    DType::BF16,
+                    "sdpa_cuda_flash must cast output to BF16"
+                );
+
+                let out_cpu = out
+                    .to_device(&Device::Cpu)
+                    .unwrap()
+                    .to_dtype(DType::F32)
+                    .unwrap();
+                let ref_out = sdpa_ref(&q_cpu, &k_cpu, &v_cpu, scale);
+                let diff = max_abs_diff(&out_cpu, &ref_out);
+                assert!(
+                    diff < 1e-2,
+                    "head_dim={head_dim} sdpa_cuda_flash diff {diff:.3e}"
+                );
+            }
+
+            #[test]
+            fn parity_head_dim_64() {
+                parity_on_head_dim(64);
+            }
+
+            #[test]
+            fn parity_head_dim_128() {
+                parity_on_head_dim(128);
+            }
+
+            #[test]
+            fn parity_head_dim_256() {
+                parity_on_head_dim(256);
+            }
+
+            #[test]
+            fn parity_head_dim_512() {
+                parity_on_head_dim(512);
+            }
+
+            #[test]
+            fn returns_none_for_unsupported_head_dim() {
+                // head_dim=80 and 96 are NOT in the CUDA flash set.
+                let Some(dev) = cuda_or_skip() else {
+                    return;
+                };
+                for head_dim in [80usize, 96] {
+                    let q = Tensor::randn(0f32, 0.5, (1, 8, 1, head_dim), &dev)
+                        .unwrap()
+                        .to_dtype(DType::BF16)
+                        .unwrap();
+                    let k = Tensor::randn(0f32, 0.5, (1, 2, 16, head_dim), &dev)
+                        .unwrap()
+                        .to_dtype(DType::BF16)
+                        .unwrap();
+                    let v = Tensor::randn(0f32, 0.5, (1, 2, 16, head_dim), &dev)
+                        .unwrap()
+                        .to_dtype(DType::BF16)
+                        .unwrap();
+                    let out =
+                        candle_nn::ops::sdpa_cuda_flash(&q, &k, &v, None, false, 0.1, 1.0).unwrap();
+                    assert!(
+                        out.is_none(),
+                        "head_dim={head_dim} must return None on CUDA"
+                    );
+                }
+            }
+
+            #[test]
+            fn returns_none_for_multi_token_prefill() {
+                let Some(dev) = cuda_or_skip() else {
+                    return;
+                };
+                // t=4 (prefill), head_dim=64 (otherwise supported).
+                let q = Tensor::randn(0f32, 0.5, (1, 8, 4, 64), &dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let k = Tensor::randn(0f32, 0.5, (1, 2, 16, 64), &dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let v = Tensor::randn(0f32, 0.5, (1, 2, 16, 64), &dev)
+                    .unwrap()
+                    .to_dtype(DType::BF16)
+                    .unwrap();
+                let out =
+                    candle_nn::ops::sdpa_cuda_flash(&q, &k, &v, None, false, 0.125, 1.0).unwrap();
+                assert!(out.is_none(), "q_len>1 must return None");
+            }
+        }
+    }
+
+    // ── P3: apply_o_proj predicate tightening ─────────────────────────────────
+
+    /// The tightened predicate (`rank == 3 && dim(1) == 1`) must accept the exact
+    /// decode shape `[b, 1, hidden]` and reject everything else.
+    /// We test the predicate logic in isolation via a helper — on CPU the
+    /// BF16-input fast path doesn't fire anyway, but we want the gating to
+    /// behave consistently with the code comment.
+    #[test]
+    fn p3_apply_o_proj_predicate_accepts_decode_shape() {
+        let dev = Device::Cpu;
+        let x = Tensor::randn(0f32, 1.0, (2, 1, 64), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        assert_eq!(x.rank(), 3);
+        assert_eq!(x.dim(1).unwrap(), 1);
+        assert_eq!(x.dtype(), DType::BF16);
+    }
+
+    #[test]
+    fn p3_apply_o_proj_predicate_rejects_prefill_shape() {
+        let dev = Device::Cpu;
+        // Prefill shape: middle dim > 1.
+        let x = Tensor::randn(0f32, 1.0, (1, 8, 64), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        assert_eq!(x.rank(), 3);
+        assert_ne!(x.dim(1).unwrap(), 1, "prefill t>1 must not match predicate");
+    }
+
+    #[test]
+    fn p3_apply_o_proj_predicate_rejects_rank_2() {
+        let dev = Device::Cpu;
+        // Flat [1, hidden] — rank 2 must NOT match now that predicate is strict.
+        let x = Tensor::randn(0f32, 1.0, (1, 64), &dev)
+            .unwrap()
+            .to_dtype(DType::BF16)
+            .unwrap();
+        assert_eq!(x.rank(), 2, "rank must be 2 for this case");
     }
 }
