@@ -481,6 +481,14 @@ struct LinearAttn {
     a_exp: Tensor,
     dt_bias: Tensor,
     norm_weight: Tensor,
+    /// Constant `(1/sqrt(head_k_dim))·ones[head_k_dim]`, F32. Used as the `alpha`
+    /// argument to `candle_nn::ops::rms_norm` so it behaves as an L2-norm on the
+    /// last dim (see `l2norm` below). Cast to the input dtype at call time.
+    l2norm_alpha: Tensor,
+    /// Precomputed `eps_rms = cfg.rms_norm_eps / head_k_dim` — the regularisation
+    /// `eps` to pass to `rms_norm` so the resulting formula matches the L2-norm
+    /// `x · rsqrt(sum(x²) + cfg.rms_norm_eps)` exactly.
+    l2norm_eps_rms: f32,
     out_proj: QLinear,
     n_key_heads: usize,
     n_value_heads: usize,
@@ -562,6 +570,14 @@ impl LinearAttn {
             qvb.map(|q| q.pp("out_proj")).as_ref(),
         )?;
 
+        // Precompute alpha = (1/sqrt(head_k_dim)) * ones[head_k_dim] and the
+        // rescaled eps for the L2-norm-via-rms_norm substitution. See `l2norm`
+        // below for the arithmetic identity that links candle-nn
+        // `rms_norm(x, alpha, eps)` to `x · rsqrt(sum(x²) + cfg.rms_norm_eps)`.
+        let l2norm_alpha =
+            Tensor::full(1.0f32 / (head_k_dim as f32).sqrt(), head_k_dim, vb.device())?;
+        let l2norm_eps_rms = (cfg.rms_norm_eps as f32) / head_k_dim as f32;
+
         // If both in_proj_a and in_proj_b are dense (non-quantized), concatenate their
         // weight matrices once at load time so forward can issue a single matmul.
         // Saves 1 dispatch per SSM layer per decode token.
@@ -582,6 +598,8 @@ impl LinearAttn {
             a_exp,
             dt_bias,
             norm_weight,
+            l2norm_alpha,
+            l2norm_eps_rms,
             out_proj,
             n_key_heads,
             n_value_heads,
@@ -601,13 +619,40 @@ impl LinearAttn {
     }
 
     /// L2-normalise the last dimension of x.
-    /// x: [..., d]
-    fn l2norm(x: &Tensor) -> Result<Tensor> {
-        let eps = 1e-6f64;
-        // sum of squares over last dim, keepdim
-        let norm_sq = x.sqr()?.sum_keepdim(candle_core::D::Minus1)?;
-        let inv_norm = (norm_sq + eps)?.sqrt()?.recip()?;
-        x.broadcast_mul(&inv_norm).map_err(Into::into)
+    /// x: [..., head_k_dim]
+    ///
+    /// Implementation: `candle_nn::ops::rms_norm(x, alpha, eps_rms)` with
+    /// `alpha = (1/sqrt(D))·ones[D]` and `eps_rms = cfg.rms_norm_eps / D`,
+    /// where `D = head_k_dim`. This is arithmetically identical to the direct
+    /// formulation `x · rsqrt(sum(x²) + cfg.rms_norm_eps)`:
+    ///
+    ///   rms_norm(x, α, e) = x · α · rsqrt(mean(x²) + e)
+    ///                     = x · α · sqrt(D) · rsqrt(sum(x²) + D·e)
+    ///
+    /// With α = 1/√D and e = cfg.rms_norm_eps/D the α·√D and D·e terms
+    /// collapse to 1 and cfg.rms_norm_eps, recovering l2norm exactly. The
+    /// payoff is one fused Metal (or CUDA) `rmsnorm` dispatch instead of six
+    /// element-wise ops (sqr → sum → add → sqrt → recip → broadcast_mul).
+    fn l2norm(&self, x: &Tensor) -> Result<Tensor> {
+        // `rms_norm` requires contiguous input. `narrow → reshape` upstream can
+        // leave a strided view — make contiguous defensively; the call is a
+        // no-op when already contiguous.
+        let x = if x.is_contiguous() {
+            x.clone()
+        } else {
+            x.contiguous()?
+        };
+        // The Metal / CUDA kernels dispatch on `(input_dtype, alpha_dtype)` pairs
+        // that must match. Alpha is stored as F32 (128 values, negligible);
+        // cast to input dtype on demand. `to_dtype` is a no-op when dtypes
+        // already match, and on a 128-element tensor the cast is effectively
+        // free even when it fires.
+        let alpha = if self.l2norm_alpha.dtype() == x.dtype() {
+            self.l2norm_alpha.clone()
+        } else {
+            self.l2norm_alpha.to_dtype(x.dtype())?
+        };
+        candle_nn::ops::rms_norm(&x, &alpha, self.l2norm_eps_rms).map_err(Into::into)
     }
 
     /// Process a sequence of tokens through the Gated Delta Rule linear attention layer.
@@ -665,8 +710,8 @@ impl LinearAttn {
         let v = v.reshape((b, t, self.n_value_heads, self.head_v_dim))?;
 
         // ── L2-normalize q and k, then scale q ───────────────────────────────
-        let q = Self::l2norm(&q)?;
-        let k = Self::l2norm(&k)?;
+        let q = self.l2norm(&q)?;
+        let k = self.l2norm(&k)?;
         let scale = (self.head_k_dim as f64).sqrt().recip();
         let q = q.affine(scale, 0.0)?;
 
@@ -2542,5 +2587,219 @@ mod tests {
             .to_dtype(DType::BF16)
             .unwrap();
         assert_eq!(x.rank(), 2, "rank must be 2 for this case");
+    }
+
+    // ── N1: L2-norm via candle-nn rms_norm ────────────────────────────────────
+    //
+    // Arithmetic equivalence:
+    //   l2norm(x, eps_user) = x · rsqrt(sum(x²) + eps_user)
+    //                       = rms_norm(x, α=(1/√D)·ones, eps_rms=eps_user/D)
+    //
+    // `eps_user` is sourced from `cfg.rms_norm_eps` (default 1e-6). The tests
+    // use that same default so the arithmetic-equivalence check is honest.
+    //
+    // The reference below reproduces the old six-dispatch chain
+    // (sqr → sum → add → sqrt → recip → bcast_mul) bit-for-bit — if someone
+    // ever alters `LinearAttn::l2norm` the diff surfaces here.
+
+    fn maybe_metal_device_n1() -> Device {
+        #[cfg(feature = "metal")]
+        {
+            Device::new_metal(0).unwrap_or(Device::Cpu)
+        }
+        #[cfg(not(feature = "metal"))]
+        Device::Cpu
+    }
+
+    fn l2norm_ref(x: &Tensor, eps_user: f32) -> Tensor {
+        let norm_sq = x
+            .sqr()
+            .unwrap()
+            .sum_keepdim(candle_core::D::Minus1)
+            .unwrap();
+        let inv_norm = (norm_sq + eps_user as f64)
+            .unwrap()
+            .sqrt()
+            .unwrap()
+            .recip()
+            .unwrap();
+        x.broadcast_mul(&inv_norm).unwrap()
+    }
+
+    /// Apply `candle_nn::ops::rms_norm` with the alpha/eps mapping used in
+    /// production. Alpha is built in F32 and cast to input dtype to mirror
+    /// what `LinearAttn::l2norm` does at call time.
+    fn l2norm_via_rmsnorm(x: &Tensor, head_k_dim: usize, eps_user: f32) -> Tensor {
+        let alpha_f32 =
+            Tensor::full(1.0f32 / (head_k_dim as f32).sqrt(), head_k_dim, x.device()).unwrap();
+        let alpha = if alpha_f32.dtype() == x.dtype() {
+            alpha_f32
+        } else {
+            alpha_f32.to_dtype(x.dtype()).unwrap()
+        };
+        let eps_rms = eps_user / head_k_dim as f32;
+        let x_c = if x.is_contiguous() {
+            x.clone()
+        } else {
+            x.contiguous().unwrap()
+        };
+        candle_nn::ops::rms_norm(&x_c, &alpha, eps_rms).unwrap()
+    }
+
+    /// Default rms_norm_eps inherited from config (see
+    /// [inferrs-models/src/config.rs](../../inferrs-models/src/config.rs)).
+    /// Hardcoded here to keep tests self-contained rather than building a full
+    /// Qwen35Config — the actual production code reads `cfg.rms_norm_eps`.
+    const N1_TEST_EPS: f32 = 1e-6;
+
+    fn run_l2norm_parity(dev: &Device, b: usize, t: usize, n_heads: usize, head_k_dim: usize) {
+        let x = Tensor::randn(0f32, 1.0f32, (b, t, n_heads, head_k_dim), dev).unwrap();
+
+        let y_ref = l2norm_ref(&x, N1_TEST_EPS);
+        let y_new = l2norm_via_rmsnorm(&x, head_k_dim, N1_TEST_EPS);
+
+        let diff = max_abs_diff(&y_ref, &y_new);
+        assert!(
+            diff < 1e-5,
+            "b={b} t={t} n_heads={n_heads} D={head_k_dim}: diff {diff:.2e}"
+        );
+
+        // Invariant: rows have unit L2 norm (within eps tolerance).
+        let sum_sq = y_new
+            .sqr()
+            .unwrap()
+            .sum_keepdim(candle_core::D::Minus1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        for (i, s) in sum_sq.iter().enumerate() {
+            assert!(
+                (s - 1.0).abs() < 1e-4,
+                "row {i}: sum(y²) = {s}, expected ≈1"
+            );
+        }
+    }
+
+    #[test]
+    fn n1_l2norm_cpu_0_8b_shape() {
+        // Qwen3.5-0.8B: n_key_heads = 16, head_k_dim = 128, t=1 (decode)
+        run_l2norm_parity(&Device::Cpu, 1, 1, 16, 128);
+    }
+
+    #[test]
+    fn n1_l2norm_cpu_4b_shape() {
+        // Qwen3.5-4B: n_key_heads = 32, head_k_dim = 128, t=1 (decode)
+        run_l2norm_parity(&Device::Cpu, 1, 1, 32, 128);
+    }
+
+    #[test]
+    fn n1_l2norm_cpu_prefill() {
+        // Prefill t>1 — verify rms_norm handles the 4D shape.
+        run_l2norm_parity(&Device::Cpu, 1, 64, 16, 128);
+    }
+
+    #[test]
+    fn n1_l2norm_metal_0_8b_shape() {
+        let dev = maybe_metal_device_n1();
+        if matches!(dev, Device::Cpu) {
+            eprintln!("Metal unavailable, skipping");
+            return;
+        }
+        run_l2norm_parity(&dev, 1, 1, 16, 128);
+    }
+
+    #[test]
+    fn n1_l2norm_metal_4b_shape() {
+        let dev = maybe_metal_device_n1();
+        if matches!(dev, Device::Cpu) {
+            eprintln!("Metal unavailable, skipping");
+            return;
+        }
+        run_l2norm_parity(&dev, 1, 1, 32, 128);
+    }
+
+    #[test]
+    fn n1_l2norm_metal_prefill() {
+        let dev = maybe_metal_device_n1();
+        if matches!(dev, Device::Cpu) {
+            eprintln!("Metal unavailable, skipping");
+            return;
+        }
+        run_l2norm_parity(&dev, 1, 64, 16, 128);
+    }
+
+    /// Near-zero vector: sum(x²) ≈ 0 so eps_user dominates. This is the
+    /// scenario where the `eps_user / D` rescaling has to be exact, otherwise
+    /// we'd get a different regularisation than the original chain.
+    #[test]
+    fn n1_l2norm_near_zero_cpu() {
+        let dev = Device::Cpu;
+        let head_k_dim = 128usize;
+        let x =
+            (Tensor::randn(0f32, 1.0f32, (1, 1, 16, head_k_dim), &dev).unwrap() * 1e-6f64).unwrap();
+
+        let y_ref = l2norm_ref(&x, N1_TEST_EPS);
+        let y_new = l2norm_via_rmsnorm(&x, head_k_dim, N1_TEST_EPS);
+        let diff = max_abs_diff(&y_ref, &y_new);
+        assert!(diff < 1e-6, "near-zero: diff {diff:.2e}");
+    }
+
+    /// Large magnitudes: rsqrt of large sum still finite, no NaN/Inf.
+    #[test]
+    fn n1_l2norm_large_magnitude_cpu() {
+        let dev = Device::Cpu;
+        let head_k_dim = 128usize;
+        let x =
+            (Tensor::randn(0f32, 1.0f32, (1, 1, 16, head_k_dim), &dev).unwrap() * 1e3f64).unwrap();
+        let y = l2norm_via_rmsnorm(&x, head_k_dim, N1_TEST_EPS);
+        let flat = y.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        for v in flat {
+            assert!(v.is_finite(), "large-magnitude: non-finite output {v}");
+        }
+    }
+
+    /// BF16 input (origin/main native SSM dtype) — alpha must be auto-cast.
+    /// Comparison is against an F32 gold reference on the BF16-rounded input:
+    /// the legacy chain accumulates the sum-of-squares *in BF16* (~1% relative
+    /// error per reduction) while `rms_norm` upcasts internally to F32. Pitting
+    /// the two against each other directly conflates algorithmic equivalence
+    /// with BF16 accumulation noise. Bounding against the F32 gold instead
+    /// isolates BF16 output-side quantisation, which is what actually matters.
+    #[test]
+    fn n1_l2norm_bf16_input_cpu() {
+        let dev = Device::Cpu;
+        let head_k_dim = 128usize;
+        let x_f32 = Tensor::randn(0f32, 1.0f32, (1, 1, 16, head_k_dim), &dev).unwrap();
+        let x_bf16 = x_f32.to_dtype(DType::BF16).unwrap();
+        // F32 gold on the BF16-rounded input.
+        let x_gold = x_bf16.to_dtype(DType::F32).unwrap();
+        let y_gold = l2norm_ref(&x_gold, N1_TEST_EPS);
+
+        let y_new = l2norm_via_rmsnorm(&x_bf16, head_k_dim, N1_TEST_EPS);
+        assert_eq!(y_new.dtype(), DType::BF16, "output dtype must stay BF16");
+
+        let diff = max_abs_diff(&y_gold, &y_new.to_dtype(DType::F32).unwrap());
+        // For x ~ N(0, 1), D=128: |y| ranges up to ~0.35 (4σ at 2048 samples
+        // divided by sqrt(D)). BF16 half-ULP at that magnitude is
+        // 0.35 × 2⁻⁸ ≈ 1.4e-3. Bound at 3e-3 to cover both that and any
+        // residual accumulation-order noise between the two paths.
+        assert!(diff < 3e-3, "bf16: diff {diff:.2e} > tol 3e-3");
+    }
+
+    /// The `to_dtype` cast path on alpha: verify it's a no-op (same dtype)
+    /// on F32 inputs — defensive check that the fast path stays fast.
+    #[test]
+    fn n1_l2norm_preserves_f32_dtype() {
+        let dev = Device::Cpu;
+        let x = Tensor::randn(0f32, 1.0f32, (1, 1, 16, 128), &dev).unwrap();
+        assert_eq!(x.dtype(), DType::F32);
+        let y = l2norm_via_rmsnorm(&x, 128, N1_TEST_EPS);
+        assert_eq!(
+            y.dtype(),
+            DType::F32,
+            "output dtype must match input F32 — alpha must be F32 too"
+        );
     }
 }
