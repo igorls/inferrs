@@ -17,6 +17,16 @@ else
   GO_INSTALL_NAME_RELEASE = -ldflags='-s -w'
 endif
 
+# The standalone OCI helper uses the platform executable suffix on Windows.
+ifeq ($(OS),Windows_NT)
+  HELPER_BIN_EXT := .exe
+else
+  HELPER_BIN_EXT :=
+endif
+
+# Keep the helper filename in one place so build targets match Rust probing.
+HELPER_BIN := inferrs-oci-models$(HELPER_BIN_EXT)
+
 # inferrs-backend-cuda is only built on Linux or Windows x86_64 (not macOS,
 # not Windows ARM64).
 ifeq ($(UNAME_S),Darwin)
@@ -51,10 +61,10 @@ all: lint test build
 ui:
 	cargo build -p inferrs
 
-build: oci-lib
+build: oci-lib oci-models
 	cargo build $(NO_GPU_PKGS)
 
-release: oci-lib-release
+release: oci-lib-release oci-models-release
 	cargo build --release $(NO_GPU_PKGS)
 
 lint:
@@ -77,11 +87,11 @@ oci-lib-release:
 		-trimpath $(GO_INSTALL_NAME_RELEASE) \
 		-o ../target/release/libocimodels.$(LIB_EXT) .
 
-# Standalone CLI binary (optional, useful for debugging).
+# Standalone CLI binary used by the HTTP server for OCI pull streaming.
 oci-models:
 	mkdir -p target/debug
-	cd oci-models && go build -o ../target/debug/inferrs-oci-models .
+	cd oci-models && go build -o ../target/debug/$(HELPER_BIN) .
 
 oci-models-release:
 	mkdir -p target/release
-	cd oci-models && go build -trimpath -ldflags='-s -w' -o ../target/release/inferrs-oci-models .
+	cd oci-models && go build -trimpath -ldflags='-s -w' -o ../target/release/$(HELPER_BIN) .

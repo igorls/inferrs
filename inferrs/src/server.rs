@@ -16,8 +16,11 @@ use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 use tower_http::cors::CorsLayer;
 
 use crate::engine::{
@@ -815,6 +818,78 @@ pub struct OllamaShowResponse {
     pub model_info: serde_json::Value,
 }
 
+/// `POST /api/pull` request.
+#[derive(Debug, Deserialize)]
+pub struct OllamaPullRequest {
+    /// Canonical Ollama field for the target model.
+    #[serde(default)]
+    pub model: String,
+    /// Legacy alias still accepted by Ollama-compatible clients.
+    #[serde(default)]
+    pub name: String,
+    /// Accepted for compatibility. The current helper decides transport.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub insecure: bool,
+    /// When `false`, wait for completion and return a single JSON object.
+    #[serde(default)]
+    pub stream: Option<bool>,
+}
+
+impl OllamaPullRequest {
+    /// Return the client-requested model, preferring `name` over `model`.
+    fn requested_model(&self) -> Option<&str> {
+        let preferred = if self.name.trim().is_empty() {
+            self.model.trim()
+        } else {
+            self.name.trim()
+        };
+        if preferred.is_empty() {
+            None
+        } else {
+            Some(preferred)
+        }
+    }
+}
+
+/// One NDJSON status object emitted by `POST /api/pull`.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct OllamaPullStatus {
+    /// Human-readable pull phase such as `pulling manifest`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// Layer digest currently being downloaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub digest: Option<String>,
+    /// Total bytes in the current layer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    /// Bytes already downloaded for the current layer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed: Option<u64>,
+    /// Error text emitted after streaming has already started.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl OllamaPullStatus {
+    /// Build a terminal success object.
+    fn success() -> Self {
+        Self {
+            status: Some("success".to_string()),
+            ..Self::default()
+        }
+    }
+
+    /// Build a terminal error object.
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            error: Some(message.into()),
+            ..Self::default()
+        }
+    }
+}
+
 /// `GET /api/version` response.
 #[derive(Debug, Serialize)]
 pub struct OllamaVersionResponse {
@@ -1023,6 +1098,31 @@ enum ModelSlot {
     Failed(String),
 }
 
+/// Maps normalized OCI references to their active pull job.
+type PullRegistry = Arc<Mutex<HashMap<String, Arc<ActivePull>>>>;
+
+/// Shared pull manager for `POST /api/pull`.
+#[derive(Clone, Default)]
+struct PullManager {
+    /// In-flight OCI pulls keyed by normalized model reference.
+    active: PullRegistry,
+}
+
+/// One active OCI pull plus the channels used by HTTP subscribers.
+struct ActivePull {
+    /// Fan-out channel for NDJSON progress lines.
+    tx: broadcast::Sender<axum::body::Bytes>,
+    /// Already-emitted NDJSON lines kept for late subscribers.
+    ///
+    /// The mutex also serialises history snapshots with new broadcasts so
+    /// late subscribers never see the same NDJSON line twice.
+    history: Arc<Mutex<Vec<axum::body::Bytes>>>,
+    /// Final pull result once the helper process exits.
+    done_rx: watch::Receiver<Option<Result<(), String>>>,
+    /// Count of blocking `stream=false` waiters that still need the job alive.
+    waiters: Arc<AtomicUsize>,
+}
+
 struct AppState {
     /// The current model slot — empty, loading, or ready.
     slot: tokio::sync::RwLock<ModelSlot>,
@@ -1032,6 +1132,255 @@ struct AppState {
     serve_args: crate::ServeArgs,
     /// HTTP client used by the daemon to proxy requests to workers.
     http_client: reqwest::Client,
+    /// Shared OCI pull coordination for Ollama-compatible clients.
+    pull_manager: PullManager,
+}
+
+/// Keeps a blocking `stream=false` waiter counted while it is alive.
+struct PullWaitGuard {
+    /// Shared waiter counter for the underlying pull job.
+    waiters: Arc<AtomicUsize>,
+}
+
+impl PullWaitGuard {
+    /// Increment the waiter count until the guard is dropped.
+    fn new(waiters: Arc<AtomicUsize>) -> Self {
+        waiters.fetch_add(1, Ordering::Relaxed);
+        Self { waiters }
+    }
+}
+
+impl Drop for PullWaitGuard {
+    fn drop(&mut self) {
+        self.waiters.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl ActivePull {
+    /// Snapshot pull history and subscribe to future progress atomically.
+    async fn snapshot_stream(
+        &self,
+    ) -> (
+        Vec<axum::body::Bytes>,
+        broadcast::Receiver<axum::body::Bytes>,
+    ) {
+        let history = self.history.lock().await;
+        let snapshot = history.clone();
+        let rx = self.tx.subscribe();
+        (snapshot, rx)
+    }
+}
+
+impl PullManager {
+    /// Return the existing pull job for `reference`, or start a new one.
+    async fn get_or_start(&self, reference: &str) -> Result<Arc<ActivePull>, String> {
+        let key = crate::pull::normalize_oci_reference(reference);
+        let mut guard = self.active.lock().await;
+        if let Some(active) = guard.get(&key) {
+            return Ok(Arc::clone(active));
+        }
+
+        let active = spawn_active_pull(self.active.clone(), key.clone(), reference.to_string())?;
+        guard.insert(key, Arc::clone(&active));
+        Ok(active)
+    }
+}
+
+/// Spawn the standalone OCI helper and return the shared pull state.
+fn spawn_active_pull(
+    registry: PullRegistry,
+    key: String,
+    reference: String,
+) -> Result<Arc<ActivePull>, String> {
+    let helper = crate::pull::oci_helper_binary().map_err(|e| e.to_string())?;
+    let mut child = tokio::process::Command::new(&helper)
+        .arg("stream")
+        .arg(&reference)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("failed to spawn {}: {e}", helper.display()))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "OCI helper did not expose stdout".to_string())?;
+
+    let (tx, _) = broadcast::channel(256);
+    let (done_tx, done_rx) = watch::channel(None);
+    let waiters = Arc::new(AtomicUsize::new(0));
+    let history = Arc::new(Mutex::new(Vec::new()));
+
+    let active = Arc::new(ActivePull {
+        tx: tx.clone(),
+        history: Arc::clone(&history),
+        done_rx,
+        waiters: Arc::clone(&waiters),
+    });
+
+    tokio::spawn(async move {
+        run_active_pull(registry, key, child, stdout, tx, history, done_tx, waiters).await;
+    });
+
+    Ok(active)
+}
+
+/// Drain helper stdout, fan out progress lines, and publish the final result.
+async fn run_active_pull(
+    registry: PullRegistry,
+    key: String,
+    mut child: tokio::process::Child,
+    stdout: tokio::process::ChildStdout,
+    tx: broadcast::Sender<axum::body::Bytes>,
+    history: Arc<Mutex<Vec<axum::body::Bytes>>>,
+    done_tx: watch::Sender<Option<Result<(), String>>>,
+    waiters: Arc<AtomicUsize>,
+) {
+    let mut lines = BufReader::new(stdout).lines();
+    let mut last_error: Option<String> = None;
+    let mut emitted_error_line = false;
+    let mut cancelled = false;
+
+    loop {
+        tokio::select! {
+            line = lines.next_line() => {
+                match line {
+                    Ok(Some(raw_line)) => {
+                        let trimmed = raw_line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        match helper_pull_line(trimmed) {
+                            Ok((bytes, maybe_error)) => {
+                                if let Some(error) = maybe_error {
+                                    last_error = Some(error);
+                                    emitted_error_line = true;
+                                }
+                                publish_pull_bytes(&tx, history.as_ref(), bytes).await;
+                            }
+                            Err(err) => {
+                                last_error = Some(err.clone());
+                                if let Ok(bytes) =
+                                    serialize_pull_line(&OllamaPullStatus::error(&err))
+                                {
+                                    publish_pull_bytes(&tx, history.as_ref(), bytes).await;
+                                    emitted_error_line = true;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(err) => {
+                        last_error = Some(format!(
+                            "failed to read OCI pull progress: {err}"
+                        ));
+                        break;
+                    }
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                if tx.receiver_count() == 0 && waiters.load(Ordering::Relaxed) == 0 {
+                    cancelled = true;
+                    let _ = child.start_kill();
+                }
+            }
+        }
+    }
+
+    let final_result = match child.wait().await {
+        Ok(_status) if cancelled => {
+            Err("OCI pull cancelled because all clients disconnected".to_string())
+        }
+        Ok(status) if status.success() => match last_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        },
+        Ok(status) => {
+            Err(last_error.unwrap_or_else(|| format!("OCI helper exited with status {status}")))
+        }
+        Err(err) => Err(format!("failed to wait for OCI pull helper: {err}")),
+    };
+
+    if let Err(ref message) = final_result {
+        if !emitted_error_line {
+            if let Ok(bytes) = serialize_pull_line(&OllamaPullStatus::error(message)) {
+                publish_pull_bytes(&tx, history.as_ref(), bytes).await;
+            }
+        }
+    }
+
+    let _ = done_tx.send(Some(final_result));
+    let mut guard = registry.lock().await;
+    guard.remove(&key);
+}
+
+/// Parse and re-encode one helper line before exposing it to HTTP clients.
+fn helper_pull_line(line: &str) -> Result<(axum::body::Bytes, Option<String>), String> {
+    let status: OllamaPullStatus =
+        serde_json::from_str(line).map_err(|e| format!("invalid OCI pull progress JSON: {e}"))?;
+    let error = status.error.clone();
+    let bytes = serialize_pull_line(&status)?;
+    Ok((bytes, error))
+}
+
+/// Append one NDJSON line to history and broadcast it in the same order.
+///
+/// The shared history mutex keeps snapshots and broadcasts in lockstep so
+/// late subscribers either see a line in history or receive it from the
+/// channel, but never both.
+async fn publish_pull_bytes(
+    tx: &broadcast::Sender<axum::body::Bytes>,
+    history: &Mutex<Vec<axum::body::Bytes>>,
+    bytes: axum::body::Bytes,
+) {
+    let mut history = history.lock().await;
+    history.push(bytes.clone());
+    let _ = tx.send(bytes);
+}
+
+/// Serialize one pull status object as an NDJSON line.
+fn serialize_pull_line(status: &OllamaPullStatus) -> Result<axum::body::Bytes, String> {
+    let mut data =
+        serde_json::to_vec(status).map_err(|e| format!("failed to encode pull progress: {e}"))?;
+    data.push(b'\n');
+    Ok(axum::body::Bytes::from(data))
+}
+
+/// Wait for the terminal result of an active pull job.
+async fn wait_for_active_pull(active: &ActivePull) -> Result<(), String> {
+    let _guard = PullWaitGuard::new(Arc::clone(&active.waiters));
+    let mut done_rx = active.done_rx.clone();
+
+    loop {
+        if let Some(result) = done_rx.borrow().clone() {
+            return result;
+        }
+        done_rx
+            .changed()
+            .await
+            .map_err(|_| "OCI pull result channel closed unexpectedly".to_string())?;
+    }
+}
+
+/// Convert a broadcast receiver into an NDJSON response body.
+fn make_ollama_pull_stream(
+    history: Vec<axum::body::Bytes>,
+    mut rx: broadcast::Receiver<axum::body::Bytes>,
+) -> impl Stream<Item = Result<axum::body::Bytes, Infallible>> {
+    async_stream::stream! {
+        for bytes in history {
+            yield Ok(bytes);
+        }
+
+        loop {
+            match rx.recv().await {
+                Ok(bytes) => yield Ok(bytes),
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
 }
 
 fn audio_error(message: impl Into<String>) -> (StatusCode, Json<ErrorResponse>) {
@@ -1478,6 +1827,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         default_params,
         serve_args: args.clone(),
         http_client: reqwest::Client::new(),
+        pull_manager: PullManager::default(),
     });
 
     // If a model was specified on the CLI, start loading it in the background
@@ -1549,6 +1899,7 @@ pub async fn run(args: ServeArgs) -> Result<()> {
         .route("/api/tags", get(ollama_tags).head(ollama_tags))
         .route("/api/ps", get(ollama_ps))
         .route("/api/show", post(ollama_show))
+        .route("/api/pull", post(ollama_pull))
         .route("/api/generate", post(ollama_generate))
         .route("/api/chat", post(ollama_chat))
         .route("/api/embed", post(ollama_embed))
@@ -3455,6 +3806,67 @@ async fn ollama_show(
     }))
 }
 
+/// `POST /api/pull` — pull one OCI model with Ollama-compatible progress.
+async fn ollama_pull(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<OllamaPullRequest>,
+) -> Result<Response, OllamaHttpError> {
+    let requested = req.requested_model().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "`model` or `name` is required"
+            })),
+        )
+    })?;
+
+    if crate::pull::classify_reference(requested) != crate::pull::RefKind::Oci {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": concat!(
+                    "/api/pull only supports OCI references. ",
+                    "Use a single-word model like `gemma3` or ",
+                    "an explicit registry reference like ",
+                    "`docker.io/ai/gemma3:latest`. ",
+                    "Bare `org/model` references are treated as ",
+                    "Hugging Face models."
+                )
+            })),
+        ));
+    }
+
+    let active = state
+        .pull_manager
+        .get_or_start(requested)
+        .await
+        .map_err(|message| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": message })),
+            )
+        })?;
+
+    if req.stream == Some(false) {
+        wait_for_active_pull(&active).await.map_err(|message| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": message })),
+            )
+        })?;
+        return Ok(Json(OllamaPullStatus::success()).into_response());
+    }
+
+    let (history, rx) = active.snapshot_stream().await;
+    let stream = make_ollama_pull_stream(history, rx);
+
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/x-ndjson")],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response())
+}
+
 /// Return the RFC3339 timestamp for right now (UTC).
 fn rfc3339_now() -> String {
     // Produce a simple ISO-8601 / RFC-3339 timestamp without pulling in chrono.
@@ -4544,6 +4956,84 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
         }
+    }
+
+    #[test]
+    fn ollama_pull_request_prefers_name_field() {
+        // Prefer the legacy `name` field when both are present.
+        let req = OllamaPullRequest {
+            model: "gemma3".to_string(),
+            name: "custom".to_string(),
+            insecure: false,
+            stream: None,
+        };
+        assert_eq!(req.requested_model(), Some("custom"));
+
+        // Fall back to `model` when `name` is empty.
+        let req = OllamaPullRequest {
+            model: "gemma3".to_string(),
+            name: String::new(),
+            insecure: false,
+            stream: None,
+        };
+        assert_eq!(req.requested_model(), Some("gemma3"));
+    }
+
+    #[test]
+    fn helper_pull_line_round_trips_ollama_status() {
+        // Helper output must remain valid Ollama NDJSON after re-encoding.
+        let line = concat!(
+            r#"{"status":"pulling sha256:deadbeef","digest":"sha256:deadbeef","#,
+            r#""total":42,"completed":7}"#
+        );
+        let (bytes, error) = helper_pull_line(line).unwrap();
+        assert_eq!(error, None);
+
+        let encoded = std::str::from_utf8(&bytes).unwrap();
+        let status: OllamaPullStatus = serde_json::from_str(encoded.trim_end()).unwrap();
+        assert_eq!(status.status.as_deref(), Some("pulling sha256:deadbeef"));
+        assert_eq!(status.digest.as_deref(), Some("sha256:deadbeef"));
+        assert_eq!(status.total, Some(42));
+        assert_eq!(status.completed, Some(7));
+    }
+
+    #[tokio::test]
+    async fn active_pull_snapshot_stream_receives_future_line_once() {
+        // Publish one line before subscribing so it must come from history.
+        let (tx, _) = broadcast::channel(16);
+        let (_done_tx, done_rx) = watch::channel::<Option<Result<(), String>>>(None);
+        let history = Arc::new(Mutex::new(Vec::new()));
+        let active = ActivePull {
+            tx: tx.clone(),
+            history: Arc::clone(&history),
+            done_rx,
+            waiters: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let manifest = serialize_pull_line(&OllamaPullStatus {
+            status: Some("pulling manifest".to_string()),
+            ..OllamaPullStatus::default()
+        })
+        .unwrap();
+        publish_pull_bytes(&tx, history.as_ref(), manifest.clone()).await;
+
+        // Snapshotting should replay history exactly once and subscribe only
+        // to future lines.
+        let (snapshot, mut rx) = active.snapshot_stream().await;
+        assert_eq!(snapshot, vec![manifest]);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        // Publish one future line and confirm the receiver gets it once.
+        let success = serialize_pull_line(&OllamaPullStatus::success()).unwrap();
+        publish_pull_bytes(&tx, history.as_ref(), success.clone()).await;
+        assert_eq!(rx.recv().await.unwrap(), success);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[test]

@@ -58,6 +58,12 @@ const LIB_NAME: &str = "ocimodels.dll";
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 const LIB_NAME: &str = "libocimodels.so";
 
+/// Platform-specific helper binary name used by the HTTP server.
+#[cfg(target_os = "windows")]
+const HELPER_BIN_NAME: &str = "inferrs-oci-models.exe";
+#[cfg(not(target_os = "windows"))]
+const HELPER_BIN_NAME: &str = "inferrs-oci-models";
+
 /// Try to load the OCI shared library, returning a reference to the resolved
 /// function pointers.  The library is loaded at most once; subsequent calls
 /// return the cached result.
@@ -128,6 +134,89 @@ fn get_last_oci_error(lib: &OciLib) -> String {
         (lib.free_string)(err_ptr);
         msg
     }
+}
+
+/// Normalize an OCI reference the same way Docker Model Runner does.
+///
+/// This is used only for `/api/pull` bookkeeping so concurrent pull requests
+/// such as `gemma3` and `ai/gemma3:latest` share the same in-flight job.
+pub fn normalize_oci_reference(reference: &str) -> String {
+    const DEFAULT_ORG: &str = "ai";
+    const DEFAULT_TAG: &str = "latest";
+
+    let mut reference = reference.trim().to_string();
+    if reference.is_empty() {
+        return reference;
+    }
+
+    if let Some(rest) = reference.strip_prefix("hf.co/") {
+        reference = format!("huggingface.co/{rest}");
+    }
+
+    let last_slash = reference.rfind('/').unwrap_or(0);
+    let last_colon = reference.rfind(':');
+    let has_tag = matches!(last_colon, Some(idx) if idx > last_slash);
+
+    let (mut name, tag) = if has_tag {
+        let colon = last_colon.expect("checked above");
+        let name = reference[..colon].to_string();
+        let tag = reference[colon + 1..].trim();
+        let tag = if tag.is_empty() { DEFAULT_TAG } else { tag };
+        (name, tag.to_string())
+    } else {
+        (reference, DEFAULT_TAG.to_string())
+    };
+
+    let first_slash = name.find('/');
+    let has_registry = matches!(first_slash, Some(idx) if name[..idx].contains('.'));
+
+    if !has_registry && !name.contains('/') {
+        name = format!("{DEFAULT_ORG}/{name}");
+    }
+
+    format!("{}:{tag}", name.to_lowercase())
+}
+
+/// Resolve the standalone OCI helper binary used by the HTTP server.
+pub fn oci_helper_binary() -> Result<PathBuf> {
+    for env_name in ["INFERRS_OCI_MODELS_BIN", "INFERRS_OCI_PULL_BIN"] {
+        if let Some(path) = std::env::var_os(env_name) {
+            let path = PathBuf::from(path);
+            anyhow::ensure!(
+                path.exists(),
+                "{env_name} points to a missing helper: {}",
+                path.display()
+            );
+            return Ok(path);
+        }
+    }
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            let sibling = parent.join(HELPER_BIN_NAME);
+            if sibling.exists() {
+                return Ok(sibling);
+            }
+        }
+    }
+
+    if let Some(path) = find_in_path(HELPER_BIN_NAME) {
+        return Ok(path);
+    }
+
+    anyhow::bail!(
+        "OCI pull streaming requires {}. Build it with `make oci-models` and \
+         place it next to the inferrs binary, or set INFERRS_OCI_MODELS_BIN.",
+        HELPER_BIN_NAME
+    );
+}
+
+/// Search for a binary in the current PATH.
+fn find_in_path(file_name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    std::env::split_paths(&path_var)
+        .map(|dir| dir.join(file_name))
+        .find(|candidate| candidate.is_file())
 }
 
 // ---------------------------------------------------------------------------
@@ -362,6 +451,7 @@ mod tests {
         // Single word → OCI (docker.io/ai)
         assert_eq!(classify_reference("gemma3"), RefKind::Oci);
         assert_eq!(classify_reference("llama"), RefKind::Oci);
+        assert_eq!(classify_reference("gemma3:latest"), RefKind::Oci);
 
         // org/model → HuggingFace
         assert_eq!(
@@ -391,5 +481,15 @@ mod tests {
 
         // localhost without a port → OCI (local registry)
         assert_eq!(classify_reference("localhost/model"), RefKind::Oci);
+    }
+
+    #[test]
+    fn test_normalize_oci_reference_matches_dmr_defaults() {
+        assert_eq!(normalize_oci_reference("gemma3"), "ai/gemma3:latest");
+        assert_eq!(normalize_oci_reference("AI/Gemma3"), "ai/gemma3:latest");
+        assert_eq!(
+            normalize_oci_reference("registry.example.com/MyOrg/Model:Q4_K_M"),
+            "registry.example.com/myorg/model:Q4_K_M"
+        );
     }
 }
