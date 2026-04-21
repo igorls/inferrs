@@ -71,7 +71,7 @@ HEXAGON_PKG := -p inferrs-backend-hexagon
 # and can be built anywhere (they probe at runtime via dlopen/LoadLibrary).
 NO_GPU_PKGS := -p inferrs -p inferrs-benchmark -p inferrs-multimodal -p inferrs-kernels -p inferrs-backend-vulkan $(HEXAGON_PKG) -p inferrs-backend-openvino $(CUDA_PKG) $(METAL_PKG)
 
-.PHONY: all build release lint test ui oci-lib oci-lib-release oci-models oci-models-release
+.PHONY: all build release lint test ui oci-lib oci-lib-release
 
 all: lint test build
 
@@ -80,10 +80,10 @@ all: lint test build
 ui:
 	cargo build -p inferrs
 
-build: oci-lib oci-models
+build: oci-lib
 	cargo build $(NO_GPU_PKGS) $(CUDA_FEATURES)
 
-release: oci-lib-release oci-models-release
+release: oci-lib-release
 	cargo build --release $(NO_GPU_PKGS) $(CUDA_FEATURES)
 
 lint:

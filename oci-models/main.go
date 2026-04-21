@@ -26,15 +26,6 @@ import (
 	"github.com/docker/model-runner/pkg/distribution/oci"
 )
 
-// ollamaPullStatus matches the NDJSON objects emitted by Ollama's /api/pull.
-type ollamaPullStatus struct {
-	Status    string `json:"status,omitempty"`
-	Digest    string `json:"digest,omitempty"`
-	Total     uint64 `json:"total,omitempty"`
-	Completed uint64 `json:"completed,omitempty"`
-	Error     string `json:"error,omitempty"`
-}
-
 // cmdPull pulls a model and prints its bundle directory to stdout.
 func cmdPull(ref string) error {
 	client, err := newClient()
@@ -225,20 +216,6 @@ func writeStreamError(err error) error {
 	}
 	_ = writePullStatus(ollamaPullStatus{Error: err.Error()})
 	return err
-}
-
-// shortDigest shortens a SHA-256 digest for Ollama-style progress messages.
-func shortDigest(digest string) string {
-	const prefix = "sha256:"
-	const shortLen = 12
-
-	if len(digest) >= len(prefix)+shortLen && digest[:len(prefix)] == prefix {
-		return digest[len(prefix) : len(prefix)+shortLen]
-	}
-	if len(digest) > shortLen {
-		return digest[:shortLen]
-	}
-	return digest
 }
 
 // usage prints CLI usage help to stderr.

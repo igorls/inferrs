@@ -14,9 +14,8 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use std::ffi::{CStr, CString};
+use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::io::Write;
-use std::os::raw::c_char;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
@@ -32,6 +31,12 @@ use std::sync::OnceLock;
 /// Function-pointer signatures matching the Go C exports in lib.go.
 type FnOciPull = unsafe extern "C" fn(*const c_char) -> *mut c_char;
 type FnOciBundle = unsafe extern "C" fn(*const c_char) -> *mut c_char;
+type FnOciPullStream = unsafe extern "C" fn(
+    *const c_char,
+    Option<unsafe extern "C" fn(*const c_char, *mut c_void)>,
+    *mut c_void,
+) -> c_int;
+type FnOciList = unsafe extern "C" fn() -> *mut c_char;
 type FnOciLastError = unsafe extern "C" fn() -> *mut c_char;
 type FnOciFreeString = unsafe extern "C" fn(*mut c_char);
 
@@ -42,6 +47,8 @@ struct OciLib {
     _lib: libloading::Library,
     pull: FnOciPull,
     bundle: FnOciBundle,
+    pull_stream: FnOciPullStream,
+    list: FnOciList,
     last_error: FnOciLastError,
     free_string: FnOciFreeString,
 }
@@ -63,11 +70,6 @@ const LIB_NAME: &str = "ocimodels.dll";
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 const LIB_NAME: &str = "libocimodels.so";
 
-/// Platform-specific helper binary name used by the HTTP server.
-#[cfg(target_os = "windows")]
-const HELPER_BIN_NAME: &str = "inferrs-oci-models.exe";
-#[cfg(not(target_os = "windows"))]
-const HELPER_BIN_NAME: &str = "inferrs-oci-models";
 
 /// Try to load the OCI shared library, returning a reference to the resolved
 /// function pointers.  The library is loaded at most once; subsequent calls
@@ -103,7 +105,7 @@ fn try_load_oci_lib() -> Result<OciLib, String> {
         )
     })?;
 
-    // Resolve the four exported symbols.
+    // Resolve the exported symbols.
     unsafe {
         let pull: FnOciPull = *lib
             .get::<FnOciPull>(b"oci_pull\0")
@@ -111,6 +113,12 @@ fn try_load_oci_lib() -> Result<OciLib, String> {
         let bundle: FnOciBundle = *lib
             .get::<FnOciBundle>(b"oci_bundle\0")
             .map_err(|e| format!("failed to resolve oci_bundle: {e}"))?;
+        let pull_stream: FnOciPullStream = *lib
+            .get::<FnOciPullStream>(b"oci_pull_stream\0")
+            .map_err(|e| format!("failed to resolve oci_pull_stream: {e}"))?;
+        let list: FnOciList = *lib
+            .get::<FnOciList>(b"oci_list\0")
+            .map_err(|e| format!("failed to resolve oci_list: {e}"))?;
         let last_error: FnOciLastError = *lib
             .get::<FnOciLastError>(b"oci_last_error\0")
             .map_err(|e| format!("failed to resolve oci_last_error: {e}"))?;
@@ -122,6 +130,8 @@ fn try_load_oci_lib() -> Result<OciLib, String> {
             _lib: lib,
             pull,
             bundle,
+            pull_stream,
+            list,
             last_error,
             free_string,
         })
@@ -182,46 +192,97 @@ pub fn normalize_oci_reference(reference: &str) -> String {
     format!("{}:{tag}", name.to_lowercase())
 }
 
-/// Resolve the standalone OCI helper binary used by the HTTP server.
-pub fn oci_helper_binary() -> Result<PathBuf> {
-    for env_name in ["INFERRS_OCI_MODELS_BIN", "INFERRS_OCI_PULL_BIN"] {
-        if let Some(path) = std::env::var_os(env_name) {
-            let path = PathBuf::from(path);
-            anyhow::ensure!(
-                path.exists(),
-                "{env_name} points to a missing helper: {}",
-                path.display()
-            );
-            return Ok(path);
-        }
-    }
+// ---------------------------------------------------------------------------
+// OCI pull streaming (via FFI callback) — used by the HTTP server's
+// `POST /api/pull` endpoint to stream Ollama-compatible NDJSON progress
+// without spawning a separate helper process.
+// ---------------------------------------------------------------------------
 
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            let sibling = parent.join(HELPER_BIN_NAME);
-            if sibling.exists() {
-                return Ok(sibling);
-            }
-        }
-    }
-
-    if let Some(path) = find_in_path(HELPER_BIN_NAME) {
-        return Ok(path);
-    }
-
-    anyhow::bail!(
-        "OCI pull streaming requires {}. Build it with `make oci-models` and \
-         place it next to the inferrs binary, or set INFERRS_OCI_MODELS_BIN.",
-        HELPER_BIN_NAME
-    );
+/// Handle returned by [`oci_pull_stream_start`].  The receiver yields one
+/// NDJSON line per message; when the channel closes the pull is complete.
+pub struct OciStreamHandle {
+    /// Receiver for NDJSON progress lines from the Go shared library.
+    pub lines: tokio::sync::mpsc::UnboundedReceiver<String>,
 }
 
-/// Search for a binary in the current PATH.
-fn find_in_path(file_name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var)
-        .map(|dir| dir.join(file_name))
-        .find(|candidate| candidate.is_file())
+/// C callback trampoline invoked by the Go shared library for each NDJSON
+/// progress line.  `ctx` points to a boxed `UnboundedSender<String>`.
+///
+/// # Safety
+/// Called from Go goroutines via the C trampoline.  The pointer must remain
+/// valid until `oci_pull_stream` returns (guaranteed by the caller).
+unsafe extern "C" fn pull_stream_trampoline(line: *const c_char, ctx: *mut c_void) {
+    if line.is_null() || ctx.is_null() {
+        return;
+    }
+    let tx = unsafe { &*(ctx as *const tokio::sync::mpsc::UnboundedSender<String>) };
+    if let Ok(s) = unsafe { CStr::from_ptr(line) }.to_str() {
+        let _ = tx.send(s.to_string());
+    }
+}
+
+/// Start an OCI pull with streaming Ollama-compatible NDJSON progress.
+///
+/// The pull runs on a dedicated OS thread (the Go shared library blocks).
+/// Each NDJSON line is delivered through the returned channel.  When the
+/// channel closes, the pull is complete.  Errors are communicated as NDJSON
+/// objects with an `"error"` field, matching the Ollama wire format.
+pub fn oci_pull_stream_start(reference: &str) -> Result<OciStreamHandle> {
+    let lib = load_oci_lib().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let c_ref = CString::new(reference).context("OCI reference contains interior NUL byte")?;
+
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+
+    std::thread::spawn(move || {
+        // Box the sender and convert to a raw pointer inside the thread so
+        // the raw pointer never crosses a thread boundary from Rust's
+        // perspective.  The Go callback may invoke it from any goroutine
+        // thread, which is safe because UnboundedSender::send is threadsafe.
+        let tx_ptr = Box::into_raw(Box::new(tx));
+        unsafe {
+            (lib.pull_stream)(
+                c_ref.as_ptr(),
+                Some(pull_stream_trampoline),
+                tx_ptr as *mut c_void,
+            );
+            // Reclaim and drop the sender, closing the channel.
+            drop(Box::from_raw(tx_ptr));
+        }
+    });
+
+    Ok(OciStreamHandle { lines: rx })
+}
+
+/// List all OCI models in the local store.
+///
+/// Returns a list of `(tag, digest)` pairs.
+#[allow(dead_code)]
+pub fn oci_list_models() -> Result<Vec<(String, String)>> {
+    let lib = load_oci_lib().map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let result = unsafe { (lib.list)() };
+    if result.is_null() {
+        let err = get_last_oci_error(lib);
+        anyhow::bail!("OCI list failed: {err}");
+    }
+
+    let raw = unsafe {
+        let s = CStr::from_ptr(result).to_string_lossy().into_owned();
+        (lib.free_string)(result);
+        s
+    };
+
+    let entries = raw
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.splitn(2, '\t');
+            let tag = parts.next()?;
+            let id = parts.next()?;
+            Some((tag.to_string(), id.to_string()))
+        })
+        .collect();
+
+    Ok(entries)
 }
 
 // ---------------------------------------------------------------------------

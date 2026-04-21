@@ -16,10 +16,8 @@ use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::convert::Infallible;
-use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex};
 use tower_http::cors::CorsLayer;
 
@@ -1258,25 +1256,14 @@ impl PullManager {
     }
 }
 
-/// Spawn the standalone OCI helper and return the shared pull state.
+/// Start an OCI pull via the shared library and return the shared pull state.
 fn spawn_active_pull(
     registry: PullRegistry,
     key: String,
     reference: String,
 ) -> Result<Arc<ActivePull>, String> {
-    let helper = crate::pull::oci_helper_binary().map_err(|e| e.to_string())?;
-    let mut child = tokio::process::Command::new(&helper)
-        .arg("stream")
-        .arg(&reference)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("failed to spawn {}: {e}", helper.display()))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "OCI helper did not expose stdout".to_string())?;
+    let mut stream_handle = crate::pull::oci_pull_stream_start(&reference)
+        .map_err(|e| e.to_string())?;
 
     let (tx, _) = broadcast::channel(256);
     let (done_tx, done_rx) = watch::channel(None);
@@ -1291,33 +1278,39 @@ fn spawn_active_pull(
     });
 
     tokio::spawn(async move {
-        run_active_pull(registry, key, child, stdout, tx, history, done_tx, waiters).await;
+        run_active_pull(
+            registry,
+            key,
+            &mut stream_handle.lines,
+            tx,
+            history,
+            done_tx,
+            waiters,
+        )
+        .await;
     });
 
     Ok(active)
 }
 
-/// Drain helper stdout, fan out progress lines, and publish the final result.
+/// Drain FFI progress lines, fan out to subscribers, and publish the final result.
 async fn run_active_pull(
     registry: PullRegistry,
     key: String,
-    mut child: tokio::process::Child,
-    stdout: tokio::process::ChildStdout,
+    line_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
     tx: broadcast::Sender<axum::body::Bytes>,
     history: Arc<Mutex<Vec<axum::body::Bytes>>>,
     done_tx: watch::Sender<Option<Result<(), String>>>,
     waiters: Arc<AtomicUsize>,
 ) {
-    let mut lines = BufReader::new(stdout).lines();
     let mut last_error: Option<String> = None;
     let mut emitted_error_line = false;
-    let mut cancelled = false;
 
     loop {
         tokio::select! {
-            line = lines.next_line() => {
+            line = line_rx.recv() => {
                 match line {
-                    Ok(Some(raw_line)) => {
+                    Some(raw_line) => {
                         let trimmed = raw_line.trim();
                         if trimmed.is_empty() {
                             continue;
@@ -1342,36 +1335,24 @@ async fn run_active_pull(
                             }
                         }
                     }
-                    Ok(None) => break,
-                    Err(err) => {
-                        last_error = Some(format!(
-                            "failed to read OCI pull progress: {err}"
-                        ));
-                        break;
-                    }
+                    None => break, // Channel closed — pull complete.
                 }
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                // If no subscribers remain, stop broadcasting.  The Go pull
+                // continues to completion in the background but we no longer
+                // buffer its output.
                 if tx.receiver_count() == 0 && waiters.load(Ordering::Relaxed) == 0 {
-                    cancelled = true;
-                    let _ = child.start_kill();
+                    line_rx.close();
+                    break;
                 }
             }
         }
     }
 
-    let final_result = match child.wait().await {
-        Ok(_status) if cancelled => {
-            Err("OCI pull cancelled because all clients disconnected".to_string())
-        }
-        Ok(status) if status.success() => match last_error {
-            Some(error) => Err(error),
-            None => Ok(()),
-        },
-        Ok(status) => {
-            Err(last_error.unwrap_or_else(|| format!("OCI helper exited with status {status}")))
-        }
-        Err(err) => Err(format!("failed to wait for OCI pull helper: {err}")),
+    let final_result = match last_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     };
 
     if let Err(ref message) = final_result {
