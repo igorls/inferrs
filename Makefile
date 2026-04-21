@@ -17,6 +17,16 @@ else
   GO_INSTALL_NAME_RELEASE = -ldflags='-s -w'
 endif
 
+# The standalone OCI helper uses the platform executable suffix on Windows.
+ifeq ($(OS),Windows_NT)
+  HELPER_BIN_EXT := .exe
+else
+  HELPER_BIN_EXT :=
+endif
+
+# Keep the helper filename in one place so build targets match Rust probing.
+HELPER_BIN := inferrs-oci-models$(HELPER_BIN_EXT)
+
 # inferrs-backend-cuda is only built on Linux or Windows x86_64 (not macOS,
 # not Windows ARM64).  When it is included, the `cuda` feature of the main
 # binary / multimodal / kernels crates is also enabled so the direct-linked
@@ -61,7 +71,7 @@ HEXAGON_PKG := -p inferrs-backend-hexagon
 # and can be built anywhere (they probe at runtime via dlopen/LoadLibrary).
 NO_GPU_PKGS := -p inferrs -p inferrs-benchmark -p inferrs-multimodal -p inferrs-kernels -p inferrs-backend-vulkan $(HEXAGON_PKG) -p inferrs-backend-openvino $(CUDA_PKG) $(METAL_PKG)
 
-.PHONY: all build release lint test ui oci-lib oci-lib-release oci-models oci-models-release
+.PHONY: all build release lint test ui oci-lib oci-lib-release
 
 all: lint test build
 
@@ -96,11 +106,11 @@ oci-lib-release:
 		-trimpath $(GO_INSTALL_NAME_RELEASE) \
 		-o ../target/release/libocimodels.$(LIB_EXT) .
 
-# Standalone CLI binary (optional, useful for debugging).
+# Standalone CLI binary used by the HTTP server for OCI pull streaming.
 oci-models:
 	mkdir -p target/debug
-	cd oci-models && go build -o ../target/debug/inferrs-oci-models .
+	cd oci-models && go build -o ../target/debug/$(HELPER_BIN) .
 
 oci-models-release:
 	mkdir -p target/release
-	cd oci-models && go build -trimpath -ldflags='-s -w' -o ../target/release/inferrs-oci-models .
+	cd oci-models && go build -trimpath -ldflags='-s -w' -o ../target/release/$(HELPER_BIN) .
