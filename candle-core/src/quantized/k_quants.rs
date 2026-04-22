@@ -2820,16 +2820,14 @@ impl GgmlType for BlockIq4Xs {
                 let scale_l = (block.scales_l[ibw / 2] >> (4 * (ibw % 2))) & 0xf;
                 let scale_h = ((block.scales_h >> (2 * ibw as u16)) & 3) as i32;
                 let scale = d * ((scale_l as i32 | (scale_h << 4)) - 32) as f32;
-                for il in 0..4_usize {
-                    let q4_base = 16 * ibw + 4 * il;
-                    for j in 0..4_usize {
-                        let byte = block.qs[q4_base + j];
-                        let lo = (byte & 0xf) as usize;
-                        let hi = ((byte >> 4) & 0xf) as usize;
-                        let out_base = 32 * ibw + 8 * il + j;
-                        y[out_base] = scale * KVALUES_IQ4NL[lo] as f32;
-                        y[out_base + 4] = scale * KVALUES_IQ4NL[hi] as f32;
-                    }
+                let qs = &block.qs[16 * ibw..16 * ibw + 16];
+                let y_sub = &mut y[32 * ibw..32 * (ibw + 1)];
+                for j in 0..16_usize {
+                    let byte = qs[j];
+                    let lo = (byte & 0xf) as usize;
+                    let hi = ((byte >> 4) & 0xf) as usize;
+                    y_sub[j] = scale * KVALUES_IQ4NL[lo] as f32;
+                    y_sub[j + 16] = scale * KVALUES_IQ4NL[hi] as f32;
                 }
             }
         }
@@ -2845,5 +2843,58 @@ impl GgmlType for BlockIq4Xs {
 
     fn vec_dot_unopt(_n: usize, _xs: &[Self], _ys: &[Self::VecDotType]) -> f32 {
         unimplemented!("IQ4_XS vec_dot is GPU-only")
+    }
+}
+
+#[cfg(test)]
+mod iq4xs_tests {
+    use super::*;
+
+    // Test A: CPU `BlockIq4Xs::to_float` nibble layout matches the ggml reference.
+    // The canonical layout (llama.cpp `dequantize_row_iq4_xs`) places lo nibbles of
+    // qs[0..16] at y[0..16] and hi nibbles at y[16..32] within each 32-element sub-block.
+    #[test]
+    fn iq4xs_to_float_matches_reference_layout() {
+        // One block with d = 1.0, scales laid out so every sub-block has scale = 1.
+        // scales encoding per sub-block: ((scale_l | (scale_h << 4)) - 32); choose
+        // scale_l = 0x1, scale_h = 0x2 → (1 | (2 << 4)) - 32 = 33 - 32 = 1. So each
+        // nibble scale_l is 0x1 and each scale_h bit-pair is 0b10 (= 2).
+        let mut qs = [0u8; QK_K / 2];
+        for (j, q) in qs.iter_mut().enumerate() {
+            // nibbles that index into KVALUES_IQ4NL deterministically
+            let lo = (j & 0xf) as u8;
+            let hi = ((j + 7) & 0xf) as u8;
+            *q = (hi << 4) | lo;
+        }
+        let scales_l = [0x11u8; QK_K / 64]; // each nibble = 0x1
+        let scales_h = 0xAAAA_u16; // every bit-pair = 0b10 = 2
+
+        let block = BlockIq4Xs {
+            d: f16::from_f32(1.0),
+            scales_h,
+            scales_l,
+            qs,
+        };
+        let mut ys = vec![0.0f32; QK_K];
+        BlockIq4Xs::to_float(std::slice::from_ref(&block), &mut ys);
+
+        for ibw in 0..8 {
+            let sub = &ys[32 * ibw..32 * (ibw + 1)];
+            let sub_qs = &qs[16 * ibw..16 * ibw + 16];
+            for j in 0..16 {
+                let expected_lo = KVALUES_IQ4NL[(sub_qs[j] & 0xf) as usize] as f32;
+                let expected_hi = KVALUES_IQ4NL[((sub_qs[j] >> 4) & 0xf) as usize] as f32;
+                assert_eq!(
+                    sub[j], expected_lo,
+                    "sub-block {ibw} position {j} (lo) mismatch"
+                );
+                assert_eq!(
+                    sub[j + 16],
+                    expected_hi,
+                    "sub-block {ibw} position {} (hi) mismatch",
+                    j + 16
+                );
+            }
+        }
     }
 }

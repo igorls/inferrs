@@ -754,6 +754,132 @@ impl candle_nn::var_builder::SimpleBackend for GemmaNormFixBackend {
     }
 }
 
+/// Qwen3.5 variant of [`GemmaNormFixBackend`], extended to paper over the
+/// two llama.cpp ↔ HuggingFace convention mismatches for Qwen3.5 GGUF:
+///
+/// 1. **RMSNorm offset.** llama.cpp stores all norm weights as the effective
+///    scale `s`, while HF stores `s - 1` for the "main" norms
+///    (`input_layernorm`, `post_attention_layernorm`, `q_norm`, `k_norm`,
+///    final `norm`) and applies them as `1 + w`.  Inferrs follows the HF
+///    convention via `rms_norm_with_offset(... 1.0)`, so external GGUF
+///    weights for these tensors need `-1.0` to align.  Exception:
+///    `linear_attn.norm.weight` (the SSM's per-head-dim gated RMSNorm at
+///    [qwen3_5.rs:829]) is loaded raw and used directly — both HF and
+///    llama.cpp store the effective scale, so no adjustment.
+///
+/// 2. **`ssm_a` representation.** HF stores `A_log = log(A)` (F32, signed,
+///    typically in `[-10, 5]`).  llama.cpp stores `-A` (F32, always negative,
+///    bounded in `[-10, 0)` since `A > 0`).  Inferrs code expects the HF
+///    convention and computes `a_exp = A_log.exp()`.  We detect the format
+///    heuristically from the value distribution and transform to `A_log` if
+///    needed: `A_log = log(-ssm_a)`.  The detection is deliberately loose so
+///    future/custom GGUFs that keep the HF convention still work untouched.
+///
+/// Head-value permutation (`reshape(n_key, ratio).T` for asymmetric models)
+/// is *not* undone here: llama.cpp applies it consistently across every
+/// value-head-indexed tensor, so the SSM recurrence remains self-coherent —
+/// heads are just stored in a different order.  Only `ssm_a` needs the
+/// representation fix regardless of permutation.
+struct Qwen35NormFixBackend {
+    inner: GgufBackend,
+}
+
+impl Qwen35NormFixBackend {
+    fn needs_minus_one(name: &str) -> bool {
+        // Skip the SSM per-value-head norm; it is stored & used raw.
+        if name.ends_with("ssm_norm.weight") {
+            return false;
+        }
+        name.ends_with("norm.weight")
+    }
+
+    /// Tensor stored as `-A` in llama.cpp vs `log(A)` in HF.  The GGUF name
+    /// is `blk.N.ssm_a` (no `.weight` suffix); HF name after reverse rename
+    /// is `...linear_attn.A_log`.
+    fn is_ssm_a(name: &str) -> bool {
+        name == "ssm_a"
+            || name.ends_with(".ssm_a")
+            || name.ends_with("linear_attn.A_log")
+            || name.ends_with("A_log")
+    }
+
+    /// Convert `ssm_a` to `A_log` if the stored tensor looks like llama.cpp's
+    /// `-A` representation.  Returns the tensor unchanged if it already looks
+    /// like HF `A_log`.
+    ///
+    /// Detection heuristic: llama.cpp stores `ssm_a = -A` with `A > 0`, so
+    /// **every** element is strictly negative.  HF stores `A_log = log(A)`
+    /// which is positive whenever `A > 1` — and the Qwen3.5 reference models
+    /// always contain at least one value-head with `A > 1` per layer, so HF
+    /// tensors reliably have at least one positive entry.
+    ///
+    /// The earlier magnitude-bound check (`min > -20`) misfired on imatrix
+    /// GGUFs where individual heads have `A ≈ 70–80` (observed on
+    /// `twalle/Qwen3.5-9B-IQ4_XS-GGUF`): those layers were wrongly classified
+    /// as HF `A_log`, leaving `a_exp = exp(-A)` instead of `A` and corrupting
+    /// the decay gate.  Dropping the magnitude bound fixes that while keeping
+    /// the sign check as a robust signal.
+    fn maybe_fix_ssm_a(tensor: Tensor) -> candle_core::Result<Tensor> {
+        // Pull to CPU for inspection (this tensor is tiny — n_value_heads ≤ 64).
+        let vals = tensor
+            .to_dtype(DType::F32)?
+            .to_vec1::<f32>()
+            .unwrap_or_default();
+        if vals.is_empty() {
+            return Ok(tensor);
+        }
+        let max_v = vals.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let min_v = vals.iter().cloned().fold(f32::INFINITY, f32::min);
+        if max_v >= 0.0 {
+            tracing::debug!(
+                "Qwen35 ssm_a appears to be HF `log(A)` (min={min_v:.3}, max={max_v:.3}); no transform"
+            );
+            return Ok(tensor);
+        }
+        tracing::info!(
+            "Qwen35 ssm_a detected as llama.cpp `-A` (min={min_v:.3}, max={max_v:.3}); \
+             transforming to `A_log = log(-ssm_a)`"
+        );
+        // A_log = log(-ssm_a). Both ops preserve dtype.
+        tensor.neg()?.log()
+    }
+}
+
+impl candle_nn::var_builder::SimpleBackend for Qwen35NormFixBackend {
+    fn get(
+        &self,
+        s: candle_core::Shape,
+        name: &str,
+        h: candle_nn::Init,
+        dtype: DType,
+        dev: &Device,
+    ) -> candle_core::Result<Tensor> {
+        let tensor = self.inner.get(s, name, h, dtype, dev)?;
+        if Self::needs_minus_one(name) {
+            tensor - 1.0f64
+        } else if Self::is_ssm_a(name) {
+            Self::maybe_fix_ssm_a(tensor)
+        } else {
+            Ok(tensor)
+        }
+    }
+
+    fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> candle_core::Result<Tensor> {
+        let tensor = self.inner.get_unchecked(name, dtype, dev)?;
+        if Self::needs_minus_one(name) {
+            tensor - 1.0f64
+        } else if Self::is_ssm_a(name) {
+            Self::maybe_fix_ssm_a(tensor)
+        } else {
+            Ok(tensor)
+        }
+    }
+
+    fn contains_tensor(&self, name: &str) -> bool {
+        self.inner.contains_tensor(name)
+    }
+}
+
 /// Build a [`VarBuilder`] backed by a GGUF file.
 ///
 /// Tensors are dequantized lazily — only on first access — so startup is
@@ -805,6 +931,11 @@ fn var_builder_from_gguf(
             "{arch:?}: applying GemmaNormFixBackend to correct RMSNorm scale for external GGUF"
         );
         Box::new(GemmaNormFixBackend { inner: backend })
+    } else if is_external_gguf && matches!(arch, ModelArchitecture::Qwen35) {
+        tracing::info!(
+            "Qwen35: applying Qwen35NormFixBackend to correct RMSNorm scale for external GGUF"
+        );
+        Box::new(Qwen35NormFixBackend { inner: backend })
     } else {
         Box::new(backend)
     };
@@ -1257,7 +1388,21 @@ pub fn load_model(
             })
         }
         ModelArchitecture::Qwen35 => {
-            let config = raw_config.to_qwen35_config(dtype, device.clone(), turbo_quant_bits);
+            let mut config = raw_config.to_qwen35_config(dtype, device.clone(), turbo_quant_bits);
+            // External GGUFs (llama.cpp) permute value-head-indexed tensors
+            // via `reshape(n_key, ratio).T` when n_value > n_key.  Flip the
+            // GQA expansion in LinearAttn to match the GGUF head layout so the
+            // SSM key/value correlation stays correct.  No-op for symmetric
+            // models (ratio=1) since the permutation is identity.
+            if is_external_gguf && config.linear_num_value_heads > config.linear_num_key_heads {
+                tracing::info!(
+                    "Qwen3.5: external GGUF detected with asymmetric SSM heads \
+                     ({} key / {} value); switching GQA expansion to GGUF head order",
+                    config.linear_num_key_heads,
+                    config.linear_num_value_heads,
+                );
+                config.gguf_external_head_order = true;
+            }
             tracing::info!(
                 "Qwen3.5 config: {} layers, {} attn heads, {} hidden, {} kv_heads",
                 config.num_hidden_layers,

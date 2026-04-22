@@ -123,15 +123,13 @@ extern "C" __global__ void dequantize_block_iq4xs_f32(const void *__restrict__ v
     const int64_t tid = threadIdx.x;
     const int64_t il = tid / 8;
     const int64_t ib = tid % 8;
-    float *y = yy + i * QK_K + 32 * ib + 8 * il;
+    float *y = yy + i * QK_K + 32 * ib + 4 * il;
     const uint8_t *q4 = x[i].qs + 16 * ib + 4 * il;
     const float d = __half2float(x[i].d) *
         ((((x[i].scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) | (((x[i].scales_h >> 2 * ib) & 3) << 4)) - 32);
     for (int j = 0; j < 4; ++j) {
-        const int2 v = get_int_from_table_16_iq(q4[j], kvalues_iq4nl);
-        const int8_t *v8 = (const int8_t *)&v;
-        y[j + 0] = d * (float)v8[0];
-        y[j + 4] = d * (float)v8[1];
+        y[j +  0] = d * (float)kvalues_iq4nl[q4[j] & 0xf];
+        y[j + 16] = d * (float)kvalues_iq4nl[(q4[j] >> 4) & 0xf];
     }
 }
 
@@ -141,15 +139,13 @@ extern "C" __global__ void dequantize_block_iq4xs_f16(const void *__restrict__ v
     const int64_t tid = threadIdx.x;
     const int64_t il = tid / 8;
     const int64_t ib = tid % 8;
-    half *y = yy + i * QK_K + 32 * ib + 8 * il;
+    half *y = yy + i * QK_K + 32 * ib + 4 * il;
     const uint8_t *q4 = x[i].qs + 16 * ib + 4 * il;
     const float d = __half2float(x[i].d) *
         ((((x[i].scales_l[ib / 2] >> 4 * (ib % 2)) & 0xf) | (((x[i].scales_h >> 2 * ib) & 3) << 4)) - 32);
     for (int j = 0; j < 4; ++j) {
-        const int2 v = get_int_from_table_16_iq(q4[j], kvalues_iq4nl);
-        const int8_t *v8 = (const int8_t *)&v;
-        y[j + 0] = __float2half_rn(d * (float)v8[0]);
-        y[j + 4] = __float2half_rn(d * (float)v8[1]);
+        y[j +  0] = __float2half_rn(d * (float)kvalues_iq4nl[q4[j] & 0xf]);
+        y[j + 16] = __float2half_rn(d * (float)kvalues_iq4nl[(q4[j] >> 4) & 0xf]);
     }
 }
 
@@ -273,12 +269,12 @@ static __device__ float iq4xs_row_dot(const block_iq4_xs *row_blocks, const floa
         const uint8_t *q4 = xi->qs + 16 * ibw + 4 * il;
         const float d = __half2float(xi->d) *
             ((((xi->scales_l[ibw / 2] >> 4 * (ibw % 2)) & 0xf) | (((xi->scales_h >> 2 * ibw) & 3) << 4)) - 32);
-        const int base = 32 * ibw + 8 * il;
+        const int base = 32 * ibw + 4 * il;
         for (int j = 0; j < 4; ++j) {
-            const int2 v = get_int_from_table_16_iq(q4[j], kvalues_iq4nl);
-            const int8_t *v8 = (const int8_t *)&v;
-            sum += (d * (float)v8[0]) * yb[base + j + 0];
-            sum += (d * (float)v8[1]) * yb[base + j + 4];
+            const float w_lo = d * (float)kvalues_iq4nl[q4[j] & 0xf];
+            const float w_hi = d * (float)kvalues_iq4nl[(q4[j] >> 4) & 0xf];
+            sum += w_lo * yb[base + j +  0];
+            sum += w_hi * yb[base + j + 16];
         }
     }
     return warp_reduce_sum(sum);
@@ -295,12 +291,12 @@ static __device__ float iq4xs_row_dot_bf16(const block_iq4_xs *row_blocks, const
         const uint8_t *q4 = xi->qs + 16 * ibw + 4 * il;
         const float d = __half2float(xi->d) *
             ((((xi->scales_l[ibw / 2] >> 4 * (ibw % 2)) & 0xf) | (((xi->scales_h >> 2 * ibw) & 3) << 4)) - 32);
-        const int base = 32 * ibw + 8 * il;
+        const int base = 32 * ibw + 4 * il;
         for (int j = 0; j < 4; ++j) {
-            const int2 v = get_int_from_table_16_iq(q4[j], kvalues_iq4nl);
-            const int8_t *v8 = (const int8_t *)&v;
-            sum += (d * (float)v8[0]) * __bfloat162float(yb[base + j + 0]);
-            sum += (d * (float)v8[1]) * __bfloat162float(yb[base + j + 4]);
+            const float w_lo = d * (float)kvalues_iq4nl[q4[j] & 0xf];
+            const float w_hi = d * (float)kvalues_iq4nl[(q4[j] >> 4) & 0xf];
+            sum += w_lo * __bfloat162float(yb[base + j +  0]);
+            sum += w_hi * __bfloat162float(yb[base + j + 16]);
         }
     }
     return warp_reduce_sum(sum);

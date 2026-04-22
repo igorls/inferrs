@@ -165,7 +165,7 @@ impl GptqSafetensorsVb {
             Ok(t) => t.data().to_vec(),
             Err(_) if self.config.sym => {
                 // sym GPTQ may omit qzeros; synthesize default zero = 8 per nibble (0x88 packed)
-                vec![0x88u8; n_groups * ((out_dim + 7) / 8) * 4]
+                vec![0x88u8; n_groups * out_dim.div_ceil(8) * 4]
             }
             Err(e) => return Err(e),
         };
