@@ -88,7 +88,7 @@ extern "C" __global__ void dequantize_block_iq3xxs_f32(const void *__restrict__ 
     const uint16_t *gas = (const uint16_t *)(x[i].qs + QK_K / 4) + 2 * ib;
     const uint8_t *grid1 = (const uint8_t *)(iq3xxs_grid + q3[2 * il + 0]);
     const uint8_t *grid2 = (const uint8_t *)(iq3xxs_grid + q3[2 * il + 1]);
-    const uint32_t aux32 = gas[0] | (gas[1] << 16);
+    const uint32_t aux32 = gas[0] | ((uint32_t)gas[1] << 16);
     const float d = __half2float(x[i].d) * (0.5f + (aux32 >> 28)) * 0.5f;
     const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
     for (int j = 0; j < 4; ++j) {
@@ -108,7 +108,7 @@ extern "C" __global__ void dequantize_block_iq3xxs_f16(const void *__restrict__ 
     const uint16_t *gas = (const uint16_t *)(x[i].qs + QK_K / 4) + 2 * ib;
     const uint8_t *grid1 = (const uint8_t *)(iq3xxs_grid + q3[2 * il + 0]);
     const uint8_t *grid2 = (const uint8_t *)(iq3xxs_grid + q3[2 * il + 1]);
-    const uint32_t aux32 = gas[0] | (gas[1] << 16);
+    const uint32_t aux32 = gas[0] | ((uint32_t)gas[1] << 16);
     const float d = __half2float(x[i].d) * (0.5f + (aux32 >> 28)) * 0.5f;
     const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
     for (int j = 0; j < 4; ++j) {
@@ -218,7 +218,7 @@ static __device__ float iq3xxs_row_dot(const block_iq3_xxs *row_blocks, const fl
         const uint16_t *gas = (const uint16_t *)(xi->qs + QK_K / 4) + 2 * ibw;
         const uint8_t *grid1 = (const uint8_t *)(iq3xxs_grid + q3[2 * il + 0]);
         const uint8_t *grid2 = (const uint8_t *)(iq3xxs_grid + q3[2 * il + 1]);
-        const uint32_t aux32 = gas[0] | (gas[1] << 16);
+        const uint32_t aux32 = gas[0] | ((uint32_t)gas[1] << 16);
         const float d = __half2float(xi->d) * (0.5f + (aux32 >> 28)) * 0.5f;
         const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
         const int base = 32 * ibw + 8 * il;
@@ -244,7 +244,7 @@ static __device__ float iq3xxs_row_dot_bf16(const block_iq3_xxs *row_blocks, con
         const uint16_t *gas = (const uint16_t *)(xi->qs + QK_K / 4) + 2 * ibw;
         const uint8_t *grid1 = (const uint8_t *)(iq3xxs_grid + q3[2 * il + 0]);
         const uint8_t *grid2 = (const uint8_t *)(iq3xxs_grid + q3[2 * il + 1]);
-        const uint32_t aux32 = gas[0] | (gas[1] << 16);
+        const uint32_t aux32 = gas[0] | ((uint32_t)gas[1] << 16);
         const float d = __half2float(xi->d) * (0.5f + (aux32 >> 28)) * 0.5f;
         const uint8_t signs = ksigns_iq2xs[(aux32 >> 7 * il) & 127];
         const int base = 32 * ibw + 8 * il;

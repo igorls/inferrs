@@ -48,6 +48,13 @@ pub fn is_gptq_aux(name: &str) -> bool {
 /// * `scales`  — [n_groups, out_dim] bf16 slice
 /// * `out_dim`, `in_dim` — weight matrix dimensions
 /// * `group_size` — quantization group size (typically 128 for GPTQ-Int4)
+///
+/// # Limitations
+/// Assumes `act_order=False` (sequential grouping: `group = c / group_size`).
+/// Models quantized with `act_order=True` have a non-sequential `g_idx` that
+/// remaps columns to groups; passing such weights here produces silently wrong
+/// output. The caller (`SimpleBackend`) currently discards `g_idx`; detecting
+/// and rejecting non-sequential `g_idx` at load time is tracked as a TODO.
 pub fn dequant_gptq_bf16(
     qweight: &[i32],
     qzeros: &[i32],
@@ -111,13 +118,18 @@ pub fn dequant_gptq_from_bytes(
         );
     }
 
+    // safetensors guarantees ≥8-byte alignment for all tensor data, which
+    // satisfies i32 (4 B) and bf16 (2 B). Assert in debug to catch regressions.
     let qweight = unsafe {
+        debug_assert_eq!(qweight_bytes.as_ptr() as usize % std::mem::align_of::<i32>(), 0);
         std::slice::from_raw_parts(qweight_bytes.as_ptr() as *const i32, in_dim / 8 * out_dim)
     };
     let qzeros = unsafe {
+        debug_assert_eq!(qzeros_bytes.as_ptr() as usize % std::mem::align_of::<i32>(), 0);
         std::slice::from_raw_parts(qzeros_bytes.as_ptr() as *const i32, n_groups * out_dim / 8)
     };
     let scales = unsafe {
+        debug_assert_eq!(scales_bytes.as_ptr() as usize % std::mem::align_of::<bf16>(), 0);
         std::slice::from_raw_parts(scales_bytes.as_ptr() as *const bf16, n_groups * out_dim)
     };
 
@@ -165,7 +177,7 @@ impl GptqSafetensorsVb {
             Ok(t) => t.data().to_vec(),
             Err(_) if self.config.sym => {
                 // sym GPTQ may omit qzeros; synthesize default zero = 8 per nibble (0x88 packed)
-                vec![0x88u8; n_groups * out_dim.div_ceil(8) * 4]
+                vec![0x88u8; n_groups * (out_dim / 8) * 4]
             }
             Err(e) => return Err(e),
         };

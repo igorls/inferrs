@@ -11,6 +11,7 @@ pub enum Id {
     Conv,
     Fill,
     FlashAttn,
+    FlashAttnPrefill,
     Indexing,
     LinearAttn,
     LinearAttnScan,
@@ -23,13 +24,14 @@ pub enum Id {
     GptqInt4,
 }
 
-pub const ALL_IDS: [Id; 16] = [
+pub const ALL_IDS: [Id; 17] = [
     Id::Affine,
     Id::Binary,
     Id::Cast,
     Id::Conv,
     Id::Fill,
     Id::FlashAttn,
+    Id::FlashAttnPrefill,
     Id::Indexing,
     Id::LinearAttn,
     Id::LinearAttnScan,
@@ -83,6 +85,7 @@ mdl!(CAST, Cast);
 mdl!(CONV, Conv);
 mdl!(FILL, Fill);
 mdl!(FLASH_ATTN, FlashAttn);
+mdl!(FLASH_ATTN_PREFILL, FlashAttnPrefill);
 mdl!(INDEXING, Indexing);
 mdl!(LINEAR_ATTN, LinearAttn);
 mdl!(LINEAR_ATTN_SCAN, LinearAttnScan);
