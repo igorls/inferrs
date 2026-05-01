@@ -58,9 +58,37 @@ function loadFromStorage() {
 }
 
 // ── Markdown renderer setup ─────────────────────────────────────────────────
+// Security: marked v15 dropped the legacy `sanitize` option, so raw HTML in
+// model output (e.g. `<script>` or event-handler attributes) would otherwise
+// reach `innerHTML` and execute.  We override the renderer to:
+//   1. Escape any raw HTML token instead of emitting it verbatim.
+//   2. Reject `javascript:`, `data:`, and `vbscript:` URLs in links/images.
+// This is much smaller than vendoring DOMPurify and covers the realistic XSS
+// surface for LLM-generated markdown.
+var safeRenderer = new marked.Renderer();
+var DANGEROUS_URL = /^\s*(javascript|data|vbscript):/i;
+safeRenderer.html = function(token) {
+  return escHtml(typeof token === 'string' ? token : (token && token.text) || '');
+};
+var origLink = safeRenderer.link.bind(safeRenderer);
+safeRenderer.link = function(args) {
+  if (args && args.href && DANGEROUS_URL.test(args.href)) {
+    return escHtml(args.text || args.href);
+  }
+  return origLink(args);
+};
+var origImage = safeRenderer.image.bind(safeRenderer);
+safeRenderer.image = function(args) {
+  if (args && args.href && DANGEROUS_URL.test(args.href)) {
+    return '';
+  }
+  return origImage(args);
+};
+
 marked.setOptions({
   gfm: true,
   breaks: true,
+  renderer: safeRenderer,
   highlight: function(code, lang) {
     if (lang && hljs.getLanguage(lang)) {
       try { return hljs.highlight(code, {language: lang}).value; } catch(e) {}

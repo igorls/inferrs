@@ -1179,8 +1179,12 @@ pub struct ModelMeta {
     pub has_vision: bool,
 }
 
-fn is_zero_usize(n: &usize) -> bool { *n == 0 }
-fn is_false(b: &bool) -> bool { !*b }
+fn is_zero_usize(n: &usize) -> bool {
+    *n == 0
+}
+fn is_false(b: &bool) -> bool {
+    !*b
+}
 
 /// Two operating modes, mirroring Ollama's daemon↔runner split:
 ///
@@ -1752,9 +1756,7 @@ fn infer_quantization_from_id(model_id: &str) -> String {
             }
             // Eat trailing _-separated alphanumerics.
             let mut end = i + 2;
-            while end < bytes.len()
-                && (bytes[end] == b'_' || bytes[end].is_ascii_alphanumeric())
-            {
+            while end < bytes.len() && (bytes[end] == b'_' || bytes[end].is_ascii_alphanumeric()) {
                 end += 1;
             }
             // Back off trailing underscores so `Q4_K_M_` → `Q4_K_M`.
@@ -1766,8 +1768,19 @@ fn infer_quantization_from_id(model_id: &str) -> String {
     }
 
     for tag in [
-        "AWQ-4BIT", "AWQ-8BIT", "AWQ", "GPTQ-INT4", "GPTQ-INT8", "GPTQ",
-        "INT4", "INT8", "FP4", "FP8", "FP16", "BF16", "FP32",
+        "AWQ-4BIT",
+        "AWQ-8BIT",
+        "AWQ",
+        "GPTQ-INT4",
+        "GPTQ-INT8",
+        "GPTQ",
+        "INT4",
+        "INT8",
+        "FP4",
+        "FP8",
+        "FP16",
+        "BF16",
+        "FP32",
     ] {
         if upper.contains(tag) {
             return tag.replace('-', " ");
@@ -4260,7 +4273,11 @@ async fn ollama_show(
 
     let meta = lm.meta.clone();
     let details = OllamaModelDetails {
-        format: if meta.format.is_empty() { "safetensors".to_string() } else { meta.format.clone() },
+        format: if meta.format.is_empty() {
+            "safetensors".to_string()
+        } else {
+            meta.format.clone()
+        },
         family: meta.family.clone(),
         parameter_size: String::new(),
         quantization_level: meta.quantization.clone(),
