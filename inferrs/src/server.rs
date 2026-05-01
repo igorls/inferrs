@@ -869,7 +869,7 @@ pub struct OllamaRunningModel {
 }
 
 /// `POST /api/show` request.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct OllamaShowRequest {
     pub model: String,
     /// When `true`, include additional model details (accepted but not yet used).
@@ -886,6 +886,19 @@ pub struct OllamaShowResponse {
     pub template: String,
     pub details: OllamaModelDetails,
     pub model_info: serde_json::Value,
+    /// inferrs-specific extension: full ModelMeta snapshot consumed by the
+    /// web UI's stats panel.  Skipped from the JSON when empty so vanilla
+    /// Ollama clients don't see a foreign field.
+    #[serde(skip_serializing_if = "model_meta_is_empty")]
+    pub inferrs_meta: ModelMeta,
+}
+
+fn model_meta_is_empty(m: &ModelMeta) -> bool {
+    m.format.is_empty()
+        && m.quantization.is_empty()
+        && m.family.is_empty()
+        && m.architecture.is_empty()
+        && m.context_length == 0
 }
 
 /// `POST /api/pull` request.
@@ -1106,7 +1119,68 @@ struct LoadedModel {
     model_id: String,
     /// How this model is served.
     backend: ModelBackend,
+    /// Static metadata captured at load time so `/api/show` and the web UI can
+    /// surface architecture / quantization / runtime details without holding
+    /// the engine lock or hitting disk on every request.
+    meta: ModelMeta,
 }
+
+/// Snapshot of everything technical users want to know about a loaded model:
+/// where it came from (format, quantization), how it's structured (architecture,
+/// context length, vocab), and how it's running (device, dtype, TurboQuant
+/// bit-width).  Stays cheap to clone — short strings + a handful of numbers.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ModelMeta {
+    /// `"safetensors"`, `"gguf"`, `"awq"`, etc. — derived from the loader path.
+    pub format: String,
+    /// Quantization scheme detected from config / GGUF metadata / model name
+    /// (e.g. `"Q4_K_M"`, `"GPTQ-4bit"`, `"AWQ-4bit"`, `"FP16"`).  Empty when unknown.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub quantization: String,
+    /// Model family (`"phi3"`, `"gemma3"`, `"qwen3"`, …) from `model_type`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub family: String,
+    /// Specific architecture variant detected by `RawConfig::detect_architecture`.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub architecture: String,
+    /// Compile-time runtime dtype the engine is using (`"BF16"`, `"F16"`, `"F32"`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub dtype: String,
+    /// Inference device descriptor (`"cuda:0"`, `"cpu"`, `"metal:0"`).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub device: String,
+    /// Maximum sequence length the engine was built with.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub context_length: usize,
+    /// Token vocabulary size when known.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub vocab_size: usize,
+    /// Hidden dimension.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub hidden_size: usize,
+    /// Transformer layer count.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub num_layers: usize,
+    /// Attention head count.
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub num_attention_heads: usize,
+    /// Distinct K/V head count (1 for MQA, < heads for GQA).
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub num_kv_heads: usize,
+    /// TurboQuant KV cache bit-width when active for this model (Qwen3 / Gemma4).
+    /// `None` when the model architecture does not use it or it was disabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turbo_quant_bits: Option<u8>,
+    /// True when the model has audio input support.
+    #[serde(skip_serializing_if = "is_false")]
+    pub has_audio: bool,
+    /// True when the model has vision input support.
+    #[serde(skip_serializing_if = "is_false")]
+    pub has_vision: bool,
+}
+
+fn is_zero_usize(n: &usize) -> bool { *n == 0 }
+fn is_false(b: &bool) -> bool { !*b }
 
 /// Two operating modes, mirroring Ollama's daemon↔runner split:
 ///
@@ -1529,6 +1603,8 @@ fn loaded_model_from_ctx(
     model_id: String,
     ctx: crate::engine::EngineContext,
 ) -> Result<LoadedModel> {
+    let meta = build_model_meta(&model_id, &ctx);
+
     // Reuse the tokenizer that was already loaded during engine initialisation
     // rather than reading the file from disk a second time.
     let tok = ctx.tokenizer;
@@ -1576,7 +1652,137 @@ fn loaded_model_from_ctx(
             vision_pooling_kernel,
             vision_default_output_length,
         },
+        meta,
     })
+}
+
+/// Build the user-facing model metadata snapshot from an `EngineContext` and
+/// the original model identifier.  Used by `/api/show` and the web UI.
+fn build_model_meta(model_id: &str, ctx: &crate::engine::EngineContext) -> ModelMeta {
+    let rc = &ctx.raw_config;
+
+    // Format: GGUF takes precedence (we always know when the loader took the
+    // GGUF path).  Otherwise look for an HF `quantization_config` (GPTQ / AWQ)
+    // before falling back to safetensors.
+    let format = if ctx.gguf_loaded {
+        "gguf".to_string()
+    } else if rc.quantization_config.is_some() {
+        // We don't currently parse the `quant_method` string from config.json,
+        // so the heuristic on the model id below decides the precise label;
+        // here we mark the file format as a quantized HF repo.
+        "quantized-hf".to_string()
+    } else {
+        "safetensors".to_string()
+    };
+
+    // Quantization label: prefer the explicit bit-width from config.json's
+    // quantization_config (which is what the loader actually used), then fall
+    // back to an HF/Ollama model-id heuristic for GGUF Q-codes / AWQ / FPx.
+    let quantization = if let Some(qc) = &rc.quantization_config {
+        let id_hint = infer_quantization_from_id(model_id);
+        if id_hint.is_empty() {
+            format!("{}-bit", qc.bits)
+        } else {
+            id_hint
+        }
+    } else {
+        infer_quantization_from_id(model_id)
+    };
+
+    let arch_str = format!("{:?}", ctx.arch).to_lowercase();
+    let family = rc.model_type.clone().unwrap_or_default();
+
+    let dtype = format!("{:?}", ctx.dtype);
+    let device = format_device(&ctx.device);
+
+    let (vocab_size, hidden_size, num_layers, num_attention_heads, num_kv_heads) =
+        if let Some(tc) = &rc.text_config {
+            (
+                tc.vocab_size.or(rc.vocab_size).unwrap_or(0),
+                tc.hidden_size.or(rc.hidden_size).unwrap_or(0),
+                tc.num_hidden_layers.or(rc.num_hidden_layers).unwrap_or(0),
+                rc.num_attention_heads.unwrap_or(0),
+                rc.num_key_value_heads.unwrap_or(0),
+            )
+        } else {
+            (
+                rc.vocab_size.unwrap_or(0),
+                rc.hidden_size.unwrap_or(0),
+                rc.num_hidden_layers.unwrap_or(0),
+                rc.num_attention_heads.unwrap_or(0),
+                rc.num_key_value_heads.unwrap_or(0),
+            )
+        };
+
+    ModelMeta {
+        format,
+        quantization,
+        family,
+        architecture: arch_str,
+        dtype,
+        device,
+        context_length: ctx.max_seq_len,
+        vocab_size,
+        hidden_size,
+        num_layers,
+        num_attention_heads,
+        num_kv_heads,
+        turbo_quant_bits: ctx.turbo_quant_bits,
+        has_audio: rc.audio_config.is_some(),
+        has_vision: rc.vision_config.is_some(),
+    }
+}
+
+/// Cheap heuristic for HuggingFace / Ollama model IDs: most repos embed the
+/// quant scheme in the name (`Q4_K_M`, `Q8_0`, `AWQ-4bit`, `GPTQ-int4`,
+/// `FP16`, `BF16`, `FP8`).  Returns an empty string when nothing matches.
+///
+/// Avoids pulling in a regex crate by walking the uppercased id once.
+fn infer_quantization_from_id(model_id: &str) -> String {
+    let upper = model_id.to_uppercase();
+
+    // GGUF Q-codes: Q{1-8}[_{S,K,M,L,0-9}]+ — emitted by llama.cpp / Ollama.
+    let bytes = upper.as_bytes();
+    for i in 0..bytes.len() {
+        if bytes[i] == b'Q' && i + 1 < bytes.len() && (b'1'..=b'8').contains(&bytes[i + 1]) {
+            // Make sure the previous char is a non-alphanumeric boundary.
+            let prev_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            if !prev_ok {
+                continue;
+            }
+            // Eat trailing _-separated alphanumerics.
+            let mut end = i + 2;
+            while end < bytes.len()
+                && (bytes[end] == b'_' || bytes[end].is_ascii_alphanumeric())
+            {
+                end += 1;
+            }
+            // Back off trailing underscores so `Q4_K_M_` → `Q4_K_M`.
+            while end > i + 2 && bytes[end - 1] == b'_' {
+                end -= 1;
+            }
+            return upper[i..end].to_string();
+        }
+    }
+
+    for tag in [
+        "AWQ-4BIT", "AWQ-8BIT", "AWQ", "GPTQ-INT4", "GPTQ-INT8", "GPTQ",
+        "INT4", "INT8", "FP4", "FP8", "FP16", "BF16", "FP32",
+    ] {
+        if upper.contains(tag) {
+            return tag.replace('-', " ");
+        }
+    }
+    String::new()
+}
+
+fn format_device(d: &candle_core::Device) -> String {
+    use candle_core::Device;
+    match d {
+        Device::Cpu => "cpu".to_string(),
+        Device::Cuda(_) => "cuda".to_string(),
+        Device::Metal(_) => "metal".to_string(),
+    }
 }
 
 /// Pick a free TCP port on localhost by binding to port 0.
@@ -1697,6 +1903,9 @@ async fn spawn_worker(
     Ok(LoadedModel {
         model_id: model_id.to_string(),
         backend: ModelBackend::Proxy { worker_url, child },
+        // Daemon-side: real metadata lives in the worker.  `/api/show` proxies
+        // to the worker's own handler, which returns its populated meta.
+        meta: ModelMeta::default(),
     })
 }
 
@@ -4029,10 +4238,12 @@ async fn ollama_ps(State(state): State<Arc<AppState>>) -> Json<OllamaPsResponse>
 /// `POST /api/show` — return information about a model.
 ///
 /// Triggers on-demand loading so the response contains accurate model info.
+/// In daemon mode the request is forwarded to the worker so its `inferrs_meta`
+/// (architecture, dtype, device, TurboQuant bits…) reaches the client.
 async fn ollama_show(
     State(state): State<Arc<AppState>>,
     Json(req): Json<OllamaShowRequest>,
-) -> impl IntoResponse {
+) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
     let lm = load_model_on_demand(&state, &req.model, None).await?;
     if !model_matches_id(&lm.model_id, &req.model) {
         return Err((
@@ -4043,13 +4254,27 @@ async fn ollama_show(
         ));
     }
 
+    if let ModelBackend::Proxy { worker_url, .. } = &lm.backend {
+        return proxy_to_worker(&state.http_client, worker_url, "/api/show", &req).await;
+    }
+
+    let meta = lm.meta.clone();
+    let details = OllamaModelDetails {
+        format: if meta.format.is_empty() { "safetensors".to_string() } else { meta.format.clone() },
+        family: meta.family.clone(),
+        parameter_size: String::new(),
+        quantization_level: meta.quantization.clone(),
+    };
+
     Ok(Json(OllamaShowResponse {
         modelfile: format!("FROM {}", req.model),
         parameters: String::new(),
         template: String::new(),
-        details: OllamaModelDetails::default(),
+        details,
         model_info: serde_json::Value::Object(serde_json::Map::new()),
-    }))
+        inferrs_meta: meta,
+    })
+    .into_response())
 }
 
 /// `POST /api/pull` — pull one OCI model with Ollama-compatible progress.

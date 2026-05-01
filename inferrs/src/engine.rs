@@ -96,6 +96,18 @@ pub struct EngineContext {
     /// The tokenizer loaded during engine initialisation, wrapped in an `Arc`
     /// so the HTTP server can reuse it without a second disk read.
     pub tokenizer: Arc<Tokenizer>,
+    /// Inference device the engine is bound to — captured here so callers
+    /// (e.g. the HTTP `/api/show` endpoint) can surface it without re-resolving.
+    pub device: candle_core::Device,
+    /// Quantization dtype requested at load time (`None` when the model is
+    /// served at full precision).  Used purely for metadata reporting.
+    #[allow(dead_code)]
+    pub quant_dtype: Option<candle_core::quantized::GgmlDType>,
+    /// True when on-the-fly quantization was applied via `download_and_maybe_quantize`.
+    pub gguf_loaded: bool,
+    /// TurboQuant KV cache bit-width in effect for this load (Qwen3/Gemma4).
+    /// `None` when the architecture doesn't use TurboQuant or it was disabled.
+    pub turbo_quant_bits: Option<u8>,
 }
 
 /// Build an [`Engine`] from [`ServeArgs`], handling the repeated sequence:
@@ -196,6 +208,14 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         &arch,
     )?;
 
+    let gguf_loaded = model_files.gguf_path.is_some();
+    let turbo_quant_bits = match arch {
+        ModelArchitecture::Qwen3 | ModelArchitecture::Qwen35 | ModelArchitecture::Gemma4 => {
+            args.turbo_quant.0
+        }
+        _ => None,
+    };
+
     Ok(EngineContext {
         engine,
         raw_config,
@@ -203,6 +223,10 @@ pub fn load_engine(args: &ServeArgs) -> Result<EngineContext> {
         dtype,
         max_seq_len,
         tokenizer,
+        device,
+        quant_dtype,
+        gguf_loaded,
+        turbo_quant_bits,
     })
 }
 
